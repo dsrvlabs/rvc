@@ -9,12 +9,22 @@ repository = "https://github.com/rootwarp/rvc"
 keywords = ["ethereum", "beacon", "validator", "failover"]
 categories = ["cryptography::cryptocurrencies"]
 
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes MockBeaconNodeClient for cross-crate tests. Do not enable on
+# production binary dependency lines.
+test-utils = []
+
 [dependencies]
 beacon = { workspace = true }
-crypto = { workspace = true }
+observability = { workspace = true }
 eth-types = { workspace = true }
+metrics = { workspace = true }
 async-trait = { workspace = true }
-futures = "0.3"
+futures.workspace = true
 reqwest-eventsource = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,5 +36,5 @@ url = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 wiremock = { workspace = true }
-tracing-test = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

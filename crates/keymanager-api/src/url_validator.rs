@@ -1,7 +1,50 @@
 use std::net::IpAddr;
 
-pub fn validate_remote_signer_url(url_str: &str, allow_insecure: bool) -> Result<url::Url, String> {
-    let url = url::Url::parse(url_str).map_err(|e| format!("Invalid URL: {e}"))?;
+use thiserror::Error;
+
+/// Errors from remote-signer URL validation.
+///
+/// All variants are client-caused (bad input or policy refusal) and therefore
+/// client-safe to surface via the central mapper
+/// ([`crate::error::map_url_validation_error`]).
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UrlValidationError {
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(String),
+    #[error("HTTP not allowed without --allow-insecure-remote-signer flag")]
+    HttpNotAllowed,
+    #[error("Unsupported URL scheme: {0}")]
+    UnsupportedScheme(String),
+    #[error("URL has no host")]
+    NoHost,
+    #[error("Private/reserved IP not allowed: {0}")]
+    PrivateOrReservedIp(String),
+    #[error("Private/reserved IPv6 not allowed: {0}")]
+    PrivateOrReservedIpv6(String),
+    #[error("DNS resolution failed for {host}: {reason}")]
+    DnsResolutionFailed { host: String, reason: String },
+    #[error("DNS resolution returned no addresses for {0}")]
+    DnsNoAddresses(String),
+    #[error(
+        "DNS-rebinding protection: hostname {host} resolves to a private/reserved IP \
+         (ISSUE-4.9 / L-9): {detail}"
+    )]
+    DnsRebinding { host: String, detail: String },
+}
+
+impl UrlValidationError {
+    /// URL validation failures are always client-caused and safe to surface.
+    pub fn is_client_safe(&self) -> bool {
+        true
+    }
+}
+
+pub fn validate_remote_signer_url(
+    url_str: &str,
+    allow_insecure: bool,
+) -> Result<url::Url, UrlValidationError> {
+    let url =
+        url::Url::parse(url_str).map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
 
     match url.scheme() {
         "https" => {}
@@ -9,10 +52,10 @@ pub fn validate_remote_signer_url(url_str: &str, allow_insecure: bool) -> Result
             tracing::warn!(url = %url, "Remote signer URL uses plaintext HTTP");
         }
         "http" => {
-            return Err("HTTP not allowed without --allow-insecure-remote-signer flag".to_string());
+            return Err(UrlValidationError::HttpNotAllowed);
         }
         scheme => {
-            return Err(format!("Unsupported URL scheme: {scheme}"));
+            return Err(UrlValidationError::UnsupportedScheme(scheme.to_string()));
         }
     }
 
@@ -20,7 +63,7 @@ pub fn validate_remote_signer_url(url_str: &str, allow_insecure: bool) -> Result
         Some(url::Host::Ipv4(v4)) => validate_ip(IpAddr::V4(v4))?,
         Some(url::Host::Ipv6(v6)) => validate_ip(IpAddr::V6(v6))?,
         Some(url::Host::Domain(_)) => {}
-        None => return Err("URL has no host".to_string()),
+        None => return Err(UrlValidationError::NoHost),
     }
 
     Ok(url)
@@ -39,7 +82,7 @@ pub fn validate_remote_signer_url(url_str: &str, allow_insecure: bool) -> Result
 pub async fn validate_remote_signer_url_runtime(
     url_str: &str,
     allow_insecure: bool,
-) -> Result<url::Url, String> {
+) -> Result<url::Url, UrlValidationError> {
     let url = validate_remote_signer_url(url_str, allow_insecure)?;
 
     if let Some(url::Host::Domain(host)) = url.host() {
@@ -50,20 +93,19 @@ pub async fn validate_remote_signer_url_runtime(
         let target = format!("{}:{}", host, port);
         let resolved: Vec<IpAddr> = tokio::net::lookup_host(&target)
             .await
-            .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+            .map_err(|e| UrlValidationError::DnsResolutionFailed {
+                host: host.clone(),
+                reason: e.to_string(),
+            })?
             .map(|sa| sa.ip())
             .collect();
 
         if resolved.is_empty() {
-            return Err(format!("DNS resolution returned no addresses for {host}"));
+            return Err(UrlValidationError::DnsNoAddresses(host));
         }
 
-        validate_resolved_ips(&resolved).map_err(|e| {
-            format!(
-                "DNS-rebinding protection: hostname {host} resolves to a private/reserved IP \
-                 (ISSUE-4.9 / L-9): {e}"
-            )
-        })?;
+        validate_resolved_ips(&resolved)
+            .map_err(|e| UrlValidationError::DnsRebinding { host, detail: e.to_string() })?;
     }
 
     Ok(url)
@@ -74,14 +116,14 @@ pub async fn validate_remote_signer_url_runtime(
 /// Returns the first violation; any single denied IP is enough to refuse
 /// the connection (rebinding protection requires that NO resolution maps
 /// to a denied range).
-pub(crate) fn validate_resolved_ips(ips: &[IpAddr]) -> Result<(), String> {
+pub(crate) fn validate_resolved_ips(ips: &[IpAddr]) -> Result<(), UrlValidationError> {
     for ip in ips {
         validate_ip(*ip)?;
     }
     Ok(())
 }
 
-fn validate_ip(ip: IpAddr) -> Result<(), String> {
+fn validate_ip(ip: IpAddr) -> Result<(), UrlValidationError> {
     match ip {
         IpAddr::V4(v4) => {
             if v4.is_loopback()
@@ -91,20 +133,20 @@ fn validate_ip(ip: IpAddr) -> Result<(), String> {
                 || v4.is_unspecified()
                 || is_cgnat(v4)
             {
-                return Err(format!("Private/reserved IP not allowed: {v4}"));
+                return Err(UrlValidationError::PrivateOrReservedIp(v4.to_string()));
             }
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unspecified() {
-                return Err(format!("Private/reserved IPv6 not allowed: {v6}"));
+                return Err(UrlValidationError::PrivateOrReservedIpv6(v6.to_string()));
             }
             // Link-local fe80::/10
             if v6.segments()[0] & 0xffc0 == 0xfe80 {
-                return Err(format!("Private/reserved IPv6 not allowed: {v6}"));
+                return Err(UrlValidationError::PrivateOrReservedIpv6(v6.to_string()));
             }
             // Unique local fc00::/7
             if v6.segments()[0] & 0xfe00 == 0xfc00 {
-                return Err(format!("Private/reserved IPv6 not allowed: {v6}"));
+                return Err(UrlValidationError::PrivateOrReservedIpv6(v6.to_string()));
             }
             // IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -134,7 +176,7 @@ mod tests {
     fn test_http_url_rejected_without_flag() {
         let result = validate_remote_signer_url("http://signer.example.com:9000", false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("HTTP not allowed"));
+        assert!(matches!(result.unwrap_err(), UrlValidationError::HttpNotAllowed));
     }
 
     #[test]
@@ -147,7 +189,10 @@ mod tests {
     fn test_file_scheme_rejected() {
         let result = validate_remote_signer_url("file:///etc/passwd", false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unsupported URL scheme"));
+        assert!(matches!(
+            result.unwrap_err(),
+            UrlValidationError::UnsupportedScheme(ref s) if s == "file"
+        ));
     }
 
     #[test]
@@ -160,7 +205,9 @@ mod tests {
     fn test_loopback_rejected() {
         let result = validate_remote_signer_url("https://127.0.0.1:9000", false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Private/reserved IP"));
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Private/reserved IP"));
+        assert!(err.is_client_safe());
     }
 
     #[test]
@@ -221,7 +268,7 @@ mod tests {
     fn test_invalid_url_rejected() {
         let result = validate_remote_signer_url("not-a-url", false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid URL"));
+        assert!(matches!(result.unwrap_err(), UrlValidationError::InvalidUrl(_)));
     }
 
     #[test]
@@ -256,14 +303,14 @@ mod tests {
         // resolution set must refuse the connection.
         let ips = [IpAddr::from([8, 8, 8, 8]), IpAddr::from([10, 0, 0, 1])];
         let err = validate_resolved_ips(&ips).expect_err("private IP must reject");
-        assert!(err.contains("Private/reserved"));
+        assert!(err.to_string().contains("Private/reserved"));
     }
 
     #[test]
     fn test_resolved_ips_only_loopback_fails() {
         let ips = [IpAddr::from([127, 0, 0, 1])];
         let err = validate_resolved_ips(&ips).expect_err("loopback must reject");
-        assert!(err.contains("Private/reserved"));
+        assert!(err.to_string().contains("Private/reserved"));
     }
 
     #[test]
@@ -307,5 +354,12 @@ mod tests {
     async fn test_runtime_invalid_url_rejected() {
         let result = validate_remote_signer_url_runtime("not-a-url", false).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_url_validation_error_is_client_safe() {
+        assert!(UrlValidationError::HttpNotAllowed.is_client_safe());
+        assert!(UrlValidationError::NoHost.is_client_safe());
+        assert!(UrlValidationError::InvalidUrl("x".into()).is_client_safe());
     }
 }

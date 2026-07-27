@@ -6,6 +6,9 @@
 //! - `test_gate_loopback_bind_allowed_with_env_var` — bind=127.0.0.1 + env var → silent Ok
 //! - `test_gate_non_loopback_refused`          — bind=0.0.0.0, env var unset, Refuse → Err
 
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 

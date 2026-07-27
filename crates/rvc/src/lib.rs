@@ -1,17 +1,18 @@
 //! rvc - Rust Validator Client
 
+pub mod background_tasks;
 pub mod beacon_adapter;
+pub mod bootstrap;
 pub mod config;
-pub mod config_url;
+pub mod deletion_denylist;
 pub mod doppelganger_adapter;
-pub mod duty_tracker;
+pub mod grpc_health;
 pub mod keymanager_adapters;
-pub mod monitoring;
+pub mod liveness_loop;
 pub mod orchestrator;
-pub mod prepare_exit;
+pub mod pubkey_index;
 pub mod slashing_monitor;
 pub mod startup;
-pub mod submit_exit;
 
 pub mod proto {
     pub mod duty_tracker {

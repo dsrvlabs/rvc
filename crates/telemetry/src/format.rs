@@ -22,7 +22,7 @@
 //! ## Redaction is unaffected
 //! Secret redaction happens at the **value** level: a `pubkey` is recorded as an
 //! already-truncated `0x{first10}...{last8}` string (via
-//! `crypto::logging::TruncatedPubkey`) and a URL via `RedactedUrl` *before* it is
+//! `observability::logging::TruncatedPubkey`) and a URL via `RedactedUrl` *before* it is
 //! handed to any layer. JSON serialization of an already-redacted value stays
 //! redacted — selecting JSON is **not** a redaction bypass (proven by a captured
 //! subscriber test, see this module's tests).
@@ -138,8 +138,12 @@ where
     }
 }
 
-/// The pretty (default) console layer — the exact `fmt::layer()` both binaries
+/// The pretty (default) console layer — the `fmt::layer()` both binaries
 /// built before issue 5.5, parameterized only by its writer.
+///
+/// ANSI styling is enabled only when the process stdout is a terminal, so
+/// piped/redirected console output (journald, docker, test harnesses) stays
+/// free of escape sequences — matching the file appender's `with_ansi(false)`.
 fn fmt_layer_pretty<S, W>(
     make_writer: W,
 ) -> tracing_subscriber::fmt::Layer<S, DefaultFields, Format, W>
@@ -147,7 +151,10 @@ where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    tracing_subscriber::fmt::layer().with_writer(make_writer)
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_writer(make_writer)
 }
 
 /// Local sub-module so the JSON-layer type (`Format<Json>`) need not be named at
@@ -170,6 +177,8 @@ mod json_layer {
 }
 
 #[cfg(test)]
+// RF1-12: unit tests mutate env via unsafe set_var/remove_var.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::io;
@@ -404,7 +413,7 @@ mod tests {
         let full_pubkey =
             "93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
         // The already-redacted values that actually get recorded (this is exactly
-        // what `crypto::logging::TruncatedPubkey` / `RedactedUrl` produce at the
+        // what `observability::logging::TruncatedPubkey` / `RedactedUrl` produce at the
         // VALUE level before the field is handed to any layer).
         let redacted_pubkey = "0x93247f2209...611df74a";
         let redacted_url = "http://***:***@beacon.internal:5052/";

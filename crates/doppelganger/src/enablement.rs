@@ -18,3 +18,20 @@ pub trait SigningEnablement: Send + Sync {
     #[must_use = "is_signing_enabled gates signing; the returned bool must be checked before proceeding"]
     fn is_signing_enabled(&self, pubkey: &crypto::PublicKey) -> bool;
 }
+
+/// Production opt-out of doppelganger protection (`--no-doppelganger-detection`).
+///
+/// Enables signing for every pubkey. This deliberately forgoes the forward-window
+/// safety cost of roughly **2–3 epochs** of monitoring (~12.8–19.2 minutes on
+/// mainnet with 12 s slots). Prefer leaving doppelganger on (the default).
+///
+/// Distinct from the test-only `AlwaysEnabled` helper in `rvc-signer`: this type
+/// is the **documented operator opt-out** and is safe to wire on the production
+/// path when the operator has explicitly disabled doppelganger detection.
+pub struct DoppelgangerDisabledByOperator;
+
+impl SigningEnablement for DoppelgangerDisabledByOperator {
+    fn is_signing_enabled(&self, _pubkey: &crypto::PublicKey) -> bool {
+        true
+    }
+}

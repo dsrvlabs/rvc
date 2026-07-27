@@ -2,9 +2,13 @@ pub mod auth;
 pub mod error;
 pub mod gate;
 pub mod handlers;
+pub mod lifecycle;
 pub mod server;
 pub mod traits;
 pub mod types;
 pub mod url_validator;
 
-pub use server::{KeymanagerServer, DEFAULT_ADDR, DEFAULT_BODY_LIMIT};
+pub use lifecycle::{DoppelgangerLifecycle, ImportKind};
+pub use server::{
+    KeymanagerDeps, KeymanagerServer, KeymanagerSettings, DEFAULT_ADDR, DEFAULT_BODY_LIMIT,
+};

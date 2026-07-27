@@ -19,7 +19,7 @@ use rvc_keymanager_api::handlers::{
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Verbose error string that must never reach the client ──────────────────
@@ -66,10 +66,10 @@ impl KeystoreManager for VerboseFailingKeystoreManager {
 struct SimpleSlashingProtection;
 
 impl SlashingProtection for SimpleSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#.to_string())
     }
 }
@@ -78,11 +78,11 @@ impl SlashingProtection for SimpleSlashingProtection {
 struct VerboseFailingSlashingProtection;
 
 impl SlashingProtection for VerboseFailingSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
-        Err(VERBOSE_ERROR.to_string())
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+        Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
-        Err(VERBOSE_ERROR.to_string())
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+        Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
 }
 
@@ -134,7 +134,7 @@ impl RemoteKeyManager for VerboseFailingRemoteKeyManager {
         false
     }
     fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
-        Err(ImportRemoteKeyError::Other(VERBOSE_ERROR.to_string()))
+        Err(ImportRemoteKeyError::Backend(VERBOSE_ERROR.to_string()))
     }
     fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
         Ok(false)
@@ -209,7 +209,11 @@ async fn test_internal_error_sanitized() {
         keystore_manager: Arc::new(SimpleKeystoreManager),
         slashing_protection: Arc::new(VerboseFailingSlashingProtection),
         validator_manager: Arc::new(NoopValidatorManager),
-        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            std::time::Duration::ZERO,
+            Arc::new(NoopDoppelgangerMonitor),
+            Arc::new(NoopValidatorManager),
+        )),
         remote_key_manager: Arc::new(SimpleRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -217,9 +221,6 @@ async fn test_internal_error_sanitized() {
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: std::time::Duration::ZERO,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let slashing_data = r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#;
@@ -263,7 +264,11 @@ async fn test_keystore_import_item_error_sanitized() {
         keystore_manager: Arc::new(VerboseFailingKeystoreManager),
         slashing_protection: Arc::new(SimpleSlashingProtection),
         validator_manager: Arc::new(NoopValidatorManager),
-        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            std::time::Duration::ZERO,
+            Arc::new(NoopDoppelgangerMonitor),
+            Arc::new(NoopValidatorManager),
+        )),
         remote_key_manager: Arc::new(SimpleRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -271,9 +276,6 @@ async fn test_keystore_import_item_error_sanitized() {
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: std::time::Duration::ZERO,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let body = serde_json::json!({
@@ -319,7 +321,11 @@ async fn test_remote_key_import_item_error_sanitized() {
         keystore_manager: Arc::new(SimpleKeystoreManager),
         slashing_protection: Arc::new(SimpleSlashingProtection),
         validator_manager: Arc::new(NoopValidatorManager),
-        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            std::time::Duration::ZERO,
+            Arc::new(NoopDoppelgangerMonitor),
+            Arc::new(NoopValidatorManager),
+        )),
         remote_key_manager: Arc::new(VerboseFailingRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -327,9 +333,6 @@ async fn test_remote_key_import_item_error_sanitized() {
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: std::time::Duration::ZERO,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let pubkey_str = format!("0x{}", pubkey_hex(3));

@@ -6,26 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 prost.workspace = true
-thiserror.workspace = true
+signer-proto = { workspace = true, features = ["server", "client"] }
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-hex.workspace = true
-rcgen = "0.13"
+eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-test-support.workspace = true
 slashing.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 tracing-subscriber.workspace = true
-
-[build-dependencies]
-tonic-build.workspace = true

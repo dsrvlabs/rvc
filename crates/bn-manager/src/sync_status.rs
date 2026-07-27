@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::BeaconClient;
-use crypto::logging::RedactedUrl;
 use futures::future::join_all;
+use observability::logging::RedactedUrl;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -41,6 +41,8 @@ impl BnSyncStatus {
 pub struct BnSyncDetail {
     pub status: BnSyncStatus,
     pub sync_distance: Option<u64>,
+    /// Latest head slot reported by `/eth/v1/node/syncing`, when parseable.
+    pub head_slot: Option<u64>,
     pub is_optimistic: bool,
     pub el_offline: bool,
 }
@@ -51,6 +53,7 @@ impl BnSyncDetail {
         Self {
             status: BnSyncStatus::Unknown,
             sync_distance: None,
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         }
@@ -157,6 +160,7 @@ async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
         Ok(response) => {
             let data = &response.data;
             let sync_distance = data.sync_distance.parse::<u64>().ok();
+            let head_slot = data.head_slot.parse::<u64>().ok();
             let is_optimistic = data.is_optimistic;
             let el_offline = data.el_offline;
             let status = if data.is_syncing || data.is_optimistic {
@@ -166,11 +170,12 @@ async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
             } else {
                 BnSyncStatus::Synced
             };
-            BnSyncDetail { status, sync_distance, is_optimistic, el_offline }
+            BnSyncDetail { status, sync_distance, head_slot, is_optimistic, el_offline }
         }
         Err(_) => BnSyncDetail {
             status: BnSyncStatus::Unreachable,
             sync_distance: None,
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         },
@@ -264,18 +269,21 @@ mod tests {
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
@@ -296,18 +304,21 @@ mod tests {
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Syncing,
                 sync_distance: Some(500),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
@@ -328,12 +339,14 @@ mod tests {
             BnSyncDetail {
                 status: BnSyncStatus::Unreachable,
                 sync_distance: None,
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Unreachable,
                 sync_distance: None,
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
@@ -354,24 +367,28 @@ mod tests {
             BnSyncDetail {
                 status: BnSyncStatus::Syncing,
                 sync_distance: Some(500),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Unreachable,
                 sync_distance: None,
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },
@@ -394,6 +411,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(0),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -402,6 +420,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(8),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -414,6 +433,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(9),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -422,6 +442,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(16),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -434,6 +455,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(17),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -442,6 +464,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(64),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -454,6 +477,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: Some(65),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -466,6 +490,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Unreachable,
             sync_distance: None,
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -478,6 +503,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::ElOffline,
             sync_distance: Some(0),
+            head_slot: None,
             is_optimistic: false,
             el_offline: true,
         };
@@ -498,6 +524,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Syncing,
             sync_distance: Some(5),
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -510,6 +537,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Synced,
             sync_distance: None,
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -522,6 +550,7 @@ mod tests {
         let detail = BnSyncDetail {
             status: BnSyncStatus::Syncing,
             sync_distance: None,
+            head_slot: None,
             is_optimistic: false,
             el_offline: false,
         };
@@ -540,6 +569,7 @@ mod tests {
     const OPTIMISTIC_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}"#;
 
     fn make_client(endpoint: &str) -> BeaconClient {
+        // max_retries=0 under multi-BN: see BnManager type docs (retries-under-failover).
         let config = BeaconClientConfig::new(endpoint).with_max_retries(0);
         BeaconClient::new(config).unwrap()
     }
@@ -569,7 +599,9 @@ mod tests {
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Synced);
         assert_eq!(guard[0].sync_distance, Some(0));
+        assert_eq!(guard[0].head_slot, Some(1000));
         assert_eq!(guard[1].status, BnSyncStatus::Synced);
+        assert_eq!(guard[1].head_slot, Some(1000));
     }
 
     #[tokio::test]
@@ -596,8 +628,10 @@ mod tests {
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Synced);
+        assert_eq!(guard[0].head_slot, Some(1000));
         assert_eq!(guard[1].status, BnSyncStatus::Syncing);
         assert_eq!(guard[1].sync_distance, Some(500));
+        assert_eq!(guard[1].head_slot, Some(500));
     }
 
     #[tokio::test]
@@ -618,6 +652,7 @@ mod tests {
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Unreachable);
         assert_eq!(guard[0].sync_distance, None);
+        assert_eq!(guard[0].head_slot, None);
     }
 
     #[tokio::test]
@@ -844,6 +879,7 @@ mod tests {
             BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             },

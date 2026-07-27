@@ -15,16 +15,16 @@
 
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, Checkpoint,
-    ContributionAndProof, ForkInfo, ForkSchedule, SyncAggregatorSelectionData,
+    ContributionAndProof, ForkInfo, ForkName, ForkSchedule, SyncAggregatorSelectionData,
     SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
     DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
-use rvc_crypto::typed_signer::capella_capped_fork_version;
 use rvc_crypto::KeyManager;
 use rvc_crypto::{
-    compute_domain, compute_signing_root, LocalSigner, SecretKey, SignContext, TypedSigner,
+    capella_capped_fork_version, compute_domain, compute_signing_root, LocalSigner, SecretKey,
+    SignContext, TypedSigner,
 };
 
 // ============================================================
@@ -69,7 +69,7 @@ fn deneb_fork_info() -> ForkInfo {
 }
 
 fn make_ctx(sk: &SecretKey, fork_info: ForkInfo) -> SignContext {
-    SignContext { pubkey: sk.public_key(), fork_info }
+    SignContext { pubkey: sk.public_key(), fork_info, fork_name: ForkName::Deneb }
 }
 
 // ============================================================
@@ -86,7 +86,7 @@ async fn test_typed_signer_local_block_golden() {
         proposer_index: 12345,
         parent_root: [0x10; 32],
         state_root: [0x20; 32],
-        body: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
     let signer = make_signer(sk);
 
@@ -120,7 +120,7 @@ async fn test_typed_signer_local_blinded_block_golden() {
         proposer_index: 42,
         parent_root: [0x30; 32],
         state_root: [0x40; 32],
-        body: vec![0xca, 0xfe, 0xba, 0xbe],
+        body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
     };
     let signer = make_signer(sk);
 
@@ -364,7 +364,7 @@ async fn test_typed_signer_local_voluntary_exit_golden() {
         current_version: capella_version,
         genesis_validators_root: GENESIS_VALIDATORS_ROOT,
     };
-    let ctx = SignContext { pubkey: sk.public_key(), fork_info };
+    let ctx = SignContext { pubkey: sk.public_key(), fork_info, fork_name: ForkName::Capella };
     let exit = VoluntaryExit { epoch: exit_epoch, validator_index: 999 };
     let signer = make_signer(sk);
 
@@ -399,7 +399,7 @@ async fn test_typed_signer_local_signing_root_deterministic() {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xab; 8],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
 
     let domain =

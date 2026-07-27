@@ -22,17 +22,24 @@ pub struct BlsToExecutionArgs {
 }
 
 pub fn run(args: BlsToExecutionArgs) -> Result<()> {
-    let network = network::from_name(&args.network)?;
-
-    let execution_address = password::validate_address(&args.execution_address)?;
-
     let mnemonic_phrase = Zeroizing::new(
         rpassword::prompt_password_stderr("Enter your mnemonic: ")
             .context("Failed to read mnemonic")?,
     );
+    run_with_mnemonic(args, mnemonic_phrase.trim())
+}
+
+/// Sign and write a BLS-to-execution change using an already-resolved mnemonic.
+///
+/// Interactive CLI entry is [`run`]; this is the shared command body used by
+/// tests (and any caller that already holds the phrase).
+pub fn run_with_mnemonic(args: BlsToExecutionArgs, mnemonic_phrase: &str) -> Result<()> {
+    let network = network::from_name(&args.network)?;
+
+    let execution_address = password::validate_address(&args.execution_address)?;
 
     let mnemonic =
-        mnemonic::validate_mnemonic(mnemonic_phrase.trim()).context("Invalid mnemonic phrase")?;
+        mnemonic::validate_mnemonic(mnemonic_phrase).context("Invalid mnemonic phrase")?;
 
     let seed = mnemonic::mnemonic_to_seed(&mnemonic, &args.mnemonic_passphrase);
 
@@ -49,10 +56,10 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
         to_execution_address: execution_address,
     };
 
-    // Domain: DOMAIN_BLS_TO_EXECUTION_CHANGE with Capella fork version and actual genesis_validators_root
+    // Domain: DOMAIN_BLS_TO_EXECUTION_CHANGE with genesis fork version (EIP-7044) and genesis_validators_root
     let domain = compute_domain(
         DOMAIN_BLS_TO_EXECUTION_CHANGE,
-        network.capella_fork_version,
+        network.genesis_fork_version,
         network.genesis_validators_root,
     );
 
@@ -74,28 +81,8 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
     let filename = format!("bls_to_execution-{}-{}.json", timestamp, args.validator_index);
     let output_path = args.output_dir.join(filename);
 
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-
-        file.write_all(json.as_bytes())
-            .with_context(|| format!("Failed to write output file: {}", output_path.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(&output_path, &json)
-            .with_context(|| format!("Failed to write output file: {}", output_path.display()))?;
-    }
+    crate::fs_util::write_new_0600(&output_path, json.as_bytes())
+        .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
 
     eprintln!("BLS-to-execution change written to: {}", output_path.display());
 
@@ -139,7 +126,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -149,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bls_to_execution_uses_capella_fork_version() {
+    fn test_bls_to_execution_uses_genesis_fork_version() {
         let (withdrawal_key, withdrawal_pubkey) = test_withdrawal_key(0);
 
         let change = BLSToExecutionChange {
@@ -160,26 +147,26 @@ mod tests {
 
         let network = network::from_name("mainnet").unwrap();
 
-        // Sign with Capella fork version (correct)
-        let capella_domain = compute_domain(
-            DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
-            network.genesis_validators_root,
-        );
-        let capella_root = compute_signing_root(&change, capella_domain);
-        let signature = withdrawal_key.sign(&capella_root);
-
-        // Verify with Capella succeeds
-        assert!(signature.verify(&withdrawal_pubkey, &capella_root).is_ok());
-
-        // Verify with genesis fork version fails (proves we use Capella)
+        // Sign with genesis fork version (correct per EIP-7044 / Capella process_bls_to_execution_change)
         let genesis_domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
             network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let genesis_root = compute_signing_root(&change, genesis_domain);
-        assert!(signature.verify(&withdrawal_pubkey, &genesis_root).is_err());
+        let signature = withdrawal_key.sign(&genesis_root);
+
+        // Verify with genesis succeeds
+        assert!(signature.verify(&withdrawal_pubkey, &genesis_root).is_ok());
+
+        // Verify with Capella fork version fails (proves we use genesis, not Capella)
+        let capella_domain = compute_domain(
+            DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            network.capella_fork_version,
+            network.genesis_validators_root,
+        );
+        let capella_root = compute_signing_root(&change, capella_domain);
+        assert!(signature.verify(&withdrawal_pubkey, &capella_root).is_err());
     }
 
     #[test]
@@ -197,7 +184,7 @@ mod tests {
         // Sign with actual genesis_validators_root (correct)
         let correct_domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let correct_root = compute_signing_root(&change, correct_domain);
@@ -205,7 +192,7 @@ mod tests {
 
         // Verify with zeroed root fails (proves we use actual root)
         let zeroed_domain =
-            compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, network.capella_fork_version, [0u8; 32]);
+            compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, network.genesis_fork_version, [0u8; 32]);
         let zeroed_root = compute_signing_root(&change, zeroed_domain);
         assert!(signature.verify(&withdrawal_pubkey, &zeroed_root).is_err());
     }
@@ -242,7 +229,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -292,7 +279,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -307,21 +294,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let output_path = dir.path().join("test_bls.json");
-
-        {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&output_path)
-                .unwrap();
-
-            file.write_all(json.as_bytes()).unwrap();
-        }
+        crate::fs_util::write_new_0600(&output_path, json.as_bytes()).unwrap();
 
         let metadata = fs::metadata(&output_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
@@ -330,6 +303,70 @@ mod tests {
         let content = fs::read_to_string(&output_path).unwrap();
         let parsed: SignedBLSToExecutionChange = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.message.validator_index, 1);
+    }
+
+    /// Command body must refuse to overwrite an existing output path (create_new via helper).
+    /// Exercises `run_with_mnemonic` (same write path as interactive `run` after the prompt).
+    #[test]
+    fn test_bls_to_execution_refuses_to_overwrite_existing_output() {
+        use std::io::ErrorKind;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let validator_index = 1u64;
+        let prior = b"prior bls change";
+        // Lowercase address skips EIP-55 mixed-case checksum validation.
+        let execution_address = format!("0x{}", "ab".repeat(20));
+
+        for _ in 0..50 {
+            for entry in fs::read_dir(&output_dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().starts_with("bls_to_execution-") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let output_path =
+                output_dir.join(format!("bls_to_execution-{}-{}.json", ts, validator_index));
+            fs::write(&output_path, prior).unwrap();
+
+            let result = run_with_mnemonic(
+                BlsToExecutionArgs {
+                    network: "mainnet".into(),
+                    output_dir: output_dir.clone(),
+                    validator_index,
+                    execution_address: execution_address.clone(),
+                    bls_withdrawal_index: 0,
+                    mnemonic_passphrase: String::new(),
+                },
+                TEST_MNEMONIC,
+            );
+
+            match result {
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let name = output_path.file_name().unwrap().to_string_lossy();
+                    assert!(
+                        msg.contains(name.as_ref())
+                            || msg.contains(&output_path.display().to_string()),
+                        "error must include path: {msg}"
+                    );
+                    assert_eq!(fs::read(&output_path).unwrap(), prior);
+                    let io_err = e
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .expect("root cause should be io::Error");
+                    assert_eq!(io_err.kind(), ErrorKind::AlreadyExists);
+                    return;
+                }
+                Ok(()) => continue,
+            }
+        }
+        panic!("failed to force output path collision through bls_to_execution command path");
     }
 
     #[test]
@@ -345,7 +382,7 @@ mod tests {
         let network = network::from_name("hoodi").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);

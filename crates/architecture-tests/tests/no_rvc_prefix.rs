@@ -1,7 +1,7 @@
 //! Standing CI gate: no `rvc.`-prefixed span names or field keys in production logging.
 //!
 //! Phase 4 of the structured-logging initiative normalizes the legacy `rvc.` tracing
-//! namespace to the canonical registry (`crypto::logging::fields`) so OTLP dashboards group
+//! namespace to the canonical registry (`observability::logging::fields`) so OTLP dashboards group
 //! on `slot`, not `rvc.slot`. This gate scans production `*.rs` source under `crates/*/src`
 //! and `bin/*/src` and fails if an `rvc.`-prefixed tracing span name or field key appears in
 //! a file that is neither permanently `EXCLUDE`d (non-key fixtures) nor on the temporary
@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 /// they are excluded outright rather than tracked in `KNOWN_REMAINING`.
 const EXCLUDE: &[&str] = &[
     // Conformance helper's test inputs ("rvc.slot", "rvc.foo") exercising the Gate-5 diff.
-    "crates/crypto/src/logging.rs",
+    "crates/observability/src/logging.rs",
     // The product's rotating log file is literally named "rvc.log" (a filename, not a key).
     "crates/telemetry/src/file_appender.rs",
-    // Likewise: bin/rvc's only rvc. hit is the default `"rvc.log"` log filename.
-    "bin/rvc/src/main.rs",
+    // Likewise: bin/rvc's only rvc. hit is the default `"rvc.log"` log filename
+    // (lived in main.rs before the RF5 bootstrap extraction moved it to logging.rs).
+    "bin/rvc/src/logging.rs",
 ];
 
 /// Production files still carrying `rvc.`-prefixed tracing keys, pending their normalization
@@ -149,7 +150,7 @@ fn no_rvc_prefixed_keys_outside_allow_lists() {
     assert!(
         offenders.is_empty(),
         "rvc.-prefixed tracing keys found in files not on EXCLUDE/KNOWN_REMAINING.\n\
-         Normalize them to crypto::logging::fields, or (if the `rvc.` is a non-key fixture) \
+         Normalize them to observability::logging::fields, or (if the `rvc.` is a non-key fixture) \
          add the file to EXCLUDE:\n  {}",
         offenders.join("\n  ")
     );

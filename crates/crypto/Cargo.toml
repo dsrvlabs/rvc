@@ -6,13 +6,24 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes `test_utils` (create_test_keystore fixtures). Enable only from
+# consumers' [dev-dependencies] — never on production dependency lines.
+test-utils = []
+
 [dependencies]
+observability = { workspace = true }
 aes.workspace = true
 async-trait.workspace = true
 blst.workspace = true
 ctr.workspace = true
 eth-types.workspace = true
 hex.workspace = true
+web3signer-wire.workspace = true
 pbkdf2.workspace = true
 rand.workspace = true
 reqwest = { workspace = true }
@@ -22,13 +33,11 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ssz.workspace = true
-ssz_derive.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 tree_hash.workspace = true
-tree_hash_derive.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 hkdf.workspace = true
@@ -37,10 +46,8 @@ parking_lot.workspace = true
 bip39.workspace = true
 rayon.workspace = true
 
-[features]
-test-utils = []
-
 [dev-dependencies]
+eth-types = { workspace = true, features = ["test-fixtures"] }
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

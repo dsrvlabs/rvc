@@ -52,6 +52,7 @@ use parking_lot::Mutex;
 
 use crate::enablement::SigningEnablement;
 use crate::error::DoppelgangerError;
+use crate::restart_skip::should_skip_restart_monitoring;
 use crate::state::{ForwardWindowStatus, ValidatorState};
 use crate::traits::ValidatorLivenessData;
 
@@ -89,13 +90,9 @@ impl ForwardWindowMachine {
     /// Restart-aware safe-skip (Layer 4): if `last_signed_attestation` returns a
     /// target epoch that is RECENT (within the monitoring window), the validator
     /// transitions straight to `Safe` without waiting for the full window.
-    /// A stale attestation (outside the window) does NOT trigger the skip —
-    /// mirroring `DoppelgangerService::check_validators` (service.rs:129-131).
-    ///
-    /// The recency guard `current_epoch > monitoring_epochs` prevents the
-    /// pre-genesis-clock-skew bypass (same guard as the service M-7 fix):
-    /// when `current_epoch == 0`, saturating arithmetic would make every
-    /// validator with any history look recent.
+    /// A stale attestation (outside the window) does NOT trigger the skip.
+    /// Uses the shared [`crate::should_skip_restart_monitoring`] predicate
+    /// (same rule as the legacy service).
     pub fn register(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let mut states = self.states.lock();
@@ -118,7 +115,7 @@ impl ForwardWindowMachine {
         // even if `register` is called again at epoch 0 (idempotency wins).
         if current_epoch == 0 {
             tracing::info!(
-                pubkey = %crypto::logging::TruncatedPubkey::new(&pubkey_hex),
+                pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
                 "doppelganger: pre-genesis (epoch 0) bypass — validator marked Safe without a monitoring window"
             );
             states.insert(pubkey_hex, ValidatorState::Safe);
@@ -127,16 +124,52 @@ impl ForwardWindowMachine {
 
         // Restart-aware safe-skip: only skip if the prior attestation is RECENT.
         let prior = self.slashing_reader.last_signed_attestation(&pubkey_hex, &self.gvr);
-        if let Some(target_epoch) = prior {
-            if current_epoch > self.monitoring_epochs
-                && current_epoch.saturating_sub(target_epoch) <= self.monitoring_epochs
-            {
-                states.insert(pubkey_hex, ValidatorState::Safe);
+        if should_skip_restart_monitoring(current_epoch, prior, self.monitoring_epochs) {
+            states.insert(pubkey_hex, ValidatorState::Safe);
+            return;
+        }
+
+        let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
+        states.insert(
+            pubkey_hex,
+            ValidatorState::Pending {
+                start_epoch: current_epoch,
+                end_epoch,
+                observed_epochs: BTreeSet::new(),
+            },
+        );
+    }
+
+    /// Register a **keymanager-imported** (or dynamically discovered) key.
+    ///
+    /// Unlike [`Self::register`], this path **never** applies:
+    /// - epoch-0 pre-genesis Safe bypass
+    /// - restart-aware Safe-skip from slashing-DB history
+    ///
+    /// Both bypasses are unsafe on the import path: a future/`mis-set`
+    /// genesis can yield epoch 0, and interchange import can plant recent
+    /// attestation history that would Safe-skip before any network liveness
+    /// is observed (SEC-2b review Finding 1 / 2). Imported keys always enter
+    /// `Pending` until SEC-2c observation + tick (or operator opt-out).
+    ///
+    /// Idempotent: existing non-`Unmonitored` state is left unchanged.
+    pub fn register_for_import(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let mut states = self.states.lock();
+
+        if let Some(state) = states.get(&pubkey_hex) {
+            if !matches!(state, ValidatorState::Unmonitored) {
                 return;
             }
         }
 
         let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
+        tracing::info!(
+            pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
+            current_epoch,
+            end_epoch,
+            "doppelganger: import/register_for_import — forced Pending (no epoch-0 / restart safe-skip)"
+        );
         states.insert(
             pubkey_hex,
             ValidatorState::Pending {

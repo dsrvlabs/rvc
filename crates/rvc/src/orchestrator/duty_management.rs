@@ -7,12 +7,14 @@ use tracing::{debug, info, warn};
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use duty_tracker::DutyTracker;
+use eth_types::Slot;
 use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
-use signer::{is_aggregator, SignerService};
-use timing::{SlotClock, SLOTS_PER_EPOCH};
+use signer::{is_aggregator, SignerService, ValidatorSigner};
+use timing::SLOTS_PER_EPOCH;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
-use super::utils;
+use super::utils::{self, TimedOutcome};
+use crate::pubkey_index::{parse_pubkey_bytes, SharedPubkeyIndexRegistry};
 
 /// Number of epochs in a single sync committee period.
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
@@ -20,35 +22,36 @@ const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 /// How many epochs before the end of a period to start prefetching next-period duties.
 const PREFETCH_LOOKAHEAD: u64 = 2;
 
-pub(crate) struct DutyManagementService<C: SlotClock + 'static> {
-    clock: Arc<C>,
+pub(crate) struct DutyManagementService {
     signer: Arc<SignerService>,
     beacon: Arc<dyn BeaconNodeClient>,
     duty_tracker: Arc<DutyTracker>,
     validator_store: Arc<validator_store::ValidatorStore>,
     pubkey_map: PubkeyMap,
+    /// Shared pubkey → validator-index registry (O(1) prepare_proposers).
+    pubkey_index: SharedPubkeyIndexRegistry,
     config: OrchestratorConfig,
     /// Tracks which sync committee periods have been prefetched to ensure idempotency.
     prefetched_periods: RwLock<HashSet<u64>>,
 }
 
-impl<C: SlotClock + 'static> DutyManagementService<C> {
+impl DutyManagementService {
     pub(crate) fn new(
-        clock: Arc<C>,
         signer: Arc<SignerService>,
         beacon: Arc<dyn BeaconNodeClient>,
         duty_tracker: Arc<DutyTracker>,
         validator_store: Arc<validator_store::ValidatorStore>,
         pubkey_map: PubkeyMap,
+        pubkey_index: SharedPubkeyIndexRegistry,
         config: OrchestratorConfig,
     ) -> Self {
         Self {
-            clock,
             signer,
             beacon,
             duty_tracker,
             validator_store,
             pubkey_map,
+            pubkey_index,
             config,
             prefetched_periods: RwLock::new(HashSet::new()),
         }
@@ -62,15 +65,16 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Attester duties
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
-            match tokio::time::timeout(
+            match utils::timed(
+                "attester_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_duties_for_epoch(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Attester duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -81,15 +85,16 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Proposer duties
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
-            match tokio::time::timeout(
+            match utils::timed(
+                "proposer_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_proposer_duties(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Proposer duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -100,15 +105,18 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Sync committee duties (at period boundaries)
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
-            match tokio::time::timeout(
+            match utils::timed(
+                "sync_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_sync_committee_duties(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch sync committee duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => {
+                    warn!(epoch, error = %e, "Failed to fetch sync committee duties")
+                }
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Sync committee duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -166,13 +174,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             next_period, next_period_first_epoch, "Prefetching next-period sync committee duties"
         );
 
-        match tokio::time::timeout(
+        match utils::timed(
+            "sync_duty_prefetch",
             self.config.timeouts.duty_fetch,
             self.duty_tracker.fetch_sync_committee_duties(next_period_first_epoch),
         )
         .await
         {
-            Ok(Ok(_)) => {
+            TimedOutcome::Ok(_) => {
                 info!(
                     next_period,
                     next_period_first_epoch, "Prefetched sync committee duties for next period"
@@ -181,7 +190,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                 // in the lookahead window skips the BN round-trip.
                 self.prefetched_periods.write().await.insert(next_period);
             }
-            Ok(Err(e)) => {
+            TimedOutcome::Err(e) => {
                 warn!(
                     next_period,
                     next_period_first_epoch,
@@ -189,7 +198,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     "Failed to prefetch sync committee duties for next period"
                 );
             }
-            Err(_) => {
+            TimedOutcome::Timeout => {
                 warn!(
                     next_period,
                     next_period_first_epoch,
@@ -205,13 +214,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
-            match tokio::time::timeout(
+            match utils::timed(
+                "attester_reorg_check",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_if_root_changed(epoch),
             )
             .await
             {
-                Ok(Ok(true)) if attester_cached => {
+                TimedOutcome::Ok(true) if attester_cached => {
                     let new_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
                     warn!(
                         epoch,
@@ -221,14 +231,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
                 }
-                Ok(Ok(true)) => {
+                TimedOutcome::Ok(true) => {
                     debug!(epoch, "Attester duties fetched (was uncached)");
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
+                TimedOutcome::Ok(false) => {}
+                TimedOutcome::Err(e) => {
                     warn!(epoch, error = %e, "Failed to check attester dependent root");
                 }
-                Err(_) => {
+                TimedOutcome::Timeout => {
                     warn!(
                         epoch,
                         "Attester reorg check timed out after {}s",
@@ -240,13 +250,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
             let old_proposer_root =
                 self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
-            match tokio::time::timeout(
+            match utils::timed(
+                "proposer_reorg_check",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
             )
             .await
             {
-                Ok(Ok(true)) if proposer_cached => {
+                TimedOutcome::Ok(true) if proposer_cached => {
                     let new_root =
                         self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
                     warn!(
@@ -257,14 +268,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
                 }
-                Ok(Ok(true)) => {
+                TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
+                TimedOutcome::Ok(false) => {}
+                TimedOutcome::Err(e) => {
                     warn!(epoch, error = %e, "Failed to check proposer dependent root");
                 }
-                Err(_) => {
+                TimedOutcome::Timeout => {
                     warn!(
                         epoch,
                         "Proposer reorg check timed out after {}s",
@@ -277,64 +288,50 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
 
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all)]
     pub(crate) async fn prepare_proposers(&self) {
-        let mut preparations = Vec::new();
+        // O(validators): one registry lookup per local key — no duty-cache scan.
+        // Build the preparations list under short sync locks (no await held).
+        let preparations: Vec<ProposerPreparation> = {
+            let pubkey_snapshot = self.pubkey_map.read().clone();
+            let index_registry = self.pubkey_index.read();
+            let mut out = Vec::with_capacity(pubkey_snapshot.len());
+            for (pubkey_bytes, pubkey) in &pubkey_snapshot {
+                let fee_recipient =
+                    self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
+                let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
 
-        let pubkey_snapshot = self.pubkey_map.read().clone();
-        for (pubkey_hex, pubkey) in &pubkey_snapshot {
-            let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
-            let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
-
-            // We need the validator_index. Look it up from cached attester duties.
-            // Iterate over current and next epoch slots to find a duty with this pubkey.
-            let normalized = utils::normalize_pubkey(pubkey_hex);
-            let mut found_index = None;
-
-            if let Ok(current_slot) = self.clock.current_slot() {
-                let current_epoch = current_slot / SLOTS_PER_EPOCH;
-                for epoch in [current_epoch, current_epoch + 1] {
-                    for slot_offset in 0..SLOTS_PER_EPOCH {
-                        let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
-                        let duties = self.duty_tracker.get_duties_for_slot(slot).await;
-                        for duty in &duties {
-                            if utils::normalize_pubkey(&duty.pubkey) == normalized {
-                                found_index = Some(duty.validator_index.clone());
-                                break;
-                            }
-                        }
-                        if found_index.is_some() {
-                            break;
-                        }
+                match index_registry.index_of(pubkey_bytes) {
+                    Some(validator_index) => {
+                        out.push(ProposerPreparation {
+                            validator_index: validator_index.to_string(),
+                            fee_recipient: fee_recipient_hex,
+                        });
                     }
-                    if found_index.is_some() {
-                        break;
+                    None => {
+                        debug!(
+                            pubkey = %format!("0x{}", hex::encode(pubkey_bytes)),
+                            "No validator index found for proposer preparation"
+                        );
                     }
                 }
             }
-
-            if let Some(validator_index) = found_index {
-                preparations.push(ProposerPreparation {
-                    validator_index,
-                    fee_recipient: fee_recipient_hex,
-                });
-            } else {
-                debug!(pubkey = %pubkey_hex, "No validator index found for proposer preparation");
-            }
-        }
+            out
+        };
 
         if preparations.is_empty() {
             return;
         }
 
         let count = preparations.len();
-        match tokio::time::timeout(
+        match utils::timed(
+            "proposer_preparation",
             self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
         {
-            Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
-            Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
-            Err(_) => {
+            TimedOutcome::Ok(_) => info!(count, "Sent proposer preparations"),
+            TimedOutcome::Err(e) => warn!(error = %e, "Failed to send proposer preparations"),
+            TimedOutcome::Timeout => {
                 warn!(
                     "Proposer preparation timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
@@ -353,14 +350,12 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             let duties = self.duty_tracker.get_duties_for_slot(slot).await;
 
             for duty in &duties {
-                // Only subscribe for our own validators
-                let normalized = utils::normalize_pubkey(&duty.pubkey);
-                let pubkey =
-                    pubkey_snapshot.iter().find(|(k, _)| utils::normalize_pubkey(k) == normalized);
-
-                let pubkey = match pubkey {
-                    Some((_, pk)) => pk.clone(),
-                    None => continue,
+                // Only subscribe for our own validators (O(1) by compressed bytes).
+                let Some(duty_bytes) = parse_pubkey_bytes(&duty.pubkey) else {
+                    continue;
+                };
+                let Some(pubkey) = pubkey_snapshot.get(&duty_bytes).cloned() else {
+                    continue;
                 };
 
                 let committee_length: u64 = match duty.committee_length.parse() {
@@ -415,20 +410,74 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
 
         let count = subscriptions.len();
-        match tokio::time::timeout(
+        match utils::timed(
+            "committee_subscription",
             self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
         {
-            Ok(Ok(_)) => info!(count, epoch, "Sent committee subscriptions"),
-            Ok(Err(e)) => warn!(epoch, error = %e, "Failed to send committee subscriptions"),
-            Err(_) => warn!(
+            TimedOutcome::Ok(_) => info!(count, epoch, "Sent committee subscriptions"),
+            TimedOutcome::Err(e) => {
+                warn!(epoch, error = %e, "Failed to send committee subscriptions")
+            }
+            TimedOutcome::Timeout => warn!(
                 epoch,
                 "Committee subscription timed out after {}s",
                 self.config.timeouts.preparation.as_secs()
             ),
         }
+    }
+
+    /// Epoch-boundary work: reorg checks, proposer preparation, committee
+    /// subscriptions for the current and next epoch, then a duty summary.
+    ///
+    /// Extracted from the coordinator slot loop so the run path stays a pure
+    /// phase dispatcher. Circuit-breaker reset stays in the coordinator (it
+    /// owns that state).
+    #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
+    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) {
+        self.check_reorg_at_epoch_boundary(current_epoch).await;
+        self.prepare_proposers().await;
+        self.submit_committee_subscriptions(current_epoch).await;
+        self.submit_committee_subscriptions(current_epoch + 1).await;
+        self.log_epoch_boundary_summary(current_epoch, current_slot).await;
+    }
+
+    /// Count attester/proposer/sync duties for the epoch and emit the
+    /// `Epoch boundary summary` info line.
+    ///
+    /// Iterates the slot range once (attester + proposer per slot) rather than
+    /// two separate 32-slot loops.
+    pub(crate) async fn log_epoch_boundary_summary(&self, current_epoch: u64, current_slot: Slot) {
+        let (attester_count, proposer_count, sync_count) =
+            self.epoch_boundary_summary_counts(current_epoch, current_slot).await;
+        info!(
+            epoch = current_epoch,
+            attester_count, proposer_count, sync_count, "Epoch boundary summary"
+        );
+    }
+
+    /// Counts used by the epoch-boundary summary.
+    ///
+    /// Single pass over `[epoch * 32, epoch * 32 + 32)` for attester and
+    /// proposer duties; sync committee duties are read for `current_slot`.
+    pub(crate) async fn epoch_boundary_summary_counts(
+        &self,
+        epoch: u64,
+        current_slot: Slot,
+    ) -> (usize, usize, usize) {
+        let mut attester_count = 0usize;
+        let mut proposer_count = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            attester_count += self.duty_tracker.get_duties_for_slot(slot).await.len();
+            if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
+                proposer_count += 1;
+            }
+        }
+        let sync_count = self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
+        (attester_count, proposer_count, sync_count)
     }
 }
 
@@ -445,9 +494,9 @@ mod tests {
     use crypto::{CompositeSigner, KeyManager, LocalSigner};
     use duty_tracker::DutyTracker;
     use eth_types::ForkSchedule;
-    use signer::SignerService;
+    use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
-    use timing::MockSlotClock;
+
     use validator_store::ValidatorStore;
 
     use super::*;
@@ -491,7 +540,7 @@ mod tests {
         })
     }
 
-    async fn build_service_no_validators(beacon_url: &str) -> DutyManagementService<MockSlotClock> {
+    async fn build_service_no_validators(beacon_url: &str) -> DutyManagementService {
         let beacon_config = BeaconClientConfig::new(beacon_url)
             .with_timeout(Duration::from_secs(5))
             .with_max_retries(1);
@@ -500,17 +549,17 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         DutyManagementService::new(
-            clock,
             signer,
             beacon,
             duty_tracker,
             validator_store,
             pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
         )
     }
@@ -604,17 +653,17 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1".to_string()]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         let service = DutyManagementService::new(
-            clock,
             signer,
             beacon_client,
             duty_tracker.clone(),
             validator_store,
             pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
         );
 
@@ -746,5 +795,146 @@ mod tests {
         let service = build_service_no_validators(&server.uri()).await;
         service.fetch_epoch_duties(current_epoch).await;
         // wiremock asserts expect(1) for PERIOD sync duties on drop
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Epoch-boundary summary: single-pass counts match dual-loop baseline
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// RF6-27: collapsing the two 32-slot loops into one pass must not change
+    /// the attester/proposer/sync counts that feed `Epoch boundary summary`.
+    #[tokio::test]
+    async fn test_epoch_boundary_summary_counts_match_dual_loop() {
+        use bn_manager::{
+            AttesterDutiesResponse, AttesterDuty, MockBeaconNodeClient, ProposerDutiesResponse,
+            ProposerDuty, SyncCommitteeDutiesResponse,
+        };
+        use eth_types::SyncCommitteeDuty;
+
+        let epoch = 10u64;
+        let slot_base = epoch * SLOTS_PER_EPOCH;
+        // 3 attester duties on two slots (2 + 1), 2 proposer slots, 1 sync duty.
+        let attester_data = vec![
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                committee_index: "0".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: slot_base.to_string(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "2".into(),
+                committee_index: "1".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "1".into(),
+                slot: slot_base.to_string(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                committee_index: "0".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: (slot_base + 5).to_string(),
+            },
+        ];
+        let proposer_data = vec![
+            ProposerDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                slot: slot_base.to_string(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "2".into(),
+                slot: (slot_base + 7).to_string(),
+            },
+        ];
+        let sync_data = vec![SyncCommitteeDuty {
+            pubkey: [0x11; 48],
+            validator_index: 1,
+            validator_sync_committee_indices: vec![0],
+        }];
+
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties({
+                    let data = attester_data.clone();
+                    move |_epoch, _indices| {
+                        Ok(AttesterDutiesResponse {
+                            dependent_root: "0xdeproot".into(),
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                })
+                .with_get_proposer_duties({
+                    let data = proposer_data.clone();
+                    move |_epoch| {
+                        Ok(ProposerDutiesResponse {
+                            dependent_root: "0xdeproot".into(),
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                })
+                .with_post_sync_committee_duties({
+                    let data = sync_data.clone();
+                    move |_epoch, _indices| {
+                        Ok(SyncCommitteeDutiesResponse {
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                }),
+        ) as Arc<dyn BeaconNodeClient>;
+
+        let indices = vec!["1".to_string(), "2".to_string()];
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
+        duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+        duty_tracker.fetch_sync_committee_duties(epoch).await.unwrap();
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let service = DutyManagementService::new(
+            signer,
+            beacon,
+            duty_tracker.clone(),
+            validator_store,
+            pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            make_config(),
+        );
+
+        let current_slot = slot_base;
+        let single_pass = service.epoch_boundary_summary_counts(epoch, current_slot).await;
+
+        // Dual-loop baseline: the pre-RF6-27 shape (two separate 32-slot walks).
+        let mut dual_attester = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            dual_attester += duty_tracker.get_duties_for_slot(slot).await.len();
+        }
+        let mut dual_proposer = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            if duty_tracker.get_proposer_duty(slot).await.is_some() {
+                dual_proposer += 1;
+            }
+        }
+        let dual_sync = duty_tracker.get_sync_committee_duties(current_slot).await.len();
+
+        assert_eq!(single_pass, (dual_attester, dual_proposer, dual_sync));
+        assert_eq!(single_pass, (3, 2, 1), "known fixture counts");
     }
 }

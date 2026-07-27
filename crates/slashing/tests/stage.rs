@@ -10,7 +10,6 @@ use rvc_slashing::{
     AttestationSlashingViolation, BlockSlashingViolation, SlashingDb, SlashingError,
 };
 
-const CN: &str = "test-cn";
 const PUBKEY: &str = "0xdeadbeef01";
 const PUBKEY2: &str = "0xdeadbeef02";
 const GVR: &[u8; 32] = &[0u8; 32];
@@ -211,7 +210,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // Use check_and_record for the first block.
-    db.check_and_record_block(CN, PUBKEY, 200, Some("0xcheck_root".into()), GVR)
+    db.check_and_record_block(PUBKEY, 200, Some("0xcheck_root".into()), GVR)
         .expect("check_and_record_block");
 
     // Stage a different slot — should work fine.
@@ -225,7 +224,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
 
     // Attempting to check_and_record at slot 200 with a different root must fail.
     let err = db
-        .check_and_record_block(CN, PUBKEY, 200, Some("0xdifferent".into()), GVR)
+        .check_and_record_block(PUBKEY, 200, Some("0xdifferent".into()), GVR)
         .expect_err("double proposal must be rejected by check_and_record");
     assert!(
         matches!(
@@ -241,7 +240,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
 fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.check_and_record_attestation(CN, PUBKEY2, 5, 15, Some("0xatt_check".into()), GVR)
+    db.check_and_record_attestation(PUBKEY2, 5, 15, Some("0xatt_check".into()), GVR)
         .expect("check_and_record_attestation");
 
     // Stage a non-conflicting attestation.
@@ -255,7 +254,7 @@ fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
 
     // Attempt a double vote via check_and_record — must be rejected.
     let err = db
-        .check_and_record_attestation(CN, PUBKEY2, 5, 15, Some("0xatt_conflict".into()), GVR)
+        .check_and_record_attestation(PUBKEY2, 5, 15, Some("0xatt_conflict".into()), GVR)
         .expect_err("double vote must be rejected");
     assert!(
         matches!(
@@ -402,4 +401,258 @@ fn test_stage_attestation_duplicate_discard_keeps_existing_row() {
     assert_eq!(after.len(), 1, "duplicate+discard must not delete the existing attestation");
     assert_eq!(after[0].source_epoch, 7);
     assert_eq!(after[0].target_epoch, 30);
+}
+
+// ── Watermark equality (RF1-01 / EIP-3076 SEC-9 / M-1) ───────────────────────
+//
+// Block-slot and attestation-target watermarks are strictly increasing: a
+// candidate equal to the watermark must be rejected. Source-epoch equality
+// remains allowed (only source < watermark is blocked).
+
+/// RF1-01: stage_block at the block watermark must be rejected.
+#[test]
+fn test_stage_block_at_block_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_block_watermark(PUBKEY, 1000).expect("set watermark");
+
+    let err = db
+        .stage_block(PUBKEY, 1000, Some("0xwm_eq".into()), GVR)
+        .expect_err("slot equal to block watermark must be rejected");
+
+    match err {
+        // RF2-12: error names the pubkey and offending values.
+        SlashingError::BelowBlockWatermark { pubkey: ref err_pk, slot, watermark_slot } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
+            assert_eq!(slot, 1000);
+            assert_eq!(watermark_slot, 1000);
+        }
+        other => panic!("expected BelowBlockWatermark, got: {other:?}"),
+    }
+}
+
+/// RF1-01: stage_block strictly below the block watermark must be rejected.
+/// Guards a future `<=` → `==` typo that would re-open fail-open for below-wm duties.
+#[test]
+fn test_stage_block_strictly_below_block_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_block_watermark(PUBKEY, 1000).expect("set watermark");
+
+    let err = db
+        .stage_block(PUBKEY, 999, Some("0xwm_below".into()), GVR)
+        .expect_err("slot strictly below block watermark must be rejected");
+
+    match err {
+        // RF2-12: error names the pubkey and offending values.
+        // (pubkey is asserted in the equality test; field presence is required here.)
+        SlashingError::BelowBlockWatermark { slot, watermark_slot, .. } => {
+            assert_eq!(slot, 999);
+            assert_eq!(watermark_slot, 1000);
+        }
+        other => panic!("expected BelowBlockWatermark, got: {other:?}"),
+    }
+}
+
+/// RF1-01: stage_attestation at the target watermark must be rejected.
+#[test]
+fn test_stage_attestation_at_target_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_attestation_watermark(PUBKEY, 100, 200).expect("set watermark");
+
+    let err = db
+        .stage_attestation(PUBKEY, 100, 200, Some("0xatt_wm_eq".into()), GVR)
+        .expect_err("target equal to att-target watermark must be rejected");
+
+    match err {
+        SlashingError::BelowAttestationWatermark {
+            pubkey: ref err_pk,
+            target_epoch,
+            watermark_target,
+        } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
+            assert_eq!(target_epoch, 200);
+            assert_eq!(watermark_target, 200);
+        }
+        other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
+    }
+}
+
+/// RF1-01: stage_attestation with target strictly below the target watermark must be rejected.
+/// Guards a future `<=` → `==` typo (same regression class as block strictly-below).
+#[test]
+fn test_stage_attestation_strictly_below_target_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_attestation_watermark(PUBKEY, 100, 200).expect("set watermark");
+
+    // source == 100 (allowed at source wm); target 199 < 200.
+    let err = db
+        .stage_attestation(PUBKEY, 100, 199, Some("0xatt_wm_below".into()), GVR)
+        .expect_err("target strictly below att-target watermark must be rejected");
+
+    match err {
+        SlashingError::BelowAttestationWatermark { target_epoch, watermark_target, .. } => {
+            assert_eq!(target_epoch, 199);
+            assert_eq!(watermark_target, 200);
+        }
+        other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
+    }
+}
+
+/// RF1-01: stage_block strictly above the block watermark still succeeds.
+#[test]
+fn test_stage_block_above_block_watermark_succeeds() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_block_watermark(PUBKEY, 1000).expect("set watermark");
+
+    db.stage_block(PUBKEY, 1001, Some("0xwm_above".into()), GVR)
+        .expect("slot above watermark must stage")
+        .commit()
+        .expect("commit");
+
+    let blocks = db.get_blocks(PUBKEY).expect("get");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].slot, 1001);
+}
+
+/// RF1-01: source equal to source watermark with target above target watermark
+/// is accepted (guards against over-applying <= to the source comparison).
+#[test]
+fn test_stage_attestation_at_source_watermark_succeeds() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_attestation_watermark(PUBKEY, 100, 200).expect("set watermark");
+
+    // source == 100 (equal to source watermark — allowed); target 201 > 200.
+    db.stage_attestation(PUBKEY, 100, 201, Some("0xsrc_eq_ok".into()), GVR)
+        .expect("source equality with target above watermark must succeed")
+        .commit()
+        .expect("commit");
+
+    let atts = db.get_attestations(PUBKEY).expect("get");
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0].source_epoch, 100);
+    assert_eq!(atts[0].target_epoch, 201);
+}
+
+/// RF2-09: source strictly below the source watermark is rejected even when target
+/// is above the target watermark. (Check-only: stage fails before a guard is handed out.)
+#[test]
+fn test_stage_attestation_below_source_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_attestation_watermark(PUBKEY, 20, 20).expect("set watermark");
+
+    // source=1 < source watermark=20; target=31 > target watermark=20.
+    let err = db
+        .stage_attestation(PUBKEY, 1, 31, Some("0xsrc_below".into()), GVR)
+        .expect_err("source strictly below att-source watermark must be rejected");
+
+    match err {
+        // Check-only path: stage returns the watermark error; no commit needed.
+        // RF2-12: error names the pubkey and offending values.
+        SlashingError::BelowAttestationSourceWatermark {
+            pubkey: ref err_pk,
+            source_epoch,
+            watermark_source,
+        } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
+            assert_eq!(source_epoch, 1);
+            assert_eq!(watermark_source, 20);
+        }
+        other => panic!("expected BelowAttestationSourceWatermark, got: {other:?}"),
+    }
+
+    // At source watermark with target above is fine (mirrors the deleted unit test).
+    db.stage_attestation(PUBKEY, 20, 31, Some("0xsrc_at_ok".into()), GVR)
+        .expect("source at watermark with target above must succeed")
+        .discard();
+}
+
+/// RF1-01: a watermark rejection must leave no committed row.
+#[test]
+fn test_stage_below_watermark_commits_no_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_block_watermark(PUBKEY, 1000).expect("set block watermark");
+    db.set_attestation_watermark(PUBKEY, 100, 200).expect("set att watermark");
+
+    let _ = db
+        .stage_block(PUBKEY, 1000, Some("0xno_commit_block".into()), GVR)
+        .expect_err("block at watermark");
+    assert!(
+        db.get_blocks(PUBKEY).expect("get blocks").is_empty(),
+        "rejected stage_block must leave no block row"
+    );
+
+    let _ = db
+        .stage_attestation(PUBKEY, 100, 200, Some("0xno_commit_att".into()), GVR)
+        .expect_err("att at target watermark");
+    assert!(
+        db.get_attestations(PUBKEY).expect("get atts").is_empty(),
+        "rejected stage_attestation must leave no attestation row"
+    );
+}
+
+/// RF1-01: stage_* and check_and_record_* must agree on watermark-equality verdicts.
+#[test]
+fn test_stage_and_check_and_record_agree_on_watermark_equality() {
+    // Block: equality rejected on both paths.
+    {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_block_watermark(PUBKEY, 1000).expect("set");
+
+        let stage_err = db
+            .stage_block(PUBKEY, 1000, Some("0xparity_b".into()), GVR)
+            .expect_err("stage must err at equality");
+        let check_err = db
+            .check_and_record_block(PUBKEY, 1000, Some("0xparity_b".into()), GVR)
+            .expect_err("check_and_record must err at equality");
+
+        assert!(
+            matches!(
+                stage_err,
+                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000, .. }
+            ),
+            "stage: {stage_err:?}"
+        );
+        assert!(
+            matches!(
+                check_err,
+                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000, .. }
+            ),
+            "check_and_record: {check_err:?}"
+        );
+    }
+
+    // Attestation target: equality rejected on both paths.
+    {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_attestation_watermark(PUBKEY, 100, 200).expect("set");
+
+        let stage_err = db
+            .stage_attestation(PUBKEY, 100, 200, Some("0xparity_a".into()), GVR)
+            .expect_err("stage must err at target equality");
+        let check_err = db
+            .check_and_record_attestation(PUBKEY, 100, 200, Some("0xparity_a".into()), GVR)
+            .expect_err("check_and_record must err at target equality");
+
+        assert!(
+            matches!(
+                stage_err,
+                SlashingError::BelowAttestationWatermark {
+                    target_epoch: 200,
+                    watermark_target: 200,
+                    ..
+                }
+            ),
+            "stage: {stage_err:?}"
+        );
+        assert!(
+            matches!(
+                check_err,
+                SlashingError::BelowAttestationWatermark {
+                    target_epoch: 200,
+                    watermark_target: 200,
+                    ..
+                }
+            ),
+            "check_and_record: {check_err:?}"
+        );
+    }
 }

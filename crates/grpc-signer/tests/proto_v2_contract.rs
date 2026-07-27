@@ -6,7 +6,11 @@
 //! 3. Calls the appropriate `TypedSigner` method.
 //! 4. Verifies the returned signature is valid for the reconstructed signing root.
 
-#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+#![allow(clippy::disallowed_methods)]
+// Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
+// RF1-12: OnceLock init sets env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
 
 use std::net::SocketAddr;
 
@@ -24,13 +28,6 @@ use eth_types::{
     ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
-};
-use rvc_grpc_signer::proto::signer::{
-    signer_service_server::SignerService as SignerServiceV1,
-    signer_service_server::SignerServiceServer, GetStatusRequest as GetStatusRequestV1,
-    GetStatusResponse as GetStatusResponseV1, ListPublicKeysRequest as ListPublicKeysRequestV1,
-    ListPublicKeysResponse as ListPublicKeysResponseV1, SignRequest as SignRequestV1,
-    SignResponse as SignResponseV1,
 };
 use rvc_grpc_signer::{
     proto::signer_v2::{
@@ -313,43 +310,8 @@ impl SignerServiceV2 for MockV2Signer {
     }
 }
 
-// Also implement v1 SignerService (for the connect ListPublicKeys call via v1 client)
-struct MockV1Signer {
-    sk: SecretKey,
-}
-
-#[tonic::async_trait]
-impl SignerServiceV1 for MockV1Signer {
-    async fn sign(
-        &self,
-        _request: Request<SignRequestV1>,
-    ) -> Result<Response<SignResponseV1>, Status> {
-        Err(Status::unimplemented("v1 raw-root sign is not supported"))
-    }
-
-    async fn list_public_keys(
-        &self,
-        _request: Request<ListPublicKeysRequestV1>,
-    ) -> Result<Response<ListPublicKeysResponseV1>, Status> {
-        Ok(Response::new(ListPublicKeysResponseV1 {
-            pubkeys: vec![self.sk.public_key().to_bytes().to_vec()],
-        }))
-    }
-
-    async fn get_status(
-        &self,
-        _request: Request<GetStatusRequestV1>,
-    ) -> Result<Response<GetStatusResponseV1>, Status> {
-        Ok(Response::new(GetStatusResponseV1 {
-            ready: true,
-            backend: "mock-v1".to_string(),
-            key_count: 1,
-        }))
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper: start a combined v1+v2 server
+// Helper: start a v2-only server (RF2-15: v1 retired from this crate)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn start_v2_server(sk: SecretKey) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -358,10 +320,8 @@ async fn start_v2_server(sk: SecretKey) -> (SocketAddr, tokio::task::JoinHandle<
     let sk_bytes = sk.to_bytes();
 
     let handle = tokio::spawn(async move {
-        let sk_v1 = SecretKey::from_bytes(&sk_bytes).unwrap();
         let sk_v2 = SecretKey::from_bytes(&sk_bytes).unwrap();
         tonic::transport::Server::builder()
-            .add_service(SignerServiceServer::new(MockV1Signer { sk: sk_v1 }))
             .add_service(SignerServiceServerV2::new(MockV2Signer { sk: sk_v2 }))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
@@ -381,7 +341,7 @@ fn test_fork_info() -> ForkInfo {
 }
 
 fn test_ctx(pk: crypto::PublicKey) -> SignContext {
-    SignContext { pubkey: pk, fork_info: test_fork_info() }
+    SignContext { pubkey: pk, fork_info: test_fork_info(), fork_name: eth_types::ForkName::Phase0 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,7 +361,7 @@ async fn test_typed_block_round_trip() {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xde, 0xad],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
 
     let ctx = test_ctx(pk.clone());
@@ -429,7 +389,7 @@ async fn test_typed_blinded_block_round_trip() {
         proposer_index: 2,
         parent_root: [0x33; 32],
         state_root: [0x44; 32],
-        body: vec![0xca, 0xfe],
+        body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
     };
 
     let ctx = test_ctx(pk.clone());
@@ -688,21 +648,109 @@ fn test_grpc_remote_signer_has_no_raw_signer_impl() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Contract version check: v1-only server causes typed RPCs to fail
+// Contract version check: server that cannot list keys fails at connect
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Start a v1-only server (no v2 typed RPCs).
-/// When `GrpcRemoteSigner` tries to call a typed RPC, it gets UNIMPLEMENTED
-/// because the server has no `SignBeaconBlock` etc. handler.
-async fn start_v1_only_server(sk: SecretKey) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+/// Stand-in for a legacy v1-only signer: registers the v2 service path but every
+/// RPC (including `ListPublicKeys`) returns `Unimplemented`.  RF2-15 removed the
+/// in-crate v1 mock types; this preserves the SS-1 connect-time refusal without
+/// reintroducing v1 codegen.
+struct UnimplementedV2Signer;
+
+#[tonic::async_trait]
+impl SignerServiceV2 for UnimplementedV2Signer {
+    async fn sign_beacon_block(
+        &self,
+        _request: Request<SignBeaconBlockRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_blinded_beacon_block(
+        &self,
+        _request: Request<SignBlindedBeaconBlockRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_attestation_data(
+        &self,
+        _request: Request<SignAttestationDataRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_aggregate_and_proof(
+        &self,
+        _request: Request<SignAggregateAndProofRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_sync_committee_message(
+        &self,
+        _request: Request<SignSyncCommitteeMessageRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_sync_aggregator_selection_data(
+        &self,
+        _request: Request<SignSyncAggregatorSelectionDataRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_contribution_and_proof(
+        &self,
+        _request: Request<SignContributionAndProofRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_builder_registration(
+        &self,
+        _request: Request<SignBuilderRegistrationRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_randao_reveal(
+        &self,
+        _request: Request<SignRandaoRevealRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_voluntary_exit(
+        &self,
+        _request: Request<SignVoluntaryExitRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn list_public_keys(
+        &self,
+        _request: Request<ListPublicKeysRequestV2>,
+    ) -> Result<Response<ListPublicKeysResponseV2>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 ListPublicKeys unavailable"))
+    }
+
+    async fn get_status(
+        &self,
+        _request: Request<GetStatusRequestV2>,
+    ) -> Result<Response<GetStatusResponseV2>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 GetStatus unavailable"))
+    }
+}
+
+async fn start_unimplemented_v2_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let sk_bytes = sk.to_bytes();
 
     let handle = tokio::spawn(async move {
-        let sk = SecretKey::from_bytes(&sk_bytes).unwrap();
         tonic::transport::Server::builder()
-            .add_service(SignerServiceServer::new(MockV1Signer { sk }))
+            .add_service(SignerServiceServerV2::new(UnimplementedV2Signer))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -712,33 +760,27 @@ async fn start_v1_only_server(sk: SecretKey) -> (SocketAddr, tokio::task::JoinHa
     (addr, handle)
 }
 
-/// Verify that a `GrpcRemoteSigner` rejects a v1-only server at connect time.
+/// Verify that a `GrpcRemoteSigner` rejects a non-functional v2 server at connect.
 ///
-/// SS-1 (Issue 2.2): the client now calls the v2 `ListPublicKeys` RPC during
-/// `connect()`.  A v1-only server does not implement the v2 service, so the
-/// connect-time key-listing returns `Unimplemented` and `connect()` itself
-/// fails — providing earlier, clearer rejection than the previous sign-time
-/// failure.
+/// SS-1 (Issue 2.2): the client calls the v2 `ListPublicKeys` RPC during
+/// `connect()`.  When that RPC returns `Unimplemented`, `connect()` fails —
+/// the same wire outcome as dialing a legacy v1-only signer (C-2/C-3).
 ///
-/// This is the updated enforcement of the C-2/C-3 fix: a v1-only signer cannot
-/// be used with the v2 client at all; the failure is now surfaced at startup.
+/// RF2-15: previously this used an in-crate v1 mock; v1 types are gone from
+/// `crates/grpc-signer`, so the stand-in is an all-Unimplemented v2 service.
 #[tokio::test]
 async fn test_refuses_v1_signer_at_typed_rpc_time() {
-    let sk = SecretKey::generate();
-    let (addr, _handle) = start_v1_only_server(sk).await;
+    let (addr, _handle) = start_unimplemented_v2_server().await;
 
-    // SS-1: connect() now fails immediately because the v1-only server does not
-    // implement the v2 ListPublicKeys RPC used during key-listing.
+    // SS-1: connect() fails because ListPublicKeys is Unimplemented.
     match GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await {
-        Ok(_) => panic!("connect() to a v1-only server must fail"),
+        Ok(_) => panic!("connect() must fail when ListPublicKeys is Unimplemented"),
         Err(crypto::SigningError::RemoteSignerError(msg)) => {
-            // The v1 server returns Unimplemented for the v2 ListPublicKeys call.
             assert!(
                 msg.contains("list public keys")
                     || msg.contains("Unimplemented")
                     || msg.contains("not implemented"),
-                "error should indicate v2 ListPublicKeys is unavailable on the v1 server, \
-                 got: {msg}"
+                "error should indicate v2 ListPublicKeys is unavailable, got: {msg}"
             );
         }
         Err(other) => panic!("expected RemoteSignerError, got: {other:?}"),

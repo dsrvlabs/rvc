@@ -9,8 +9,12 @@ repository = "https://github.com/rootwarp/rvc"
 keywords = ["ethereum", "validator", "doppelganger", "safety"]
 categories = ["cryptography::cryptocurrencies"]
 
+[lints]
+workspace = true
+
 [dependencies]
 crypto = { workspace = true }
+observability = { workspace = true }
 eth-types = { workspace = true }
 slashing = { workspace = true }
 async-trait = { workspace = true }
@@ -20,7 +24,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-crypto = { workspace = true, features = ["test-utils"] }
+crypto = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }

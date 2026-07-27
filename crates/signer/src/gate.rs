@@ -7,19 +7,22 @@
 //!
 //! For each slashable operation (`sign_block`, `sign_attestation`):
 //!
-//! 1. Acquire the per-pubkey async lock from `ValidatorLockMap` (held for the
-//!    entire operation).
-//! 2. Check `gate_decision` — if false, return
-//!    `Err(SigningGateError::BlockedByDoppelganger)` immediately; no staging or
-//!    signing occurs, and no slashing-DB row is written.
-//! 3. Stage → sign → commit/discard — run inside `tokio::task::spawn_blocking`
-//!    because `StagedBlock`/`StagedAttestation` hold a `parking_lot::MutexGuard`
-//!    (`!Send`) and must not cross a real `.await`.  The async sign call is
-//!    driven via `Handle::current().block_on(timeout(dur, signer.sign(...)))` on
-//!    the same blocking thread; a timeout maps to `SigningFailed` with an
-//!    immediate `discard()` so the staged row is rolled back (no phantom row).
-//!    On sign success the staged row is committed; on sign failure it is
-//!    discarded (M-1 property — no phantom row on signer error).
+//! 1. Cheap outer `gate_decision` — if false, return
+//!    `Err(SigningGateError::BlockedByDoppelganger)` immediately (no lock).
+//! 2. Delegate to [`crate::core::sign_slashable`] with
+//!    [`TimeoutPolicy::DiscardStagedRow`] (in-process / gate backends):
+//!    - acquire the per-pubkey async lock;
+//!    - **re-check** enablement under the lock (Safe→Detected TOCTOU);
+//!    - `spawn_blocking` stage → sign (with timeout) → commit/discard;
+//!    - record the standard RVC slashable metric families via
+//!      [`crate::core::StandardSlashableHooks`].
+//!
+//! The gate's timeout policy is always discard-on-timeout, which is sound for the
+//! **in-process** BLS backends production `rvc-signer` wires today. Dropping the
+//! timed-out client future does **not** prove “no signature” for an arbitrary
+//! remote-capable `dyn Signer` — do not place remote backends behind
+//! `DiscardStagedRow`. Remote fail-closed retain is RF4-06
+//! (`SignerService` + `RetainStagedRow` / backend-kind mapping).
 //!
 //! # Non-slashable signing flow
 //!
@@ -37,6 +40,11 @@
 //!
 //! Because non-slashable signs carry no `!Send` staging guard, they are plain
 //! `async` with a direct `.await` on the signer — no `spawn_blocking` needed.
+//!
+//! **SS-2 / SS-3 (aggregate-and-proof):** `sign_aggregate_and_proof` is
+//! deliberately non-slashable. The inner attestation is slashable and must
+//! already have been committed via `sign_attestation`; re-staging the aggregate
+//! would double-stage and mis-attribute epochs/roots. See the method docs.
 //!
 //! # Gate decision and fail-closed default
 //!
@@ -66,22 +74,28 @@
 //! # Signer timeout (BUG-003)
 //!
 //! The staging guard holds the SQLite single-writer `parking_lot::MutexGuard`
-//! across the stage→sign→commit window.  A wedged remote signer would hold this
-//! write lock indefinitely, causing a signing blackout for ALL validators (they
-//! queue behind the same lock).  The gate therefore wraps the sign call in a
-//! `tokio::time::timeout`; on expiry the staged guard is discarded (ROLLBACK) and
+//! across the stage→sign→commit window.  A wedged signer would hold this write
+//! lock indefinitely, causing a signing blackout for ALL validators (they queue
+//! behind the same lock).  The gate therefore wraps the sign call in a
+//! `tokio::time::timeout`; on expiry with the gate's `DiscardStagedRow` policy
+//! the staged guard is discarded (ROLLBACK) and
 //! `Err(SigningFailed("signer timed out"))` is returned.  The default is 4 seconds
 //! (well under a 12-second Ethereum slot).  Configure with `with_sign_timeout`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::{logging::TruncatedPubkey, CompositeSigner, PublicKey, Signer, SigningError};
+use crypto::{CompositeSigner, PublicKey, Signer, SigningError};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
+use observability::logging::TruncatedPubkey;
 use slashing::{PubkeyScopedDb, SlashingDb};
 use tracing::{error, warn};
 
+use crate::core::{
+    sign_slashable, SignSlashableRequest, StandardSlashableHooks, TimeoutPolicy,
+    TimeoutPolicySource,
+};
 use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
 use crate::locks::ValidatorLockMap;
@@ -121,7 +135,8 @@ pub struct SigningGate {
     locks: Arc<ValidatorLockMap>,
     /// Maximum wall-clock duration allowed for a single BLS sign call.
     ///
-    /// Expiry triggers `discard()` on the staged guard (ROLLBACK) and returns
+    /// Expiry is handled by the slashable core's [`TimeoutPolicy`] (gate uses
+    /// discard-on-timeout → ROLLBACK) and returns
     /// `Err(SigningFailed("signer timed out"))`.  Defaults to 4 seconds.
     sign_timeout: Duration,
 }
@@ -216,12 +231,13 @@ impl SigningGate {
     ///
     /// # Defense-in-depth
     ///
-    /// 1. Acquire per-pubkey async lock (see module doc on cancellation).
-    /// 2. `gate_decision` — fails closed on false (unknown pubkey → denied).
-    /// 3. Stage → sign (with timeout) → commit/discard (spawn_blocking +
-    ///    Handle::block_on).  On stage error → `BlockedBySlashingDb` (slot
-    ///    consumed).  On commit error → `SlashingDbCommitFailed` (nothing written;
-    ///    same-root retry safe).  On sign error → `discard()` (no phantom row).
+    /// 1. Outer `gate_decision` — fails closed on false (unknown pubkey → denied).
+    /// 2. [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`]: lock →
+    ///    re-check enablement under lock → stage → sign (timeout) → commit/discard.
+    ///    On stage error → `SlashingBlocked`. On commit error → `CommitFailed`
+    ///    (nothing written; same-root retry safe). On timeout with Discard →
+    ///    `discard()` (no phantom row). On other sign errors today → discard.
+    ///    Records standard RVC slashable metrics.
     pub async fn sign_block(
         &self,
         pubkey: &PublicKey,
@@ -230,19 +246,9 @@ impl SigningGate {
         gvr: Root,
         client_cn: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        // Step 1: per-pubkey async lock (Send-safe OwnedMutexGuard).
-        //
-        // CANCELLATION NOTE: if the caller drops this future at the
-        // `spawn_blocking(...).await` below, this guard is released while the
-        // blocking task keeps running.  The authoritative double-sign serializer
-        // is the SQLite `BEGIN IMMEDIATE` lock held by `StagedBlock`; see module
-        // doc for the full analysis.
-        let _guard = self.locks.lock(&pubkey_bytes).await;
-
-        // Step 2: doppelganger gate (single gate-decision point for all paths).
+        // Cheap outer enablement check (no lock). Core re-checks under the lock.
         if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -252,95 +258,41 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        // Step 3: stage → sign (with timeout) → commit/discard inside spawn_blocking.
-        //
-        // `StagedBlock<'_>` holds a `parking_lot::MutexGuard` (`!Send`).
-        // Keeping everything inside `spawn_blocking` ensures the guard never
-        // crosses a real `.await`.  The async sign call is driven via
-        // `Handle::current().block_on(timeout(..., signer.sign(...)))` on the
-        // same blocking thread — the canonical pattern for calling async code from
-        // spawn_blocking.  The timeout bounds the write-lock hold duration.
         let db = Arc::clone(&self.slashing_db);
-        let signer = Arc::clone(&self.signer);
-        let handle = tokio::runtime::Handle::current();
-        let sign_timeout = self.sign_timeout;
-        let pubkey_hex_clone = pubkey_hex.clone();
         let client_cn_owned = client_cn.to_string();
+        let pubkey_hex_clone = pubkey_hex.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, SigningGateError> {
-            let signing_root_hex = hex::encode(signing_root);
-            let scoped = PubkeyScopedDb::new(Arc::clone(&db), client_cn_owned, gvr);
-
-            let staged = scoped
-                .stage_block(&pubkey_hex_clone, slot, Some(signing_root_hex))
-                .map_err(|e| {
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot,
-                        rejection_reason = %e,
-                        "SigningGate: sign_block blocked by slashing protection"
-                    );
-                    SigningGateError::BlockedBySlashingDb(e)
-                })?;
-
-            let sign_result = handle.block_on(tokio::time::timeout(
-                sign_timeout,
-                signer.sign(&signing_root, &pubkey_bytes),
-            ));
-
-            match sign_result {
-                // Timeout — discard staged row (no phantom) and return error.
-                Err(_elapsed) => {
-                    staged.discard();
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot,
-                        timeout_secs = sign_timeout.as_secs_f64(),
-                        "SigningGate: sign_block signer timed out; staged row discarded"
-                    );
-                    Err(SigningGateError::SigningFailed("signer timed out".to_string()))
-                }
-
-                // Sign succeeded — commit the staged row.
-                Ok(Ok(sig)) => {
-                    staged.commit().map_err(|e| {
-                        error!(
-                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                            slot,
-                            error = %e,
-                            "SigningGate: sign_block commit failed after successful sign"
-                        );
-                        SigningGateError::SlashingDbCommitFailed(e)
-                    })?;
-                    Ok(sig.to_bytes().to_vec())
-                }
-
-                // Key not found — discard staged row (no phantom).
-                Ok(Err(SigningError::KeyNotFound(_))) => {
-                    staged.discard();
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot,
-                        "SigningGate: sign_block key not found; staged row discarded"
-                    );
-                    Err(SigningGateError::KeyNotFound)
-                }
-
-                // Other signer error — discard staged row (no phantom).
-                Ok(Err(e)) => {
-                    staged.discard();
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot,
-                        error = %e,
-                        "SigningGate: sign_block signer error; staged row discarded"
-                    );
-                    Err(SigningGateError::SigningFailed(e.to_string()))
-                }
-            }
-        })
+        // Explicit policy: gate backends are in-process — discard on timeout.
+        sign_slashable(
+            SignSlashableRequest {
+                locks: self.locks.as_ref(),
+                pubkey,
+                enablement: self.enablement.as_ref(),
+                signer: Arc::clone(&self.signer),
+                signing_root,
+                sign_timeout: self.sign_timeout,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                hooks: Arc::new(StandardSlashableHooks::block()),
+                op_name: "sign_block",
+            },
+            move |session| {
+                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
+                session.stage_then_sign(|| {
+                    scoped
+                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
+                        .map_err(|e| {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot,
+                                rejection_reason = %e,
+                                "SigningGate: sign_block blocked by slashing protection"
+                            );
+                            e
+                        })
+                })
+            },
+        )
         .await
-        .map_err(|e| SigningGateError::SigningFailed(format!("sign_block task panicked: {e}")))?
     }
 
     /// Sign an attestation.
@@ -363,11 +315,13 @@ impl SigningGate {
     ///
     /// # Defense-in-depth
     ///
-    /// Identical flow to `sign_block`: lock → gate_decision →
-    /// stage + sign (with timeout) + commit/discard (spawn_blocking + Handle::block_on).
-    /// On stage error → `BlockedBySlashingDb` (epoch consumed).
-    /// On commit error → `SlashingDbCommitFailed` (nothing written; same-root retry safe).
-    /// On sign error → `discard()` (no phantom row).
+    /// Identical flow to `sign_block`: outer `gate_decision` →
+    /// [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`].
+    /// On stage error → `SlashingBlocked` (epoch consumed).
+    /// On commit error → `CommitFailed` (nothing written; same-root retry safe).
+    /// On timeout or ambiguous sign errors with Discard → `discard()` (no phantom
+    /// row). Discard applies to the full [`crate::TimeoutPolicy`] scope on the
+    /// gate path (in-process backends).
     pub async fn sign_attestation(
         &self,
         pubkey: &PublicKey,
@@ -377,13 +331,9 @@ impl SigningGate {
         gvr: Root,
         client_cn: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        // Step 1: per-pubkey async lock (see CANCELLATION NOTE in sign_block).
-        let _guard = self.locks.lock(&pubkey_bytes).await;
-
-        // Step 2: doppelganger gate (single gate-decision point for all paths).
+        // Cheap outer enablement check (no lock). Core re-checks under the lock.
         if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -394,100 +344,47 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        // Step 3: stage → sign (with timeout) → commit/discard inside spawn_blocking.
         let db = Arc::clone(&self.slashing_db);
-        let signer = Arc::clone(&self.signer);
-        let handle = tokio::runtime::Handle::current();
-        let sign_timeout = self.sign_timeout;
-        let pubkey_hex_clone = pubkey_hex.clone();
         let client_cn_owned = client_cn.to_string();
+        let pubkey_hex_clone = pubkey_hex.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, SigningGateError> {
-            let signing_root_hex = hex::encode(signing_root);
-            let scoped = PubkeyScopedDb::new(Arc::clone(&db), client_cn_owned, gvr);
-
-            let staged = scoped
-                .stage_attestation(
-                    &pubkey_hex_clone,
-                    source_epoch,
-                    target_epoch,
-                    Some(signing_root_hex),
-                )
-                .map_err(|e| {
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        source_epoch,
-                        target_epoch,
-                        rejection_reason = %e,
-                        "SigningGate: sign_attestation blocked by slashing protection"
-                    );
-                    SigningGateError::BlockedBySlashingDb(e)
-                })?;
-
-            let sign_result = handle.block_on(tokio::time::timeout(
-                sign_timeout,
-                signer.sign(&signing_root, &pubkey_bytes),
-            ));
-
-            match sign_result {
-                // Timeout — discard staged row (no phantom) and return error.
-                Err(_elapsed) => {
-                    staged.discard();
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        source_epoch,
-                        target_epoch,
-                        timeout_secs = sign_timeout.as_secs_f64(),
-                        "SigningGate: sign_attestation signer timed out; staged row discarded"
-                    );
-                    Err(SigningGateError::SigningFailed("signer timed out".to_string()))
-                }
-
-                // Sign succeeded — commit the staged row.
-                Ok(Ok(sig)) => {
-                    staged.commit().map_err(|e| {
-                        error!(
-                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+        // Explicit policy: gate backends are in-process — discard on timeout.
+        sign_slashable(
+            SignSlashableRequest {
+                locks: self.locks.as_ref(),
+                pubkey,
+                enablement: self.enablement.as_ref(),
+                signer: Arc::clone(&self.signer),
+                signing_root,
+                sign_timeout: self.sign_timeout,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                hooks: Arc::new(StandardSlashableHooks::attestation()),
+                op_name: "sign_attestation",
+            },
+            move |session| {
+                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
+                session.stage_then_sign(|| {
+                    scoped
+                        .stage_attestation(
+                            &pubkey_hex_clone,
                             source_epoch,
                             target_epoch,
-                            error = %e,
-                            "SigningGate: sign_attestation commit failed after successful sign"
-                        );
-                        SigningGateError::SlashingDbCommitFailed(e)
-                    })?;
-                    Ok(sig.to_bytes().to_vec())
-                }
-
-                // Key not found — discard staged row (no phantom).
-                Ok(Err(SigningError::KeyNotFound(_))) => {
-                    staged.discard();
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        source_epoch,
-                        target_epoch,
-                        "SigningGate: sign_attestation key not found; staged row discarded"
-                    );
-                    Err(SigningGateError::KeyNotFound)
-                }
-
-                // Other signer error — discard staged row (no phantom).
-                Ok(Err(e)) => {
-                    staged.discard();
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        source_epoch,
-                        target_epoch,
-                        error = %e,
-                        "SigningGate: sign_attestation signer error; staged row discarded"
-                    );
-                    Err(SigningGateError::SigningFailed(e.to_string()))
-                }
-            }
-        })
+                            Some(hex::encode(signing_root)),
+                        )
+                        .map_err(|e| {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                source_epoch,
+                                target_epoch,
+                                rejection_reason = %e,
+                                "SigningGate: sign_attestation blocked by slashing protection"
+                            );
+                            e
+                        })
+                })
+            },
+        )
         .await
-        .map_err(|e| {
-            SigningGateError::SigningFailed(format!("sign_attestation task panicked: {e}"))
-        })?
     }
 
     // ── Non-slashable signing methods ─────────────────────────────────────────

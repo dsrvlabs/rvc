@@ -1,10 +1,16 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service", "crates/architecture-tests", "crates/signer-registry"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/rvc", "crates/rvc-test-support", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/sync-service", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
 default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
+# Use `deny` (not `forbid`) so file-level `#![allow(unsafe_code)]` remains possible for
+# the reviewed test-only allow-list (GlobalAlloc counters, env::set_var in tests).
+# `forbid` cannot be overridden and would break that allow-list.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -19,8 +25,8 @@ metrics = { path = "crates/metrics", package = "rvc-metrics" }
 slashing = { path = "crates/slashing", package = "rvc-slashing" }
 timing = { path = "crates/timing", package = "rvc-timing" }
 crypto = { path = "crates/crypto", package = "rvc-crypto" }
+observability = { path = "crates/observability", package = "rvc-observability" }
 duty-tracker = { path = "crates/duty-tracker", package = "rvc-duty-tracker" }
-propagator = { path = "crates/propagator", package = "rvc-propagator" }
 signer = { path = "crates/signer", package = "rvc-signer" }
 validator-store = { path = "crates/validator-store", package = "rvc-validator-store" }
 block-service = { path = "crates/block-service", package = "rvc-block-service" }
@@ -33,6 +39,10 @@ telemetry = { path = "crates/telemetry", package = "rvc-telemetry" }
 secret-provider = { path = "crates/secret-provider", package = "rvc-secret-provider" }
 grpc-signer = { path = "crates/grpc-signer", package = "rvc-grpc-signer" }
 signer-registry = { path = "crates/signer-registry", package = "rvc-signer-registry" }
+web3signer-wire = { path = "crates/web3signer-wire", package = "rvc-web3signer-wire" }
+signer-proto = { path = "crates/signer-proto", package = "rvc-signer-proto" }
+signer-server = { path = "crates/signer-server", package = "rvc-signer-server" }
+rvc-test-support = { path = "crates/rvc-test-support" }
 
 # External
 async-trait = "0.1"
@@ -54,6 +64,10 @@ tonic = "0.12"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 reqwest-eventsource = "0.6"
+futures = "0.3"
+hyper = "1"
+http-body-util = "0.1"
+rcgen = "0.13"
 
 # OpenTelemetry
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
@@ -73,6 +87,15 @@ hex = "0.4"
 rand = "0.8"
 ssz = { package = "ethereum_ssz", version = "0.9" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
+# ethereum_ssz 0.8 (lib name `ssz`) aliased as `ssz08` for BeaconBlockBody Encode/Decode.
+# ssz_types 0.10.1 implements Encode/Decode against 0.8 only; workspace `ssz` stays on 0.9
+# for the rest of eth-types. Same resolved crate instance as ssz_types' dep (no new dual).
+ssz08 = { package = "ethereum_ssz", version = "0.8.3" }
+# VariableList / FixedVector / BitVector with compile-time limits. 0.10.1 is the
+# last release on tree_hash 0.9 / ethereum_ssz 0.8 (tree_hash 0.9 itself pins
+# ethereum_ssz 0.8 for Bitfield). Do not jump to 0.11+ without a workspace-wide
+# tree_hash upgrade — those pin tree_hash ≥ 0.10.
+ssz_types = "0.10.1"
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
 sha2 = "0.10"

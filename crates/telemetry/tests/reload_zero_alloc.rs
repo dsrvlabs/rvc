@@ -15,6 +15,9 @@
 //! callsite-interest cache are not raced. Non-vacuity is proven in-test: an
 //! ENABLED `info!` over the same consuming layer DOES allocate.
 
+// RF1-12: Counting GlobalAlloc + env mutation for reload zero-alloc gate.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

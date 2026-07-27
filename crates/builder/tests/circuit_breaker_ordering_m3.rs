@@ -28,7 +28,7 @@
 // A `loom`-based test would provide exhaustive model-checked verification;
 // `loom` is not currently a workspace dev-dep (see Cargo.toml).
 
-use rvc_builder::CircuitBreakerState;
+use signer::CircuitBreakerState;
 use std::sync::{Arc, Barrier};
 use std::thread;
 

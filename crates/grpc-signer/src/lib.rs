@@ -1,25 +1,13 @@
 pub mod client;
+
+/// Re-export of the shared v2 signer proto bindings (compiled once in `rvc-signer-proto`).
 pub mod proto {
-    pub mod signer {
-        tonic::include_proto!("signer");
-    }
-    pub mod signer_v2 {
-        tonic::include_proto!("signer.v2");
-    }
+    pub use signer_proto::signer_v2;
 }
 
 pub use client::{
     GrpcRemoteSigner, GrpcRemoteSignerConfig, REMOTE_SIGNER_INSECURE_ENV_VAR,
     SIGNER_V2_PACKAGE_NAME,
-};
-
-// V1 proto re-exports — kept for the v1 server/trait types used in tests and downstream.
-// The v1 client is no longer used for connect-time ListPublicKeys (SS-1, Issue 2.2).
-pub use proto::signer::signer_service_client::SignerServiceClient;
-pub use proto::signer::signer_service_server::{SignerService, SignerServiceServer};
-pub use proto::signer::{
-    GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
-    PartialSignRequest, PartialSignResponse, SignRequest, SignResponse,
 };
 
 // V2 client and server exports
@@ -30,28 +18,6 @@ pub use proto::signer_v2::signer_service_server::{
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_v1_list_public_keys_request_accessible() {
-        let req = ListPublicKeysRequest {};
-        let _ = req;
-    }
-
-    #[test]
-    fn test_v1_get_status_request_accessible() {
-        let req = GetStatusRequest {};
-        let _ = req;
-    }
-
-    #[test]
-    fn test_v1_get_status_response_fields() {
-        let resp = GetStatusResponse { ready: false, backend: "remote".to_string(), key_count: 0 };
-        assert!(!resp.ready);
-        assert_eq!(resp.backend, "remote");
-        assert_eq!(resp.key_count, 0);
-    }
-
     // ---- proto v2 compile tests ----
     // These tests verify that all 10 typed SignerService RPCs + 3 PeerSignerService RPCs
     // from signer.v2.proto are reachable from crates/grpc-signer.

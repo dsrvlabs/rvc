@@ -60,6 +60,7 @@ rvc start [OPTIONS]
 | `--keystore-path <PATH>` | `./keystores` | Directory containing EIP-2335 keystore JSON files |
 | `--password-file <PATH>` | none | Password file for keystore decryption |
 | `--slashing-db-path <PATH>` | `./slashing_protection.sqlite` | Slashing protection SQLite database |
+| `--init-slashing-db` | false | Allow creating a **fresh empty** slashing DB if the path is missing (SEC-3). Dangerous on a previously-active validator (zero history → double-sign risk). Use only for genuine first deploy; 0-byte/corrupt files always abort. Config equivalent: `allow_fresh_db = true` |
 | `--network <NETWORK>` | `mainnet` | Network preset: `mainnet`, `sepolia`, `holesky`, `goerli`, `custom` |
 
 #### Server Options
@@ -180,6 +181,7 @@ Create a TOML file (see `config.example.toml`):
 beacon_url = "http://localhost:5052"
 keystore_path = "./keystores"
 slashing_db_path = "./slashing_protection.sqlite"
+# allow_fresh_db = true   # only for genuine first deploy (prefer --init-slashing-db once)
 metrics_port = 8080
 grpc_port = 50051
 network = "mainnet"
@@ -332,6 +334,67 @@ RUST_LOG=rvc=trace,rvc_bn_manager=debug rvc start
 > healthy `info` heartbeat, and the file-more-verbose-than-console recipe, see the
 > [Operator Guide](../plan/logging/OPERATOR_GUIDE.md).
 
+### `RVC_ALLOW_NON_WAL_SLASHING_DB` (danger — durability escape hatch)
+
+By default the slashing-protection SQLite DB **must** open in WAL journal mode.
+If the underlying filesystem cannot support WAL (tmpfs, NFSv3, SMB, some FUSE
+mounts), startup aborts with a `JournalMode` error rather than signing with a
+weaker durability guarantee.
+
+To override (temporary workaround only):
+
+```bash
+RVC_ALLOW_NON_WAL_SLASHING_DB=true rvc start -c config.toml
+# same env var is honoured by rvc-signer
+```
+
+What this disables:
+
+- The hard-fail that refuses a non-WAL journal mode.
+- You still get `synchronous=EXTRA` (and macOS `fullfsync=ON`), but crash
+  recovery after a host power loss is **degraded**. On shared/network storage,
+  two processes can also more easily see inconsistent DB state.
+
+Risk (same-key-two-places):
+
+- Slashing protection only works if **one** process owns the DB and that DB
+  survives restarts on durable local storage. Setting this flag to run on
+  shared storage (NFS/SMB) does **not** make multi-host active-active safe —
+  it only silences the WAL check. Running the same validator keys on two hosts
+  (or two DBs) remains a double-sign risk regardless of this flag.
+- Prefer moving the DB to a WAL-capable local volume instead of using the
+  escape hatch in production.
+
+### `keystore_path` / `slashing_db_path` must travel together
+
+These two paths are **independently settable** in config and CLI:
+
+| Setting | Default | Role |
+|---------|---------|------|
+| `keystore_path` / `--keystore-path` | `./keystores` | EIP-2335 keys + process lock (`<keystore_path>/.rvc.lock`) + deletion denylist |
+| `slashing_db_path` / `--slashing-db-path` | `./slashing_protection.sqlite` | EIP-3076 signing history |
+
+Footgun — **copied data-dir deployments**:
+
+- A common ops mistake is to rsync/snapshot only the keystore directory (or only
+  the DB file) onto a new host. Keys without their slashing history re-sign
+  already-broadcast messages → **slashable**. History without the matching keys
+  is useless and can mask the real risk when keys are restored later from a
+  different path.
+- Keep both on the **same durable volume** and treat them as one unit when
+  migrating, restoring, or cloning a validator. Never run the same keys on two
+  live hosts.
+- On Unix, startup logs a **warning** when the two paths resolve to different
+  filesystems (`st_dev` differs). Heed that warning: it often means one path is
+  on ephemeral storage (container layer, tmpfs) while the other is on a mount.
+
+Recommended layout:
+
+```toml
+keystore_path = "/var/lib/rvc/keystores"
+slashing_db_path = "/var/lib/rvc/slashing_protection.sqlite"
+```
+
 ## Shutdown
 
 Send `SIGINT` (Ctrl+C) or `SIGTERM` for graceful shutdown. The client will:
@@ -405,7 +468,7 @@ rvc start -c config.toml \
 # Start rvc-signer first
 rvc-signer serve \
   --keystore-dir ./signer-keystores \
-  --password-dir ./signer-passwords \
+  --password-file ./signer-password.txt \
   --tls-cert ./certs/server.pem \
   --tls-key ./certs/server-key.pem \
   --tls-ca-cert ./certs/ca.pem \
@@ -438,8 +501,7 @@ rvc-signer serve [OPTIONS]
 | `--config <PATH>` | none | TOML configuration file |
 | `--listen-address <ADDR>` | `127.0.0.1:50052` | gRPC listen address |
 | `--keystore-dir <PATH>` | none | Directory containing EIP-2335 keystore files |
-| `--password-dir <PATH>` | none | Directory with per-keystore password files |
-| `--password-file <PATH>` | none | Single password file for all keystores |
+| `--password-file <PATH>` | none | Password file for all keystores (required) |
 | `--tls-cert <PATH>` | none | Server TLS certificate (PEM) |
 | `--tls-key <PATH>` | none | Server TLS private key (PEM) |
 | `--tls-ca-cert <PATH>` | none | CA certificate for client authentication (PEM) |
@@ -499,7 +561,7 @@ rvc-signer split-key \
 rvc-signer serve \
   --backend dvt \
   --keystore-dir ./shares/node1 \
-  --password-dir ./passwords \
+  --password-file ./password.txt \
   --tls-cert ./certs/node1.pem \
   --tls-key ./certs/node1-key.pem \
   --tls-ca-cert ./certs/ca.pem \

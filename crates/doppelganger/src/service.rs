@@ -1,58 +1,57 @@
 //! Doppelganger detection service.
+//!
+//! Legacy one-shot monitoring path. Production wiring uses
+//! [`crate::ForwardWindowMachine`] + the SEC-2c liveness loop; this service
+//! remains for tests and characterization of the restart-skip predicate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use crypto::logging::TruncatedPubkey;
-use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use eth_types::Epoch;
+use observability::logging::TruncatedPubkey;
 use tracing::{debug, info, warn, Instrument};
 
+use crate::epoch_clock::MonotonicEpochClock;
 use crate::error::DoppelgangerError;
+use crate::restart_skip::should_skip_restart_monitoring;
 use crate::traits::{LegacySlashingHistoryReader, LivenessChecker};
 use crate::{DoppelgangerResult, DoppelgangerStatus};
 
-const DEFAULT_MONITORING_EPOCHS: u64 = 2;
+/// Default forward-window length in epochs (≈ 2 epochs / ~12.8 min on mainnet).
+///
+/// Shared by [`crate::DoppelgangerService`] and [`crate::ForwardWindowMachine`]
+/// production wiring (SEC-2b).
+pub const DEFAULT_MONITORING_EPOCHS: u64 = 2;
 
 /// Service for detecting doppelganger validators.
 ///
-/// The epoch is computed from a BN-supplied `genesis_time` combined with a
-/// monotonic [`Instant`] captured at construction.  This ensures that NTP
-/// wall-clock steps cannot silently advance (or retract) the epoch window.
+/// Epoch math is owned exclusively by the embedded [`MonotonicEpochClock`]
+/// (NTP-immune). There is no second `current_epoch` implementation here.
 pub struct DoppelgangerService {
     liveness_checker: Arc<dyn LivenessChecker>,
     slashing_db: Arc<dyn LegacySlashingHistoryReader>,
     monitoring_epochs: u64,
-    /// BN-supplied genesis time (Unix seconds).
-    genesis_time: u64,
-    /// Monotonic instant captured at service creation.
-    service_start_instant: Instant,
-    /// Wall-clock Unix seconds captured once at service creation.
-    /// Combined with `service_start_instant.elapsed()` to produce a
-    /// monotonically-advancing "now" that is immune to NTP steps.
-    start_unix_time: u64,
+    /// Sole epoch source — same type as production forward-window wiring.
+    epoch_clock: MonotonicEpochClock,
 }
 
 impl DoppelgangerService {
     /// Create a new service.
     ///
     /// `genesis_time` is the BN-reported genesis Unix timestamp.  It anchors
-    /// the epoch computation so the service is not affected by subsequent NTP
-    /// adjustments.
+    /// the shared [`MonotonicEpochClock`] so the service is not affected by
+    /// subsequent NTP adjustments.
     pub fn new(
         liveness_checker: Arc<dyn LivenessChecker>,
         slashing_db: Arc<dyn LegacySlashingHistoryReader>,
         genesis_time: u64,
     ) -> Self {
-        let start_unix_time =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         Self {
             liveness_checker,
             slashing_db,
             monitoring_epochs: DEFAULT_MONITORING_EPOCHS,
-            genesis_time,
-            service_start_instant: Instant::now(),
-            start_unix_time,
+            epoch_clock: MonotonicEpochClock::new(genesis_time),
         }
     }
 
@@ -64,44 +63,32 @@ impl DoppelgangerService {
 
     /// Override the clock anchor — TEST-ONLY (do not call from production).
     ///
-    /// Replaces the captured `service_start_instant` and `start_unix_time` with
-    /// the supplied values so that `current_epoch()` can be driven with
-    /// deterministic, controlled time values.
+    /// Replaces the embedded [`MonotonicEpochClock`] anchors so tests can drive
+    /// deterministic epoch values.
     ///
     /// **Safety note:** `service_start_instant` MUST be in the past relative
-    /// to the time `current_epoch()` will be called.  A future `Instant` will
-    /// panic inside `current_epoch()` via `Instant::elapsed()` on stable Rust.
-    /// We accept this contract rather than gating the function behind a
-    /// `cfg(test)` flag because the function is required by integration tests
-    /// in `tests/clock_m7.rs` which are compiled as a separate crate.
+    /// to the time the clock is read.  A future [`Instant`] will panic inside
+    /// `Instant::elapsed()` on stable Rust.  Required by integration tests in
+    /// `tests/clock_m7.rs` (separate crate).
     pub fn with_start_time(mut self, service_start_instant: Instant, start_unix_time: u64) -> Self {
-        self.service_start_instant = service_start_instant;
-        self.start_unix_time = start_unix_time;
+        self.epoch_clock = MonotonicEpochClock::with_start_time(
+            self.epoch_clock.genesis_time(),
+            service_start_instant,
+            start_unix_time,
+        );
         self
     }
 
-    /// Return the current epoch based on a monotonic clock anchored on `genesis_time`.
-    ///
-    /// ```text
-    /// now_unix       = start_unix_time + service_start_instant.elapsed()
-    /// current_epoch  = (now_unix - genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
-    /// ```
-    ///
-    /// Because `service_start_instant.elapsed()` is derived from a monotonic
-    /// [`Instant`], NTP wall-clock adjustments cannot shift the computed epoch.
-    pub fn current_epoch(&self) -> Epoch {
-        let elapsed_secs = self.service_start_instant.elapsed().as_secs();
-        let now_unix = self.start_unix_time.saturating_add(elapsed_secs);
-        let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
-        secs_since_genesis / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+    /// Shared monotonic epoch clock (sole `current_epoch` implementation).
+    pub fn epoch_clock(&self) -> &MonotonicEpochClock {
+        &self.epoch_clock
     }
 
     /// Check which validators need monitoring vs can be marked safe (restart-aware).
     ///
     /// For each pubkey, queries the slashing DB for the last signed attestation epoch.
-    /// If the validator signed within the last `monitoring_epochs` epochs,
-    /// it is considered a restart and marked `Safe` immediately.
-    /// Otherwise, it needs monitoring.
+    /// If [`should_skip_restart_monitoring`] is true, the validator is marked
+    /// `Safe` immediately; otherwise it needs monitoring.
     #[tracing::instrument(name = "doppelganger.check_validators", skip_all, fields(validator_count = pubkeys.len()))]
     pub fn check_validators(
         &self,
@@ -119,34 +106,26 @@ impl DoppelgangerService {
 
             let last_epoch = self.slashing_db.last_signed_attestation_epoch(pubkey)?;
 
-            let status = match last_epoch {
-                // Guard `current_epoch > self.monitoring_epochs` prevents the
-                // pre-genesis-clock-skew bypass (M-7 review SF-1): if
-                // `start_unix_time < genesis_time`, `current_epoch()` collapses
-                // to 0, and `0.saturating_sub(N) = 0 <= monitoring_epochs`
-                // would otherwise mark every validator with any history Safe
-                // without completing the monitoring window.
-                Some(epoch)
-                    if current_epoch > self.monitoring_epochs
-                        && current_epoch.saturating_sub(epoch) <= self.monitoring_epochs =>
-                {
-                    info!(
-                        pubkey = %TruncatedPubkey::new(pubkey),
-                        last_epoch = epoch,
-                        current_epoch = current_epoch,
-                        "restart detected, skipping doppelganger monitoring"
-                    );
-                    DoppelgangerStatus::Safe
-                }
-                _ => {
-                    info!(
-                        pubkey = %TruncatedPubkey::new(pubkey),
-                        last_epoch = ?last_epoch,
-                        current_epoch = current_epoch,
-                        "validator needs doppelganger monitoring"
-                    );
-                    DoppelgangerStatus::DetectionInProgress
-                }
+            let status = if should_skip_restart_monitoring(
+                current_epoch,
+                last_epoch,
+                self.monitoring_epochs,
+            ) {
+                info!(
+                    pubkey = %TruncatedPubkey::new(pubkey),
+                    last_epoch = ?last_epoch,
+                    current_epoch = current_epoch,
+                    "restart detected, skipping doppelganger monitoring"
+                );
+                DoppelgangerStatus::Safe
+            } else {
+                info!(
+                    pubkey = %TruncatedPubkey::new(pubkey),
+                    last_epoch = ?last_epoch,
+                    current_epoch = current_epoch,
+                    "validator needs doppelganger monitoring"
+                );
+                DoppelgangerStatus::DetectionInProgress
             };
 
             results.push((pubkey.clone(), status));
@@ -254,7 +233,7 @@ impl DoppelgangerService {
         // Late-bind the detected count onto the `doppelganger.monitor` span via the kit
         // helper. The field was declared `field::Empty` at span creation, so this record
         // lands (a raw key not declared there would be silently dropped).
-        crypto::logging::record_debug(
+        observability::logging::record_debug(
             &tracing::Span::current(),
             "detected_count",
             detected.len() as u64,
@@ -274,7 +253,7 @@ mod tests {
     use crate::{DoppelgangerError, DoppelgangerStatus};
 
     /// The `doppelganger.monitor` span declares `detected_count = field::Empty` and the run
-    /// late-binds it via `crypto::logging::record_debug`. This proves that record lands —
+    /// late-binds it via `observability::logging::record_debug`. This proves that record lands —
     /// the field name in the helper call MUST match the declared field or it silently
     /// vanishes (the #1 record() foot-gun).
     #[test]
@@ -310,7 +289,7 @@ mod tests {
             let span =
                 tracing::info_span!("doppelganger.monitor", detected_count = tracing::field::Empty);
             let _e = span.enter();
-            crypto::logging::record_debug(&tracing::Span::current(), "detected_count", 3u64);
+            observability::logging::record_debug(&tracing::Span::current(), "detected_count", 3u64);
         });
 
         let recorded = cap.0.lock().unwrap();
@@ -950,13 +929,61 @@ mod tests {
         assert!(s.contains("0xpk2"));
     }
 
-    // -- current_epoch / BN-derived clock tests (M-7) --
+    // -- shared MonotonicEpochClock wiring (M-7 / RF4-30) --
+
+    /// Service embeds `MonotonicEpochClock`; epoch agrees with a standalone
+    /// clock built from the same anchors (single implementation, shared path).
+    #[test]
+    fn test_single_epoch_clock_used_by_all_doppelganger_paths() {
+        use std::time::Instant;
+
+        use eth_types::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+
+        use crate::MonotonicEpochClock;
+
+        const SECONDS_PER_EPOCH: u64 = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
+
+        let start_instant = Instant::now();
+        let start_unix_time = SECONDS_PER_EPOCH * 5;
+        let genesis_time = 0_u64;
+
+        let standalone =
+            MonotonicEpochClock::with_start_time(genesis_time, start_instant, start_unix_time);
+
+        let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
+        let service = DoppelgangerService::new(liveness, slashing_db, genesis_time)
+            .with_start_time(start_instant, start_unix_time);
+
+        assert_eq!(
+            service.epoch_clock().current_epoch(),
+            standalone.current_epoch(),
+            "service must use MonotonicEpochClock, not a parallel formula"
+        );
+        assert_eq!(service.epoch_clock().current_epoch(), 5);
+
+        // Epoch-boundary anchors: exactly N epochs after genesis.
+        let boundary_unix = SECONDS_PER_EPOCH * 10;
+        let boundary_instant = Instant::now();
+        let service_boundary = DoppelgangerService::new(
+            Arc::new(MockLivenessChecker::new(vec![])),
+            Arc::new(MockSlashingDb::new()),
+            genesis_time,
+        )
+        .with_start_time(boundary_instant, boundary_unix);
+        let clock_boundary =
+            MonotonicEpochClock::with_start_time(genesis_time, boundary_instant, boundary_unix);
+        assert_eq!(service_boundary.epoch_clock().current_epoch(), clock_boundary.current_epoch());
+        assert_eq!(service_boundary.epoch_clock().current_epoch(), 10);
+    }
 
     /// Two services with different genesis_times must differ by
     /// `(genesis_time_diff / SECONDS_PER_EPOCH)` epochs.
     #[test]
     fn test_genesis_time_anchored() {
         use std::time::Instant;
+
+        use eth_types::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
 
         const SECONDS_PER_EPOCH: u64 = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
 
@@ -977,8 +1004,8 @@ mod tests {
         let service2 = DoppelgangerService::new(liveness2, slashing2, genesis2)
             .with_start_time(start_instant, start_unix_time);
 
-        let epoch1 = service1.current_epoch();
-        let epoch2 = service2.current_epoch();
+        let epoch1 = service1.epoch_clock().current_epoch();
+        let epoch2 = service2.epoch_clock().current_epoch();
 
         assert_eq!(
             epoch1.saturating_sub(epoch2),
@@ -987,11 +1014,12 @@ mod tests {
         );
     }
 
-    /// current_epoch() matches the manual monotonic formula —
-    /// not `SystemTime::now()`.
+    /// Embedded clock matches the manual monotonic formula — not `SystemTime::now()`.
     #[test]
     fn test_current_epoch_uses_monotonic_formula() {
         use std::time::Instant;
+
+        use eth_types::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
 
         const SECONDS_PER_EPOCH: u64 = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
 
@@ -1004,14 +1032,14 @@ mod tests {
         let service = DoppelgangerService::new(liveness, slashing_db, genesis_time)
             .with_start_time(start_instant, start_unix);
 
-        let epoch = service.current_epoch();
+        let epoch = service.epoch_clock().current_epoch();
         // elapsed ≈ 0 so epoch ≈ (start_unix + 0 - genesis) / SECONDS_PER_EPOCH = 7
         assert_eq!(epoch, 7, "epoch must be anchored at 7 when start_unix = 7 * SECONDS_PER_EPOCH");
 
         // Cross-check against formula:
         let elapsed = start_instant.elapsed().as_secs();
         let expected = (start_unix + elapsed - genesis_time) / SECONDS_PER_EPOCH;
-        assert_eq!(service.current_epoch(), expected);
+        assert_eq!(service.epoch_clock().current_epoch(), expected);
     }
 
     // -- DoppelgangerError tests --

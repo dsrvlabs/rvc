@@ -6,21 +6,39 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
+[features]
+# Deterministic SSZ/KAT bodies + known roots for unit/integration tests only.
+# Production builds leave this off so fixture code is not compiled into the lib.
+default = []
+test-fixtures = []
+
+# Integration tests that build typed bodies (L-3 KZG binding) need fixtures.
+[[test]]
+name = "block_and_blobs_l3"
+required-features = ["test-fixtures"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 ethereum_serde_utils.workspace = true
 hex.workspace = true
+# Used by `is_sync_committee_aggregator` (RF3-20 / G7). External only — keeps
+# the zero workspace-internal out-edge pin for rvc-eth-types.
+sha2.workspace = true
 ssz.workspace = true
 ssz_derive.workspace = true
+# Body-container SSZ Encode/Decode only (ssz_types VariableList/Bit* are 0.8 traits).
+ssz08.workspace = true
+ssz_types.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 tree_hash.workspace = true
 tree_hash_derive.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tracing-test = { workspace = true, features = ["no-env-filter"] }
 # Independent SSZ-Merkleization oracle for the BeaconBlockHeader KAT (FR-31).
 # Dev-only: not a production out-edge, so the architecture-tests
 # zero-out-edge invariant for rvc-eth-types is unaffected.

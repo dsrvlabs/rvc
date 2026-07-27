@@ -1,6 +1,6 @@
 use super::bls::{SecretKey, Signature};
-use super::signing::{compute_domain, compute_signing_root};
-use eth_types::{ForkName, ForkSchedule, Root, VoluntaryExit, DOMAIN_VOLUNTARY_EXIT};
+use super::signing_root::{signing_root_for, DutyRef, SigningCtx};
+use eth_types::{ForkSchedule, Root, VoluntaryExit};
 
 #[tracing::instrument(
     name = "crypto.sign_voluntary_exit",
@@ -11,26 +11,24 @@ use eth_types::{ForkName, ForkSchedule, Root, VoluntaryExit, DOMAIN_VOLUNTARY_EX
 /// Signs a voluntary exit with the correct fork-aware domain.
 ///
 /// Per EIP-7044, voluntary exit signatures are perpetually valid by capping the
-/// fork version at Capella for exits at Capella epoch or later.
+/// fork version at Capella for exits at Capella epoch or later — applied inside
+/// [`signing_root_for`].
 pub fn sign_voluntary_exit(
     voluntary_exit: &VoluntaryExit,
     secret_key: &SecretKey,
     fork_schedule: &ForkSchedule,
     genesis_validators_root: Root,
 ) -> Signature {
-    let fork_name = ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
-    // EIP-7044: voluntary exit signatures are perpetually valid by capping at Capella
-    let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };
-    let fork_version = capped.fork_version(fork_schedule);
-    let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, fork_version, genesis_validators_root);
-    let signing_root = compute_signing_root(voluntary_exit, domain);
+    let ctx = SigningCtx { fork_schedule, genesis_validators_root };
+    let signing_root = signing_root_for(&DutyRef::VoluntaryExit(voluntary_exit), &ctx);
     secret_key.sign(&signing_root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signing::compute_domain;
+    use crate::signing::{compute_domain, compute_signing_root};
+    use eth_types::{ForkName, DOMAIN_VOLUNTARY_EXIT};
 
     fn test_fork_schedule() -> ForkSchedule {
         ForkSchedule {

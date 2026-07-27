@@ -1,10 +1,14 @@
 [package]
 name = "rvc"
+autobins = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = []
@@ -19,20 +23,20 @@ beacon.workspace = true
 bn-manager.workspace = true
 block-service.workspace = true
 crypto.workspace = true
+observability.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
+grpc-signer.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
-propagator.workspace = true
 prost.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
 secret-provider.workspace = true
 signer.workspace = true
 slashing.workspace = true
-sync-service.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
@@ -52,10 +56,19 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-crypto = { workspace = true, features = ["test-utils"] }
-http-body-util = "0.1"
+# test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
+bn-manager = { workspace = true, features = ["test-utils"] }
+crypto.workspace = true
+http-body-util.workspace = true
+# Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
+# for the RF1-02 fail-closed DB-error integration test.
+rusqlite = { workspace = true, features = ["bundled"] }
+secrecy.workspace = true
 serde_json.workspace = true
+# test-utils: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
+signer = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+tokio-stream.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tracing-test.workspace = true

@@ -6,11 +6,12 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use bn_manager::{
-    BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration,
-    ValidatorRegistrationV1,
+    BeaconError, ProposerPreparation, SignedValidatorRegistration, ValidatorRegistrationV1,
 };
-use signer::{SignerError, ValidatorSigner};
+use signer::SignerError;
 use validator_store::ValidatorStore;
+
+use crate::traits::{BuilderBeaconClient, RegistrationSigner};
 
 #[derive(Debug, Error)]
 pub enum BuilderServiceError {
@@ -29,8 +30,8 @@ struct CachedRegistration {
 }
 
 pub struct BuilderService {
-    signer: Arc<dyn ValidatorSigner>,
-    bn: Arc<dyn BeaconNodeClient>,
+    signer: Arc<dyn RegistrationSigner>,
+    bn: Arc<dyn BuilderBeaconClient>,
     validator_store: Arc<ValidatorStore>,
     genesis_fork_version: [u8; 4],
     cache: tokio::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
@@ -40,8 +41,8 @@ pub struct BuilderService {
 
 impl BuilderService {
     pub fn new(
-        signer: Arc<dyn ValidatorSigner>,
-        bn: Arc<dyn BeaconNodeClient>,
+        signer: Arc<dyn RegistrationSigner>,
+        bn: Arc<dyn BuilderBeaconClient>,
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
     ) -> Self {
@@ -49,8 +50,8 @@ impl BuilderService {
     }
 
     pub fn with_batching(
-        signer: Arc<dyn ValidatorSigner>,
-        bn: Arc<dyn BeaconNodeClient>,
+        signer: Arc<dyn RegistrationSigner>,
+        bn: Arc<dyn BuilderBeaconClient>,
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
         registration_batch_size: usize,
@@ -129,8 +130,11 @@ impl BuilderService {
                 .await
             {
                 Ok(signature) => {
-                    registrations
-                        .push(SignedValidatorRegistration { message: registration, signature });
+                    // Wire boundary: eth_types::Signature is Vec<u8> for JSON serde.
+                    registrations.push(SignedValidatorRegistration {
+                        message: registration,
+                        signature: signature.to_bytes().to_vec(),
+                    });
                 }
                 Err(e) => {
                     error!(
@@ -281,23 +285,11 @@ mod tests {
     use parking_lot::Mutex;
 
     use async_trait::async_trait;
-    use bn_manager::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription,
-        BlockRootResponse, ConfigSpecResponse, ForkSchedule, GenesisResponse, ProduceBlockResponse,
-        ProposerDutiesResponse, SignedBeaconBlock, SignedBlindedBeaconBlock,
-        SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-        SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-        VersionedSignedAggregateAndProof,
-    };
     use crypto::PublicKey;
-    use eth_types::{
-        AggregateAndProof, AttestationData, ElectraAggregateAndProof, Epoch, Root, Slot,
-        VoluntaryExit,
-    };
+    use eth_types::ValidatorRegistrationV1;
     use validator_store::ValidatorConfig;
 
-    // --- Mock BN ---
+    // --- Narrow mock BN (only the two methods BuilderService uses) ---
 
     struct MockBn {
         register_calls: Mutex<Vec<Vec<SignedValidatorRegistration>>>,
@@ -336,108 +328,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BeaconNodeClient for MockBn {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
+    impl BuilderBeaconClient for MockBn {
         async fn prepare_beacon_proposer(
             &self,
             preparations: &[ProposerPreparation],
@@ -448,12 +339,7 @@ mod tests {
             self.prepare_calls.lock().push(preparations.to_vec());
             Ok(())
         }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
+
         async fn register_validators(
             &self,
             registrations: &[SignedValidatorRegistration],
@@ -467,138 +353,49 @@ mod tests {
             self.register_calls.lock().push(registrations.to_vec());
             Ok(())
         }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
     }
 
-    // --- Mock Signer ---
+    // --- Narrow mock signer (only sign_builder_registration) ---
 
     struct MockSigner {
         fail_sign: bool,
         sign_calls: Mutex<Vec<[u8; 48]>>,
+        /// Fixed valid BLS signature for wire-boundary assertions.
+        sig: crypto::Signature,
     }
 
     impl MockSigner {
         fn new() -> Self {
-            Self { fail_sign: false, sign_calls: Mutex::new(Vec::new()) }
+            Self {
+                fail_sign: false,
+                sign_calls: Mutex::new(Vec::new()),
+                sig: crypto::SecretKey::generate().sign(b"mock-builder-reg"),
+            }
         }
 
         fn with_sign_error(mut self) -> Self {
             self.fail_sign = true;
             self
         }
+
+        fn signature_bytes(&self) -> Vec<u8> {
+            self.sig.to_bytes().to_vec()
+        }
     }
 
-    #[async_trait(?Send)]
-    impl ValidatorSigner for MockSigner {
-        async fn sign_attestation(
-            &self,
-            _: &AttestationData,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_block(
-            &self,
-            _: &Root,
-            _: Slot,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_randao_reveal(
-            &self,
-            _: Epoch,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_sync_committee_message(
-            &self,
-            _: &Root,
-            _: Slot,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_selection_proof(
-            &self,
-            _: Slot,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_aggregate_and_proof(
-            &self,
-            _: &AggregateAndProof,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_electra_aggregate_and_proof(
-            &self,
-            _: &ElectraAggregateAndProof,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_voluntary_exit(
-            &self,
-            _: &VoluntaryExit,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
+    #[async_trait]
+    impl RegistrationSigner for MockSigner {
         async fn sign_builder_registration(
             &self,
             _registration: &ValidatorRegistrationV1,
             pubkey: &PublicKey,
             _fork_version: [u8; 4],
-        ) -> Result<Vec<u8>, SignerError> {
+        ) -> Result<crypto::Signature, SignerError> {
             if self.fail_sign {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
-            Ok(vec![0xaa; 96])
-        }
-        async fn sign_sync_committee_selection_proof(
-            &self,
-            _: Slot,
-            _: u64,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_contribution_and_proof(
-            &self,
-            _: &eth_types::ContributionAndProof,
-            _: &PublicKey,
-            _: &eth_types::ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
+            Ok(self.sig.clone())
         }
     }
 
@@ -655,19 +452,44 @@ mod tests {
         )
     }
 
+    /// RED→GREEN: BuilderService compiles against a two-method BN stub +
+    /// one-method registration signer (no BeaconNodeClient / ValidatorSigner).
+    #[tokio::test]
+    async fn test_builder_service_compiles_against_two_method_stub() {
+        let pk = gen_pubkey_bytes();
+        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service =
+            BuilderService::new(signer, bn.clone(), Arc::new(store), [0x00, 0x00, 0x00, 0x00]);
+
+        service.register_validators().await.unwrap();
+        assert_eq!(bn.register_calls.lock().len(), 1);
+
+        let mut indices = HashMap::new();
+        indices.insert(pk, 1u64);
+        service.prepare_proposers(&indices).await.unwrap();
+        assert_eq!(bn.prepare_calls.lock().len(), 1);
+    }
+
     // --- register_validators tests ---
 
     #[tokio::test]
     async fn test_register_validators_no_builder_enabled() {
         let pk = gen_pubkey_bytes();
         let store = test_store_with_builder_validators(&[(pk, false, None, None)]);
-        let service = build_service(MockSigner::new(), MockBn::new(), store);
+        let bn = Arc::new(MockBn::new());
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            [0x00, 0x00, 0x00, 0x00],
+        );
 
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let bn = service.bn.as_ref() as *const dyn BeaconNodeClient as *const MockBn;
-        let calls = unsafe { &*bn }.register_calls.lock();
+        let calls = bn.register_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -708,7 +530,7 @@ mod tests {
         assert_eq!(calls[0][0].message.pubkey, pk1);
         assert_eq!(calls[0][0].message.fee_recipient, fr);
         assert_eq!(calls[0][0].message.gas_limit, 35_000_000);
-        assert_eq!(calls[0][0].signature, vec![0xaa; 96]);
+        assert_eq!(calls[0][0].signature, signer.signature_bytes());
 
         let sign_calls = signer.sign_calls.lock();
         assert_eq!(sign_calls.len(), 1);
@@ -1154,6 +976,30 @@ mod tests {
         );
         assert_eq!(service.registration_batch_size, 100);
         assert_eq!(service.registration_batch_delay_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn test_batching_delay_between_batches() {
+        // Relocated from bin/rvc tier-4 registration_batching (unique timing cover).
+        let pks: Vec<[u8; 48]> = (0..20).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> =
+            pks.iter().map(|pk| (*pk, true, None, None)).collect();
+        let store = Arc::new(test_store_with_builder_validators(&validators));
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer, bn.clone(), store, 10, 50);
+
+        let start = std::time::Instant::now();
+        service.register_validators().await.unwrap();
+        let elapsed = start.elapsed();
+
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 2, "20 validators / 10 batch = 2 requests");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "should have delay between batches, elapsed: {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]

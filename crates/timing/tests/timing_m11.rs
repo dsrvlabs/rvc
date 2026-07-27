@@ -6,9 +6,7 @@
 //! exact spec mark even for non-12 s slot durations. On mainnet this is
 //! `3333 * 12000 / 10000 = 3999 ms` (not 4000), per report §4.3.
 
-use rvc_timing::{
-    due_ms, MockSlotClock, SlotClock, AGGREGATE_DUE_BPS_GLOAS, ATTESTATION_DUE_BPS_GLOAS,
-};
+use rvc_timing::{due_ms, MockSlotClock, SlotClock};
 use std::time::Duration;
 
 const TEST_GENESIS: u64 = 1_606_824_023;
@@ -109,23 +107,20 @@ fn test_due_ms_tiny_bps_floor() {
     assert_eq!(due_ms(1, 12000), 1);
 }
 
-// -- Gloas 1/4 attestation deadline on a 12 s slot: 2500 * 12000 / 10000 = 3000 ms.
-// The legacy integer `/3` model could only produce 4000 ms; it could not express 1/4.
+// -- Non-default bps fractions (future-fork style): 1/4 and 1/2 of the slot.
+// Named Gloas BPS constants were deleted with RF2-03; due_ms itself still
+// expresses any bps fraction (reintroduced later via ForkSchedule in Phase 3).
 #[test]
-fn test_due_ms_gloas_attestation_quarter_12s() {
-    assert_eq!(due_ms(ATTESTATION_DUE_BPS_GLOAS, 12000), 3000);
+fn test_due_ms_quarter_bps_12s() {
+    assert_eq!(due_ms(2500, 12000), 3000);
 }
 
-// -- Gloas 1/2 aggregate deadline on a 12 s slot: 5000 * 12000 / 10000 = 6000 ms.
-// The legacy `*2/3` model could only produce 8000 ms; it could not express 1/2.
 #[test]
-fn test_due_ms_gloas_aggregate_half_12s() {
-    assert_eq!(due_ms(AGGREGATE_DUE_BPS_GLOAS, 12000), 6000);
+fn test_due_ms_half_bps_12s() {
+    assert_eq!(due_ms(5000, 12000), 6000);
 }
 
-// -- Gloas 1/4 attestation deadline on a non-12 s 8 s slot: 2500 * 8000 / 10000 = 2000 ms.
-// Proves the formula generalizes across slot durations (legacy /3 would give ~2666).
 #[test]
-fn test_due_ms_gloas_attestation_quarter_8s() {
-    assert_eq!(due_ms(ATTESTATION_DUE_BPS_GLOAS, 8000), 2000);
+fn test_due_ms_quarter_bps_8s() {
+    assert_eq!(due_ms(2500, 8000), 2000);
 }

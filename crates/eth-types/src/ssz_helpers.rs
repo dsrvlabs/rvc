@@ -1,9 +1,19 @@
 //! SSZ encode/decode helpers for consensus objects.
 //!
-//! These helpers dispatch by `fork_id` (PHASE0=0, ALTAIR=1, BELLATRIX=2,
-//! CAPELLA=3, DENEB=4, ELECTRA=5, FULU=6) and provide unified entry points
-//! that the signer service can use to deserialize SSZ bytes from proto fields
-//! without inspecting the bytes directly.
+//! ## What `fork_id` means here
+//!
+//! Helpers take a numeric `fork_id` matching [`crate::ForkName::id`]
+//! (PHASE0=0 … FULU=6). Unknown ids are rejected via [`crate::ForkName`]'s
+//! `TryFrom<u32>` impl. **`fork_id` is not a layout dispatcher**: encoders
+//! ignore it, and decoders use a single fixed layout per type. In particular
+//! [`decode_attestation_ssz`] always expects the pre-Electra three-field
+//! attestation shape (see below). A live mainnet Electra VC may still send
+//! `fork_id = 5` with that pre-Electra-shaped buffer — that path must keep
+//! working. Electra-shaped four-field buffers are rejected with
+//! [`SszDecodeError::ElectraLayoutUnsupported`] rather than misparsed.
+//! A real `ElectraAttestation` SSZ codec is out of scope for these helpers.
+//!
+//! ## BeaconBlock container
 //!
 //! The `BeaconBlock` and related types use a `body: Vec<u8>` representation
 //! internally. Their SSZ layout is a simple 5-field container with one
@@ -22,7 +32,8 @@
 use thiserror::Error;
 
 use crate::{
-    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, SyncCommitteeContribution,
+    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, ForkName,
+    SyncCommitteeContribution,
 };
 
 /// Errors that can occur when decoding SSZ bytes into a consensus type.
@@ -39,6 +50,15 @@ pub enum SszDecodeError {
 
     #[error("invalid SSZ encoding: {0}")]
     InvalidEncoding(String),
+
+    /// Buffer looks like an Electra (or later) attestation layout with
+    /// `committee_bits`, which these helpers do not decode. Prefer this over
+    /// silently returning a garbage pre-Electra [`Attestation`].
+    #[error(
+        "Electra-shaped attestation SSZ is not supported by this decoder (fork_id={fork_id}); \
+         send the pre-Electra three-field layout or use a codec that understands committee_bits"
+    )]
+    ElectraLayoutUnsupported { fork_id: u32 },
 }
 
 // ============================================================
@@ -99,13 +119,17 @@ pub fn decode_blinded_beacon_block_ssz(
 // Attestation
 // ============================================================
 
+/// Pre-Electra attestation fixed prefix length for the wire layout used here:
+/// `offset_agg(4) | data(128) | offset_sig(4)`.
+const ATTESTATION_FIXED_LEN: usize = 4 + 128 + 4;
+
 /// SSZ-encode an [`Attestation`] to bytes.
 ///
-/// Layout: aggregation_bits (variable) | data (fixed, 128 bytes) | signature (variable, 96 bytes fixed)
+/// Pre-Electra three-field layout (aggregation_bits and signature treated as
+/// variable-length regions; data fixed at 128 bytes):
+/// `offset_agg(4) + data(128) + offset_sig(4) + aggregation_bits + signature`.
 ///
-/// Actually: two variable-length fields (aggregation_bits, signature) + one fixed-length field (data).
-/// SSZ layout for a 3-field container where fields 1 and 3 are variable:
-/// offset1(4) + data(128) + offset3(4) + aggregation_bits_data + signature_data
+/// `fork_id` is accepted for API symmetry and is not used for encoding.
 pub fn encode_attestation_ssz(att: &Attestation, _fork_id: u32) -> Vec<u8> {
     // data is fixed-length (128 bytes: 8+8+32+40+40)
     use ssz::Encode;
@@ -124,15 +148,23 @@ pub fn encode_attestation_ssz(att: &Attestation, _fork_id: u32) -> Vec<u8> {
     out
 }
 
-/// SSZ-decode bytes into an [`Attestation`], dispatching by `fork_id`.
+/// SSZ-decode bytes into a pre-Electra [`Attestation`].
+///
+/// Always expects the three-field layout produced by [`encode_attestation_ssz`],
+/// regardless of `fork_id` (including Electra/`5` and Fulu/`6`). Buffers whose
+/// offsets or trailing sizes do not match that layout — typically Electra
+/// attestations carrying `committee_bits` — return
+/// [`SszDecodeError::ElectraLayoutUnsupported`] instead of a wrong
+/// [`Attestation`].
 pub fn decode_attestation_ssz(bytes: &[u8], fork_id: u32) -> Result<Attestation, SszDecodeError> {
     validate_fork_id(fork_id)?;
 
     use ssz::Decode;
 
-    // Layout: offset1(4) + data(128) + offset3(4) + aggregation_bits + signature
+    // Layout: offset_agg(4) + data(128) + offset_sig(4) + aggregation_bits + signature(96)
     const DATA_SSZ_LEN: usize = 128; // 8+8+32+40+40
-    const FIXED_LEN: usize = 4 + DATA_SSZ_LEN + 4;
+    const FIXED_LEN: usize = ATTESTATION_FIXED_LEN;
+    const BLS_SIG_LEN: usize = crate::SIGNATURE_BYTES_LEN;
 
     if bytes.len() < FIXED_LEN {
         return Err(SszDecodeError::TooShort { need: FIXED_LEN, got: bytes.len() });
@@ -143,11 +175,26 @@ pub fn decode_attestation_ssz(bytes: &[u8], fork_id: u32) -> Result<Attestation,
     let offset3 =
         u32::from_le_bytes(bytes[4 + DATA_SSZ_LEN..FIXED_LEN].try_into().unwrap()) as usize;
 
-    if offset1 < FIXED_LEN || offset1 > bytes.len() {
+    // Strict inverse of `encode_attestation_ssz`: the first variable region
+    // must start immediately after the fixed prefix. A larger first offset is
+    // what Electra four-field encodings produce (extra offset / fixed fields
+    // in the prefix) and must not be misparsed as aggregation_bits.
+    if offset1 != FIXED_LEN {
+        if offset1 > FIXED_LEN && offset1 <= bytes.len() {
+            return Err(SszDecodeError::ElectraLayoutUnsupported { fork_id });
+        }
         return Err(SszDecodeError::OffsetOutOfRange { offset: offset1, len: bytes.len() });
     }
     if offset3 < offset1 || offset3 > bytes.len() {
         return Err(SszDecodeError::OffsetOutOfRange { offset: offset3, len: bytes.len() });
+    }
+
+    let sig_len = bytes.len() - offset3;
+    // BLS signatures are fixed 96 bytes. Extra trailing bytes are the usual
+    // signature of an Electra buffer that appended `committee_bits` after the
+    // three-field body (or used a different trailing split).
+    if sig_len != BLS_SIG_LEN {
+        return Err(SszDecodeError::ElectraLayoutUnsupported { fork_id });
     }
 
     let aggregation_bits = bytes[offset1..offset3].to_vec();
@@ -234,11 +281,9 @@ pub fn decode_sync_committee_contribution_ssz(
 /// (slot, proposer_index, parent_root, state_root, body)
 type BlockFields = (u64, u64, [u8; 32], [u8; 32], Vec<u8>);
 
-/// Validate that a `fork_id` is a known value (0..=6).
+/// Validate that a `fork_id` is a known [`ForkName`] id.
 fn validate_fork_id(fork_id: u32) -> Result<(), SszDecodeError> {
-    if fork_id > 6 {
-        return Err(SszDecodeError::UnknownForkId(fork_id));
-    }
+    ForkName::try_from(fork_id).map_err(|e| SszDecodeError::UnknownForkId(e.0))?;
     Ok(())
 }
 
@@ -384,6 +429,25 @@ mod tests {
         assert!(matches!(result, Err(SszDecodeError::UnknownForkId(7))));
     }
 
+    /// RF3-07: `validate_fork_id` delegates to `ForkName::try_from`.
+    /// Accept 0..=6; reject 7 and `u32::MAX` with `UnknownForkId`.
+    #[test]
+    fn test_validate_fork_id_accepts_0_through_6_rejects_7_and_max() {
+        let block = sample_beacon_block();
+        let encoded = encode_beacon_block_ssz(&block, 0);
+        for fork_id in 0u32..=6 {
+            decode_beacon_block_ssz(&encoded, fork_id)
+                .unwrap_or_else(|e| panic!("fork_id={fork_id} should be accepted: {e}"));
+        }
+        for fork_id in [7u32, u32::MAX] {
+            let result = decode_beacon_block_ssz(&encoded, fork_id);
+            assert!(
+                matches!(result, Err(SszDecodeError::UnknownForkId(id)) if id == fork_id),
+                "fork_id={fork_id} should be UnknownForkId, got {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_decode_beacon_block_too_short_returns_error() {
         let short = vec![0u8; 10];
@@ -480,5 +544,107 @@ mod tests {
         let encoded = encode_sync_committee_contribution_ssz(&contrib, 5); // Electra
         let decoded = decode_sync_committee_contribution_ssz(&encoded, 5).unwrap();
         assert_eq!(contrib, decoded);
+    }
+
+    /// Hand-encode an Electra four-field attestation in the same offset style as
+    /// [`encode_attestation_ssz`], plus a third offset for `committee_bits`.
+    ///
+    /// Layout: `offset_agg(4) | data(128) | offset_sig(4) | offset_committee(4)
+    /// | aggregation_bits | signature | committee_bits`.
+    fn encode_electra_shaped_attestation_handrolled(
+        aggregation_bits: &[u8],
+        data: &AttestationData,
+        signature: &[u8],
+        committee_bits: &[u8],
+    ) -> Vec<u8> {
+        use ssz::Encode;
+        let data_bytes = data.as_ssz_bytes();
+        let fixed_size = 4 + data_bytes.len() + 4 + 4;
+        let offset_agg = fixed_size as u32;
+        let offset_sig = offset_agg + aggregation_bits.len() as u32;
+        let offset_committee = offset_sig + signature.len() as u32;
+
+        let mut out = Vec::with_capacity(
+            fixed_size + aggregation_bits.len() + signature.len() + committee_bits.len(),
+        );
+        out.extend_from_slice(&offset_agg.to_le_bytes());
+        out.extend_from_slice(&data_bytes);
+        out.extend_from_slice(&offset_sig.to_le_bytes());
+        out.extend_from_slice(&offset_committee.to_le_bytes());
+        out.extend_from_slice(aggregation_bits);
+        out.extend_from_slice(signature);
+        out.extend_from_slice(committee_bits);
+        out
+    }
+
+    /// RF3-09: Electra four-field buffers must not decode as a garbage
+    /// pre-Electra `Attestation`.
+    #[test]
+    fn test_electra_shaped_aggregate_is_not_silently_misparsed() {
+        let data = AttestationData {
+            slot: 100,
+            index: 0,
+            beacon_block_root: [0x33; 32],
+            source: Checkpoint { epoch: 9, root: [0x44; 32] },
+            target: Checkpoint { epoch: 10, root: [0x55; 32] },
+        };
+        let encoded = encode_electra_shaped_attestation_handrolled(
+            &[0xff, 0x01],
+            &data,
+            &[0xaa; 96],
+            &[0x01; 8], // committee_bits (Bitvector[64] = 8 bytes)
+        );
+
+        // First offset is 140, not 136 — without the structural check this used
+        // to return Ok(Attestation) with a corrupted signature region.
+        assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), 140);
+
+        for fork_id in 0u32..=6 {
+            let result = decode_attestation_ssz(&encoded, fork_id);
+            assert!(
+                matches!(
+                    result,
+                    Err(SszDecodeError::ElectraLayoutUnsupported { fork_id: id }) if id == fork_id
+                ),
+                "fork_id={fork_id}: expected ElectraLayoutUnsupported, got {result:?}"
+            );
+        }
+    }
+
+    /// RF3-09: mainnet Electra path tags `fork_id = 5` but still sends the
+    /// pre-Electra-shaped buffer from [`encode_attestation_ssz`].
+    #[test]
+    fn test_legacy_attestation_at_fork_id_5_still_decodes() {
+        let att = sample_attestation();
+        let encoded = encode_attestation_ssz(&att, 5);
+        let decoded = decode_attestation_ssz(&encoded, 5).expect("legacy @ fork_id=5");
+        assert_eq!(att, decoded);
+    }
+
+    /// RF3-09: legacy round-trip remains green for every known fork id.
+    #[test]
+    fn test_legacy_attestation_roundtrip_all_fork_ids_0_to_6() {
+        let att = sample_attestation();
+        for fork_id in 0u32..=6 {
+            let encoded = encode_attestation_ssz(&att, fork_id);
+            let decoded = decode_attestation_ssz(&encoded, fork_id)
+                .unwrap_or_else(|e| panic!("fork_id={fork_id}: {e}"));
+            assert_eq!(att, decoded, "roundtrip failed for fork_id={fork_id}");
+        }
+    }
+
+    /// RF3-09: Electra layout that reuses the 136-byte fixed prefix but appends
+    /// `committee_bits` after a 96-byte signature (sig region longer than 96).
+    #[test]
+    fn test_electra_trailing_committee_bits_rejected() {
+        let att = sample_attestation();
+        let mut encoded = encode_attestation_ssz(&att, 5);
+        encoded.extend_from_slice(&[0x01; 8]); // fake committee_bits trailer
+
+        let result = decode_attestation_ssz(&encoded, 5);
+        assert!(
+            matches!(result, Err(SszDecodeError::ElectraLayoutUnsupported { fork_id: 5 })),
+            "got {result:?}"
+        );
     }
 }

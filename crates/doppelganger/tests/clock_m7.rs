@@ -1,21 +1,21 @@
 //! Integration tests for M-7: BN-derived clock anchored on genesis_time.
 //!
-//! Verifies that `DoppelgangerService::current_epoch()` is immune to NTP wall-clock
-//! steps by anchoring the epoch computation on a monotonic `Instant` elapsed
-//! plus a `start_unix_time` captured once at construction.
+//! Verifies that [`MonotonicEpochClock`] is immune to NTP wall-clock steps
+//! by anchoring epoch computation on a monotonic `Instant` elapsed plus a
+//! `start_unix_time` captured once at construction.  The legacy
+//! `DoppelgangerService` embeds the same clock (no parallel formula).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rvc_doppelganger::{
-    DoppelgangerError, DoppelgangerService, LegacySlashingHistoryReader, LivenessChecker,
+    DoppelgangerService, LegacySlashingHistoryReader, LivenessChecker, MonotonicEpochClock,
     ValidatorLivenessData,
 };
 
 // Epoch length in seconds: SECONDS_PER_SLOT * SLOTS_PER_EPOCH = 12 * 32 = 384
 const SECONDS_PER_EPOCH: u64 = 12 * 32;
 
-// --- Minimal mock implementations ---
+// --- Minimal mock implementations (service embedding check) ---
 
 struct EmptySlashingDb;
 
@@ -23,7 +23,7 @@ impl LegacySlashingHistoryReader for EmptySlashingDb {
     fn last_signed_attestation_epoch(
         &self,
         _pubkey: &str,
-    ) -> Result<Option<u64>, DoppelgangerError> {
+    ) -> Result<Option<u64>, rvc_doppelganger::DoppelgangerError> {
         Ok(None)
     }
 }
@@ -36,7 +36,7 @@ impl LivenessChecker for EmptyLivenessChecker {
         &self,
         _epoch: u64,
         _validator_indices: &[String],
-    ) -> Result<Vec<ValidatorLivenessData>, DoppelgangerError> {
+    ) -> Result<Vec<ValidatorLivenessData>, rvc_doppelganger::DoppelgangerError> {
         Ok(vec![])
     }
 }
@@ -46,6 +46,7 @@ fn mock_service(
     start_unix_time: u64,
     start_instant: Instant,
 ) -> DoppelgangerService {
+    use std::sync::Arc;
     let liveness: Arc<dyn LivenessChecker> = Arc::new(EmptyLivenessChecker);
     let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(EmptySlashingDb);
     DoppelgangerService::new(liveness, slashing_db, genesis_time)
@@ -53,10 +54,6 @@ fn mock_service(
 }
 
 /// M-7: A wall-clock step (NTP jump) must NOT shift the computed epoch.
-///
-/// The epoch is computed from `start_unix_time + Instant::elapsed()`, not from
-/// `SystemTime::now()`. So even if the wall clock jumps, the monotonic elapsed
-/// is unaffected and the epoch stays consistent.
 #[test]
 fn test_wall_clock_jump_does_not_shift_epoch() {
     // Scenario:
@@ -71,10 +68,16 @@ fn test_wall_clock_jump_does_not_shift_epoch() {
     let start_unix_time = SECONDS_PER_EPOCH * 5; // 1920s => epoch 5
     let start_instant = Instant::now();
 
+    let clock = MonotonicEpochClock::with_start_time(genesis_time, start_instant, start_unix_time);
     let service = mock_service(genesis_time, start_unix_time, start_instant);
 
-    let epoch = service.current_epoch();
+    let epoch = clock.current_epoch();
     assert_eq!(epoch, 5, "epoch should be anchored at 5 epochs past genesis");
+    assert_eq!(
+        service.epoch_clock().current_epoch(),
+        epoch,
+        "service must share MonotonicEpochClock formula"
+    );
 
     // Simulate a "wall-clock jump" by observing that our formula does NOT use
     // SystemTime::now().  We verify by cross-checking with the manual formula:
@@ -82,23 +85,16 @@ fn test_wall_clock_jump_does_not_shift_epoch() {
     let elapsed_secs = start_instant.elapsed().as_secs();
     let expected = (start_unix_time + elapsed_secs - genesis_time) / SECONDS_PER_EPOCH;
     assert_eq!(
-        service.current_epoch(),
+        clock.current_epoch(),
         expected,
         "epoch must equal the monotonic-elapsed formula, not SystemTime::now()"
     );
-
-    // Additionally verify that even after a small real-world sleep the epoch is
-    // still derived from monotonic elapsed, not from a wall-clock re-read.
-    // (No sleep needed: the formula itself is the proof.)
-    // The key property: if we had used SystemTime::now() and NTP stepped the clock
-    // forward by hours, current_epoch() would jump. With Instant, it cannot.
 }
 
-/// M-7: Two services with different genesis_times must produce epochs that differ
+/// M-7: Two clocks with different genesis_times must produce epochs that differ
 /// by exactly `(genesis_time_diff / SECONDS_PER_EPOCH)`.
 #[test]
 fn test_genesis_time_anchored() {
-    // Both services start at the same unix time and same instant.
     let start_instant = Instant::now();
     let start_unix_time = 2_000_000_u64;
 
@@ -106,14 +102,14 @@ fn test_genesis_time_anchored() {
     // genesis2 is 1_000 epochs later: 1_000 * 384 = 384_000 seconds
     let genesis2 = genesis1 + SECONDS_PER_EPOCH * 1_000; // 1_384_000
 
-    let service1 = mock_service(genesis1, start_unix_time, start_instant);
-    let service2 = mock_service(genesis2, start_unix_time, start_instant);
+    let clock1 = MonotonicEpochClock::with_start_time(genesis1, start_instant, start_unix_time);
+    let clock2 = MonotonicEpochClock::with_start_time(genesis2, start_instant, start_unix_time);
 
-    let epoch1 = service1.current_epoch();
-    let epoch2 = service2.current_epoch();
+    let epoch1 = clock1.current_epoch();
+    let epoch2 = clock2.current_epoch();
 
-    // service1: (2_000_000 - 1_000_000) / 384 = 2_604 epochs
-    // service2: (2_000_000 - 1_384_000) / 384 = 1_604 epochs
+    // clock1: (2_000_000 - 1_000_000) / 384 = 2_604 epochs
+    // clock2: (2_000_000 - 1_384_000) / 384 = 1_604 epochs
     // Difference: 1_000 epochs
     assert_eq!(
         epoch1.saturating_sub(epoch2),
@@ -130,10 +126,10 @@ fn test_epoch_advances_with_elapsed() {
     let one_epoch_ago = Instant::now() - Duration::from_secs(SECONDS_PER_EPOCH);
     let start_unix_time = SECONDS_PER_EPOCH; // started 1 epoch after genesis
 
-    let service = mock_service(genesis_time, start_unix_time, one_epoch_ago);
+    let clock = MonotonicEpochClock::with_start_time(genesis_time, one_epoch_ago, start_unix_time);
 
     // elapsed ≈ 384s, start_unix = 384, genesis = 0
     // now_unix ≈ 384 + 384 = 768, epoch ≈ 768 / 384 = 2
-    let epoch = service.current_epoch();
+    let epoch = clock.current_epoch();
     assert!(epoch >= 2, "with ~1 epoch elapsed the computed epoch should be ≥ 2, got {epoch}");
 }

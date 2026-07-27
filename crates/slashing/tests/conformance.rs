@@ -2,14 +2,57 @@
 //!
 //! Integrates all 38 test cases from the official
 //! `eth-clients/slashing-protection-interchange-tests` repository.
-//! Tests "complete", "minimal conservative" (HashMap-based), and
-//! "real watermarks" (SlashingDb watermark API) import strategies.
-
-use std::collections::HashMap;
+//!
+//! # Runner → strategy mapping
+//!
+//! - **`complete`** — full-history EIP-3076 strategy. Interchange history is loaded
+//!   via `record_block` / `record_attestation` (no watermarks) so verdicts certify
+//!   **history-only** complete-strategy decisions. Validation (version / GVR) mirrors
+//!   production [`SlashingDb::import`]. Every block/attestation verdict comes from the
+//!   production `stage_* → commit()/discard()` path.
+//! - **`minimal_conservative`** — watermark (minified) EIP-3076 strategy. Interchange
+//!   maxima are projected onto the real `set_block_watermark` /
+//!   `set_attestation_watermark` API (harness-side projection; production
+//!   [`SlashingDb::import`] now does the same raise-only projection). Every verdict
+//!   comes from the same production `stage_* → commit()/discard()` path. After a
+//!   successful stage commit the harness raises the corresponding watermark so later
+//!   steps see the post-sign high-water mark (production signing does not auto-raise
+//!   watermarks after each sign — that remains history-table driven on the complete
+//!   path).
+//!
+//! Both runners therefore certify the **production decision path**. They still diverge
+//! on strategy-sensitive fixtures (`*_iff_minified`, `*_fail_iff_imported`, resign /
+//! gap cases, etc.) because the *import* side differs (full history vs watermark
+//! maxima). Production `import` is hybrid (history + watermark floor); the complete
+//! runner loads history without watermarks to isolate pure complete-strategy
+//! semantics (RF2-12-M1: no public `clear_watermarks` wipe API).
+//!
+//! # B5 / RF2-12
+//!
+//! Production [`SlashingDb::import`] raises watermarks from interchange maxima
+//! (raise-only, same transaction as row inserts). Covered by unit tests. The minimal
+//! harness still projects maxima explicitly so it does not depend on history rows.
 
 use serde::Deserialize;
 
-use rvc_slashing::{InterchangeFormat, SlashingDb};
+use rvc_slashing::{InterchangeFormat, SlashingDb, SlashingError};
+
+mod common;
+use common::{stage_and_commit_attestation, stage_and_commit_block};
+
+/// Zero GVR used by signing-path checks in the complete runner (matches the
+/// historical `check_and_record_*` harness; import pins the test-case GVR).
+const SIGN_GVR: &[u8; 32] = &[0u8; 32];
+
+// ---------------------------------------------------------------------------
+// Stage-path harness helpers (RF1-03)
+// ---------------------------------------------------------------------------
+
+/// Stage a block via the production path and commit on success.
+///
+/// On rejection, `stage_block` rolls back before returning `Err` (no guard is
+/// handed out). On accept, the guard is committed so the row is durable for
+/// subsequent checks in the same runner.
 
 // ---------------------------------------------------------------------------
 // Test fixture types
@@ -63,15 +106,78 @@ fn load_test_case(name: &str) -> TestCase {
 }
 
 // ---------------------------------------------------------------------------
-// Complete strategy runner
+// Complete strategy runner (production stage_* → commit/discard path)
 // ---------------------------------------------------------------------------
+
+/// Load interchange into history tables **without** raising watermarks.
+///
+/// Mirrors production [`SlashingDb::import`] validation (version + GVR + parse)
+/// and idempotent history inserts, but deliberately skips the RF2-12 watermark
+/// raise so this runner certifies pure complete / history-table strategy.
+/// Production hybrid import (history + watermark floor) is covered by unit tests.
+///
+/// RF2-12-M1: avoids any public wipe API — `clear_watermarks` is `#[cfg(test)]`
+/// `pub(crate)` only and is not reachable from this integration test.
+fn complete_import_history_only(
+    db: &SlashingDb,
+    interchange: &InterchangeFormat,
+    expected_gvr: &str,
+) -> Result<(), SlashingError> {
+    if interchange.metadata.interchange_format_version != "5" {
+        return Err(SlashingError::InvalidInterchangeFormat(format!(
+            "unsupported interchange_format_version: expected \"5\", got \"{}\"",
+            interchange.metadata.interchange_format_version
+        )));
+    }
+
+    if interchange.metadata.genesis_validators_root != expected_gvr {
+        return Err(SlashingError::GenesisValidatorsRootMismatch {
+            expected: expected_gvr.to_string(),
+            actual: interchange.metadata.genesis_validators_root.clone(),
+        });
+    }
+
+    for validator in &interchange.data {
+        for attestation in &validator.signed_attestations {
+            let source_epoch: u64 = attestation.source_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid source_epoch: {}",
+                    attestation.source_epoch
+                ))
+            })?;
+            let target_epoch: u64 = attestation.target_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid target_epoch: {}",
+                    attestation.target_epoch
+                ))
+            })?;
+            db.seed_attestation(
+                &validator.pubkey,
+                source_epoch,
+                target_epoch,
+                attestation.signing_root.clone(),
+                SIGN_GVR,
+            )?;
+        }
+
+        for block in &validator.signed_blocks {
+            let slot: u64 = block.slot.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
+            })?;
+            db.seed_block(&validator.pubkey, slot, block.signing_root.clone(), SIGN_GVR)?;
+        }
+    }
+
+    Ok(())
+}
 
 fn run_complete(test: &TestCase) {
     let db = SlashingDb::open_in_memory().expect("failed to open db");
     let gvr = &test.genesis_validators_root;
 
     for (step_idx, step) in test.steps.iter().enumerate() {
-        let import_result = db.import(&step.interchange, gvr);
+        // History-only load (no watermark floor) for pure complete-strategy isolation.
+        let import_result = complete_import_history_only(&db, &step.interchange, gvr);
 
         if !step.should_succeed {
             if !step.contains_slashable_data {
@@ -98,15 +204,15 @@ fn run_complete(test: &TestCase) {
             );
         }
 
-        // Run block checks
+        // Run block checks via production stage path
         for (i, block) in step.blocks.iter().enumerate() {
             let slot: u64 = block.slot.parse().unwrap();
-            let result = db.check_and_record_block(
-                "local-vc",
+            let result = stage_and_commit_block(
+                &db,
                 &block.pubkey,
                 slot,
                 block.signing_root.clone(),
-                &[0u8; 32],
+                SIGN_GVR,
             );
 
             if block.should_succeed_complete {
@@ -127,17 +233,17 @@ fn run_complete(test: &TestCase) {
             }
         }
 
-        // Run attestation checks
+        // Run attestation checks via production stage path
         for (i, att) in step.attestations.iter().enumerate() {
             let source: u64 = att.source_epoch.parse().unwrap();
             let target: u64 = att.target_epoch.parse().unwrap();
-            let result = db.check_and_record_attestation(
-                "local-vc",
+            let result = stage_and_commit_attestation(
+                &db,
                 &att.pubkey,
                 source,
                 target,
                 att.signing_root.clone(),
-                &[0u8; 32],
+                SIGN_GVR,
             );
 
             if att.should_succeed_complete {
@@ -161,19 +267,61 @@ fn run_complete(test: &TestCase) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal conservative strategy runner (HashMap-based watermarks)
+// Minimal / watermark strategy: project interchange maxima, decide via stage_*
 // ---------------------------------------------------------------------------
 
+/// Project interchange block/attestation maxima onto real watermark storage.
+///
+/// Harness-only until Phase 2 B5 moves this into production import.
+fn project_interchange_maxima_to_watermarks(db: &SlashingDb, interchange: &InterchangeFormat) {
+    for validator in &interchange.data {
+        let max_slot = validator.signed_blocks.iter().map(|b| b.slot.parse::<u64>().unwrap()).max();
+        if let Some(slot) = max_slot {
+            let current = db.get_block_watermark(&validator.pubkey).unwrap().unwrap_or(0);
+            db.set_block_watermark(&validator.pubkey, slot.max(current)).unwrap();
+        }
+
+        let max_source = validator
+            .signed_attestations
+            .iter()
+            .map(|a| a.source_epoch.parse::<u64>().unwrap())
+            .max();
+        let max_target = validator
+            .signed_attestations
+            .iter()
+            .map(|a| a.target_epoch.parse::<u64>().unwrap())
+            .max();
+        if let (Some(source), Some(target)) = (max_source, max_target) {
+            let (cur_source, cur_target) =
+                db.get_attestation_watermark(&validator.pubkey).unwrap().unwrap_or((0, 0));
+            db.set_attestation_watermark(
+                &validator.pubkey,
+                source.max(cur_source),
+                target.max(cur_target),
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// Raise block watermark after a successful stage commit (min strategy high-water).
+fn raise_block_watermark_after_sign(db: &SlashingDb, pubkey: &str, slot: u64) {
+    let current = db.get_block_watermark(pubkey).unwrap().unwrap_or(0);
+    db.set_block_watermark(pubkey, slot.max(current)).unwrap();
+}
+
+/// Raise attestation watermarks after a successful stage commit.
+fn raise_attestation_watermark_after_sign(db: &SlashingDb, pubkey: &str, source: u64, target: u64) {
+    let (cur_source, cur_target) = db.get_attestation_watermark(pubkey).unwrap().unwrap_or((0, 0));
+    db.set_attestation_watermark(pubkey, source.max(cur_source), target.max(cur_target)).unwrap();
+}
+
 fn run_minimal_conservative(test: &TestCase) {
+    let db = SlashingDb::open_in_memory().expect("failed to open db");
     let gvr = &test.genesis_validators_root;
 
-    // Track per-validator watermarks
-    let mut block_wm: HashMap<String, u64> = HashMap::new();
-    let mut att_source_wm: HashMap<String, u64> = HashMap::new();
-    let mut att_target_wm: HashMap<String, u64> = HashMap::new();
-
     for (step_idx, step) in test.steps.iter().enumerate() {
-        // GVR mismatch check
+        // GVR mismatch: min strategy does not call import; reject at the harness.
         if step.interchange.metadata.genesis_validators_root != *gvr {
             assert!(
                 !step.should_succeed,
@@ -183,80 +331,55 @@ fn run_minimal_conservative(test: &TestCase) {
             continue;
         }
 
-        // Minimal import: update watermarks from interchange data
-        for validator in &step.interchange.data {
-            for block in &validator.signed_blocks {
-                let slot: u64 = block.slot.parse().unwrap();
-                let entry = block_wm.entry(validator.pubkey.clone()).or_insert(0);
-                if slot > *entry {
-                    *entry = slot;
-                }
-            }
-            for att in &validator.signed_attestations {
-                let source: u64 = att.source_epoch.parse().unwrap();
-                let target: u64 = att.target_epoch.parse().unwrap();
-                let se = att_source_wm.entry(validator.pubkey.clone()).or_insert(0);
-                if source > *se {
-                    *se = source;
-                }
-                let te = att_target_wm.entry(validator.pubkey.clone()).or_insert(0);
-                if target > *te {
-                    *te = target;
-                }
-            }
-        }
+        // Min import: project interchange maxima onto real watermarks (B5 handoff).
+        project_interchange_maxima_to_watermarks(&db, &step.interchange);
 
-        // Run block checks using watermark logic
+        // Block checks via production stage path (verdict only — no inline wm compares).
         for (i, block) in step.blocks.iter().enumerate() {
             let slot: u64 = block.slot.parse().unwrap();
-            let success = match block_wm.get(&block.pubkey) {
-                Some(&max_slot) => slot > max_slot,
-                None => true, // No previous blocks, any slot is fine
-            };
+            let result = stage_and_commit_block(
+                &db,
+                &block.pubkey,
+                slot,
+                block.signing_root.clone(),
+                SIGN_GVR,
+            );
 
-            if success {
-                // Record successful signing → update watermark
-                let entry = block_wm.entry(block.pubkey.clone()).or_insert(0);
-                if slot > *entry {
-                    *entry = slot;
-                }
+            if result.is_ok() {
+                raise_block_watermark_after_sign(&db, &block.pubkey, slot);
             }
 
+            let success = result.is_ok();
             assert_eq!(
                 success, block.should_succeed,
                 "[minimal] {}: step {step_idx}, block {i} (slot={slot}): \
-                 expected should_succeed={}, got {success}",
+                 expected should_succeed={}, got {success} ({result:?})",
                 test.name, block.should_succeed
             );
         }
 
-        // Run attestation checks using watermark logic
+        // Attestation checks via production stage path.
         for (i, att) in step.attestations.iter().enumerate() {
             let source: u64 = att.source_epoch.parse().unwrap();
             let target: u64 = att.target_epoch.parse().unwrap();
+            let result = stage_and_commit_attestation(
+                &db,
+                &att.pubkey,
+                source,
+                target,
+                att.signing_root.clone(),
+                SIGN_GVR,
+            );
 
-            let success = match (att_source_wm.get(&att.pubkey), att_target_wm.get(&att.pubkey)) {
-                (Some(&max_source), Some(&max_target)) => {
-                    source >= max_source && target > max_target
-                }
-                _ => true, // No previous attestations
-            };
-
-            if success {
-                let se = att_source_wm.entry(att.pubkey.clone()).or_insert(0);
-                if source > *se {
-                    *se = source;
-                }
-                let te = att_target_wm.entry(att.pubkey.clone()).or_insert(0);
-                if target > *te {
-                    *te = target;
-                }
+            if result.is_ok() {
+                raise_attestation_watermark_after_sign(&db, &att.pubkey, source, target);
             }
 
+            let success = result.is_ok();
             assert_eq!(
                 success, att.should_succeed,
                 "[minimal] {}: step {step_idx}, attestation {i} \
-                 (src={source}, tgt={target}): expected should_succeed={}, got {success}",
+                 (src={source}, tgt={target}): expected should_succeed={}, got {success} ({result:?})",
                 test.name, att.should_succeed
             );
         }
@@ -264,111 +387,7 @@ fn run_minimal_conservative(test: &TestCase) {
 }
 
 // ---------------------------------------------------------------------------
-// Real watermarks strategy runner (SlashingDb watermark API)
-// ---------------------------------------------------------------------------
-
-fn run_with_real_watermarks(test: &TestCase) {
-    let db = SlashingDb::open_in_memory().expect("failed to open db");
-    let gvr = &test.genesis_validators_root;
-
-    for (step_idx, step) in test.steps.iter().enumerate() {
-        // GVR mismatch check
-        if step.interchange.metadata.genesis_validators_root != *gvr {
-            assert!(
-                !step.should_succeed,
-                "[real_wm] {}: step {step_idx}: GVR mismatch but should_succeed is true",
-                test.name
-            );
-            continue;
-        }
-
-        // Import: update watermarks from interchange data using real SlashingDb API
-        for validator in &step.interchange.data {
-            let max_slot =
-                validator.signed_blocks.iter().map(|b| b.slot.parse::<u64>().unwrap()).max();
-            if let Some(slot) = max_slot {
-                let current = db.get_block_watermark(&validator.pubkey).unwrap().unwrap_or(0);
-                db.set_block_watermark(&validator.pubkey, slot.max(current)).unwrap();
-            }
-
-            let max_source = validator
-                .signed_attestations
-                .iter()
-                .map(|a| a.source_epoch.parse::<u64>().unwrap())
-                .max();
-            let max_target = validator
-                .signed_attestations
-                .iter()
-                .map(|a| a.target_epoch.parse::<u64>().unwrap())
-                .max();
-            if let (Some(source), Some(target)) = (max_source, max_target) {
-                let (cur_source, cur_target) =
-                    db.get_attestation_watermark(&validator.pubkey).unwrap().unwrap_or((0, 0));
-                db.set_attestation_watermark(
-                    &validator.pubkey,
-                    source.max(cur_source),
-                    target.max(cur_target),
-                )
-                .unwrap();
-            }
-        }
-
-        // Block checks using real SlashingDb watermark API
-        for (i, block) in step.blocks.iter().enumerate() {
-            let slot: u64 = block.slot.parse().unwrap();
-            let watermark = db.get_block_watermark(&block.pubkey).unwrap();
-            let success = match watermark {
-                Some(wm) => slot > wm,
-                None => true,
-            };
-
-            if success {
-                let current = db.get_block_watermark(&block.pubkey).unwrap().unwrap_or(0);
-                db.set_block_watermark(&block.pubkey, slot.max(current)).unwrap();
-            }
-
-            assert_eq!(
-                success, block.should_succeed,
-                "[real_wm] {}: step {step_idx}, block {i} (slot={slot}): \
-                 expected should_succeed={}, got {success}",
-                test.name, block.should_succeed
-            );
-        }
-
-        // Attestation checks using real SlashingDb watermark API
-        for (i, att) in step.attestations.iter().enumerate() {
-            let source: u64 = att.source_epoch.parse().unwrap();
-            let target: u64 = att.target_epoch.parse().unwrap();
-
-            let watermark = db.get_attestation_watermark(&att.pubkey).unwrap();
-            let success = match watermark {
-                Some((wm_source, wm_target)) => source >= wm_source && target > wm_target,
-                None => true,
-            };
-
-            if success {
-                let (cur_source, cur_target) =
-                    db.get_attestation_watermark(&att.pubkey).unwrap().unwrap_or((0, 0));
-                db.set_attestation_watermark(
-                    &att.pubkey,
-                    source.max(cur_source),
-                    target.max(cur_target),
-                )
-                .unwrap();
-            }
-
-            assert_eq!(
-                success, att.should_succeed,
-                "[real_wm] {}: step {step_idx}, attestation {i} \
-                 (src={source}, tgt={target}): expected should_succeed={}, got {success}",
-                test.name, att.should_succeed
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Macro to generate test functions for all 38 test cases
+// Macro to generate test functions for all 38 test cases × 2 runners
 // ---------------------------------------------------------------------------
 
 macro_rules! conformance_test {
@@ -386,12 +405,6 @@ macro_rules! conformance_test {
             fn minimal_conservative() {
                 let test = load_test_case(stringify!($name));
                 run_minimal_conservative(&test);
-            }
-
-            #[test]
-            fn real_watermarks() {
-                let test = load_test_case(stringify!($name));
-                run_with_real_watermarks(&test);
             }
         }
     };
@@ -458,3 +471,33 @@ conformance_test!(single_validator_two_blocks_no_signing_root);
 
 // Wrong genesis validators root (1)
 conformance_test!(wrong_genesis_validators_root);
+
+// ---------------------------------------------------------------------------
+// check_and_record_* smoke (Phase 2 B4 handoff)
+// ---------------------------------------------------------------------------
+//
+// RF1-03 retargeted the complete conformance runner at stage_* → commit/discard.
+// This single smoke test keeps the legacy check_and_record_* API exercised so
+// Phase 2 issue B4 (decide fate of check_and_record_*) has an explicit target
+// to delete or repoint rather than discovering silent coverage loss.
+//
+// Do not expand this into a second conformance suite.
+
+/// Thin residual coverage for `check_and_record_*` until Phase 2 B4.
+#[test]
+fn check_and_record_smoke_for_phase2_b4() {
+    let db = SlashingDb::open_in_memory().expect("open db");
+    let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // Accept a block, then reject a conflicting double proposal at the same slot.
+    db.check_and_record_block(pubkey, 100, Some("0xroot_a".into()), SIGN_GVR)
+        .expect("first block must succeed");
+    let blocked = db.check_and_record_block(pubkey, 100, Some("0xroot_b".into()), SIGN_GVR);
+    assert!(blocked.is_err(), "conflicting block at same slot must be rejected");
+
+    // Accept an attestation, then reject a double vote at the same target.
+    db.check_and_record_attestation(pubkey, 1, 2, Some("0xatt_a".into()), SIGN_GVR)
+        .expect("first attestation must succeed");
+    let blocked = db.check_and_record_attestation(pubkey, 1, 2, Some("0xatt_b".into()), SIGN_GVR);
+    assert!(blocked.is_err(), "double vote at same target must be rejected");
+}

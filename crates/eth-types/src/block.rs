@@ -1,42 +1,19 @@
 use serde::{Deserialize, Serialize};
-use tree_hash::{mix_in_length, Hash256, MerkleHasher, TreeHash, TreeHashType};
+use tree_hash::{mix_in_length, MerkleHasher, TreeHash};
 
+use crate::block_body::{
+    blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
+    body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
+    decode_beacon_block_body_electra, BodySszError,
+};
 use crate::hex_fixed::bytes_32_hex;
-use crate::tree_hash_utils::vec_u8_tree_hash_root;
+use crate::tree_hash_utils::{impl_container_tree_hash, TreeHashError};
 use crate::{Root, Signature, Slot};
-
-/// Fixed-portion length of a Deneb/Electra `BeaconBlockBody` SSZ encoding.
-///
-/// Layout (cumulative bytes):
-/// - `randao_reveal`: 96 bytes (fixed)
-/// - `eth1_data`: 72 bytes (fixed)
-/// - `graffiti`: 32 bytes (fixed)
-/// - 5 variable-field offsets × 4 bytes: 20 bytes
-/// - `sync_aggregate`: 160 bytes (fixed)
-/// - 3 variable-field offsets × 4 bytes: 12 bytes  (execution_payload,
-///   bls_to_execution_changes, blob_kzg_commitments)
-/// - **Total**: 392 bytes
-const DENEB_BODY_FIXED_LEN: usize = 392;
-
-/// Byte offset within the body fixed portion where the `blob_kzg_commitments`
-/// variable-field offset is stored (bytes 388–391, u32 LE).
-const KZG_COMMIT_OFFSET_POS: usize = 388;
-
-/// Size of a single KZG commitment: BLS12-381 G1 compressed point (48 bytes).
-const KZG_COMMITMENT_BYTES: usize = 48;
-
-/// Spec cap on `blob_kzg_commitments` per block (Deneb `MAX_BLOB_COMMITMENTS_PER_BLOCK`).
-///
-/// Used as a defense-in-depth bound on the parser: a malicious or buggy BN
-/// returning more entries than the spec allows is rejected.
-const MAX_BLOB_COMMITMENTS_PER_BLOCK: usize = 4096;
 
 /// Fork variants relevant to `BeaconBlockBody` SSZ layout for KZG extraction.
 ///
 /// Deneb has `blob_kzg_commitments` as the *last* variable field (field 12).
-/// Electra adds `execution_requests` as field 13 *after* `blob_kzg_commitments`,
-/// so the commitment region is bounded by the next variable-field offset
-/// rather than `body.len()`.
+/// Electra adds `execution_requests` as field 13 *after* `blob_kzg_commitments`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyForkLayout {
     /// Deneb `BeaconBlockBody`: `blob_kzg_commitments` is the trailing variable field.
@@ -49,87 +26,43 @@ pub enum BodyForkLayout {
 ///
 /// Returns `Some(Deneb)` for `"deneb"`, `Some(Electra)` for `"electra"` /
 /// `"fulu"`. Pre-Deneb forks have no blob commitments and return `None`.
+///
+/// Exact, case-sensitive match via [`ForkName::from_str`] + [`ForkName::body_layout`].
+/// Unrecognised strings (including wrong case) yield `None`.
 pub fn body_fork_layout(consensus_version: &str) -> Option<BodyForkLayout> {
-    match consensus_version {
-        "deneb" => Some(BodyForkLayout::Deneb),
-        "electra" | "fulu" => Some(BodyForkLayout::Electra),
-        _ => None,
-    }
+    use std::str::FromStr;
+
+    use crate::fork::ForkName;
+
+    ForkName::from_str(consensus_version).ok().and_then(ForkName::body_layout)
 }
 
 /// Extract blob KZG commitments from a raw SSZ-encoded `BeaconBlockBody`.
 ///
-/// Returns the parsed list on success; returns an empty vector when the body
-/// is malformed (shorter than the 392-byte fixed portion, out-of-range
-/// offset, alignment mismatch, or count exceeding [`MAX_BLOB_COMMITMENTS_PER_BLOCK`]).
-///
-/// `layout` selects the bound for the commitment region:
-/// - [`BodyForkLayout::Deneb`]: region runs from the offset to `body.len()`.
-/// - [`BodyForkLayout::Electra`]: region runs from the offset to the
-///   *next* variable-field offset (`execution_requests`), which is stored at
-///   bytes 392–395 of the body fixed portion. Without this bound, the
-///   parser would absorb `execution_requests` bytes as fake commitments
-///   when the request region happens to be 48-byte-aligned (or empty).
+/// Dispatches on `layout` to the typed Deneb/Electra body decoder and returns
+/// `body.blob_kzg_commitments`. A **genuinely empty** commitment list is
+/// `Ok(vec![])`; a **malformed** body is `Err(BodySszError)` — the two must not
+/// be conflated (a corrupt body must not fingerprint as the empty list).
 ///
 /// # Spec reference
 ///
-/// Deneb `BeaconBlockBody` (EIP-4844): `blob_kzg_commitments` is field 12 of
-/// the Container, with its SSZ offset recorded at bytes 388–391 of the fixed
-/// portion. Each `KZGCommitment` is a `Bytes48` (48-byte BLS12-381 G1 point).
-/// Electra `BeaconBlockBody` (EIP-7685): `execution_requests` is field 13;
-/// its offset is recorded at bytes 392–395 of the fixed portion (the
-/// fixed-portion length grows from 392 to 396 in Electra).
-pub(crate) fn extract_blob_kzg_commitments(body: &[u8], layout: BodyForkLayout) -> Vec<[u8; 48]> {
-    let fixed_len = match layout {
-        BodyForkLayout::Deneb => DENEB_BODY_FIXED_LEN,
-        BodyForkLayout::Electra => DENEB_BODY_FIXED_LEN + 4,
-    };
-    if body.len() < fixed_len {
-        return vec![];
-    }
-
-    let kzg_start = u32::from_le_bytes(
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .try_into()
-            .expect("slice is exactly 4 bytes"),
-    ) as usize;
-
-    let kzg_end = match layout {
-        BodyForkLayout::Deneb => body.len(),
-        BodyForkLayout::Electra => {
-            // Read the next variable-field offset (bytes 392–395 = execution_requests).
-            let next_offset = u32::from_le_bytes(
-                body[DENEB_BODY_FIXED_LEN..DENEB_BODY_FIXED_LEN + 4]
-                    .try_into()
-                    .expect("slice is exactly 4 bytes"),
-            ) as usize;
-            // The next offset must follow `kzg_start` and stay within the body.
-            if next_offset < kzg_start || next_offset > body.len() {
-                return vec![];
-            }
-            next_offset
+/// Deneb `BeaconBlockBody` (EIP-4844): `blob_kzg_commitments` is field 12.
+/// Electra `BeaconBlockBody` (EIP-7685): `execution_requests` is field 13 after
+/// the commitments; the typed decoder bounds the commitment list correctly.
+pub(crate) fn extract_blob_kzg_commitments(
+    body: &[u8],
+    layout: BodyForkLayout,
+) -> Result<Vec<[u8; 48]>, BodySszError> {
+    match layout {
+        BodyForkLayout::Deneb => {
+            let decoded = decode_beacon_block_body_deneb(body)?;
+            Ok(decoded.blob_kzg_commitments.into())
         }
-    };
-
-    // The kzg offset must point into the variable region and below kzg_end.
-    if kzg_start < fixed_len || kzg_start > kzg_end {
-        return vec![];
+        BodyForkLayout::Electra => {
+            let decoded = decode_beacon_block_body_electra(body)?;
+            Ok(decoded.blob_kzg_commitments.into())
+        }
     }
-
-    let kzg_bytes = &body[kzg_start..kzg_end];
-    if !kzg_bytes.len().is_multiple_of(KZG_COMMITMENT_BYTES) {
-        return vec![];
-    }
-
-    let count = kzg_bytes.len() / KZG_COMMITMENT_BYTES;
-    if count > MAX_BLOB_COMMITMENTS_PER_BLOCK {
-        return vec![];
-    }
-
-    kzg_bytes
-        .chunks_exact(KZG_COMMITMENT_BYTES)
-        .map(|chunk| chunk.try_into().expect("chunk is exactly 48 bytes"))
-        .collect()
 }
 
 /// Compute an internal KZG-commitment binding fingerprint.
@@ -316,18 +249,21 @@ impl BlockContents {
 
     /// Extract blob KZG commitments from the `BeaconBlockBody` SSZ bytes.
     ///
-    /// Returns an empty vector for the `Block` variant (pre-Deneb blocks carry
-    /// no blob commitments) and for bodies shorter than the 392-byte Deneb
-    /// fixed portion.
+    /// Returns `Ok(vec![])` for the `Block` variant (no blob commitments on that
+    /// wire shape). For `BlockAndBlobs`, decodes the body with the typed layout
+    /// decoder: empty commitments are `Ok(vec![])`, malformed SSZ is `Err`.
     ///
     /// This is the ISSUE-4.3 (L-3) defense-in-depth accessor: blob commitments
     /// are already opaquely bound via the block body tree hash; exposing them
     /// canonically allows callers to verify counts and compute a structured root
     /// before signing without changing the BN-facing signing scope.
-    pub fn blob_kzg_commitments(&self, layout: BodyForkLayout) -> Vec<[u8; 48]> {
+    pub fn blob_kzg_commitments(
+        &self,
+        layout: BodyForkLayout,
+    ) -> Result<Vec<[u8; 48]>, BodySszError> {
         match self {
             Self::BlockAndBlobs { block, .. } => extract_blob_kzg_commitments(&block.body, layout),
-            Self::Block(_) => vec![],
+            Self::Block(_) => Ok(vec![]),
         }
     }
 
@@ -338,12 +274,67 @@ impl BlockContents {
     /// `Block` or for `BlockAndBlobs` with no blobs. **NOT spec-aligned**; see
     /// [`kzg_commitment_list_root`] for the threat model and design rationale.
     ///
-    /// `layout` selects the body SSZ schema (Deneb vs. Electra+).
+    /// `layout` selects the body SSZ schema (Deneb vs. Electra+). Propagates
+    /// body-decode errors — a corrupt body is never fingerprinted as empty.
     ///
     /// This root is **separate from and does not change the block signing scope**.
     /// It is logged by the block service as a structured commitment binding.
-    pub fn kzg_commitment_root(&self, layout: BodyForkLayout) -> [u8; 32] {
-        kzg_commitment_list_root(&self.blob_kzg_commitments(layout))
+    pub fn kzg_commitment_root(&self, layout: BodyForkLayout) -> Result<[u8; 32], BodySszError> {
+        Ok(kzg_commitment_list_root(&self.blob_kzg_commitments(layout)?))
+    }
+}
+
+/// Electra `BeaconBlock` for the SEC-6c external block-level vector.
+///
+/// Header: slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`;
+/// body = [`crate::block_body::external_vector_electra_body`].
+///
+/// Gated behind `test-fixtures` (or crate-local `cfg(test)`); see RF3-19.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn external_vector_electra_block() -> BeaconBlock {
+    BeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_electra_body().as_ssz_bytes(),
+    }
+}
+
+/// Electra blinded block for the SEC-6d external vector (distinct blinded
+/// graffiti; same header fields as the full Electra block vector).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn external_vector_electra_blinded_block() -> BlindedBeaconBlock {
+    BlindedBeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_blinded_electra_body().as_ssz_bytes(),
+    }
+}
+
+/// Deneb `BeaconBlock` for the SEC-6d external block-level vector.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn external_vector_deneb_block() -> BeaconBlock {
+    BeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_deneb_body().as_ssz_bytes(),
+    }
+}
+
+/// Deneb blinded block for the SEC-6d external vector.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn external_vector_deneb_blinded_block() -> BlindedBeaconBlock {
+    BlindedBeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_blinded_deneb_body().as_ssz_bytes(),
     }
 }
 
@@ -354,71 +345,72 @@ impl BeaconBlock {
     /// path where a bare `BeaconBlock` is available instead of `BlockContents`.
     /// **NOT spec-aligned**; see [`kzg_commitment_list_root`] doc.
     ///
-    /// `layout` selects the body SSZ schema (Deneb vs. Electra+).
-    pub fn kzg_commitment_root(&self, layout: BodyForkLayout) -> [u8; 32] {
-        kzg_commitment_list_root(&extract_blob_kzg_commitments(&self.body, layout))
+    /// `layout` selects the body SSZ schema (Deneb vs. Electra+). Propagates
+    /// body-decode errors — a corrupt body is never fingerprinted as empty.
+    pub fn kzg_commitment_root(&self, layout: BodyForkLayout) -> Result<[u8; 32], BodySszError> {
+        Ok(kzg_commitment_list_root(&extract_blob_kzg_commitments(&self.body, layout)?))
     }
 
     /// Return the number of blob KZG commitments in this block's body SSZ.
     ///
-    /// Returns 0 for pre-Deneb blocks (body shorter than the 392-byte fixed
-    /// portion) or when the commitment region is malformed.
-    pub fn blob_kzg_count(&self, layout: BodyForkLayout) -> usize {
-        extract_blob_kzg_commitments(&self.body, layout).len()
+    /// Propagates typed body-decode errors; does not treat malformed SSZ as
+    /// zero commitments.
+    pub fn blob_kzg_count(&self, layout: BodyForkLayout) -> Result<usize, BodySszError> {
+        Ok(extract_blob_kzg_commitments(&self.body, layout)?.len())
     }
 }
 
-impl TreeHash for BeaconBlock {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
+// Leaf order: slot, proposer_index, parent_root, state_root, body_root
+// (body_root is the typed body HTR over raw SSZ bytes — not a ByteList leaf).
+impl_container_tree_hash!(
+    BeaconBlock,
+    "valid Electra/Deneb BeaconBlockBody SSZ for tree_hash_root",
+    body_auto = |s| {
+        body_tree_hash_root(&s.body)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })
+    },
+    body_layout = |s, layout| {
+        body_tree_hash_root_for_layout(&s.body, layout)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })
+    },
+    [
+        |s| Ok(s.slot.tree_hash_root()),
+        |s| Ok(s.proposer_index.tree_hash_root()),
+        |s| Ok(s.parent_root.tree_hash_root()),
+        |s| Ok(s.state_root.tree_hash_root()),
+    ]
+);
 
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(5);
-        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.body).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
-
-impl TreeHash for BlindedBeaconBlock {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(5);
-        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.body).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
+// Leaf order: slot, proposer_index, parent_root, state_root, body_root
+// (body_root is the typed blinded body HTR over raw SSZ bytes).
+impl_container_tree_hash!(
+    BlindedBeaconBlock,
+    "valid Electra/Deneb BlindedBeaconBlockBody SSZ for tree_hash_root",
+    body_auto = |s| {
+        blinded_body_tree_hash_root(&s.body)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })
+    },
+    body_layout = |s, layout| {
+        blinded_body_tree_hash_root_for_layout(&s.body, layout)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })
+    },
+    [
+        |s| Ok(s.slot.tree_hash_root()),
+        |s| Ok(s.proposer_index.tree_hash_root()),
+        |s| Ok(s.parent_root.tree_hash_root()),
+        |s| Ok(s.state_root.tree_hash_root()),
+    ]
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_body::{
+        external_vector_blinded_electra_body, external_vector_deneb_body,
+        external_vector_electra_body, EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX,
+        EXTERNAL_DENEB_BLOCK_ROOT_HEX, EXTERNAL_DENEB_BODY_ROOT_HEX,
+        EXTERNAL_ELECTRA_BLOCK_ROOT_HEX, EXTERNAL_ELECTRA_BODY_ROOT_HEX,
+    };
     use tree_hash::TreeHash;
 
     fn sample_block() -> BeaconBlock {
@@ -427,22 +419,56 @@ mod tests {
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
+            body: external_vector_electra_body().as_ssz_bytes(),
         }
     }
 
     fn sample_blinded_block() -> BlindedBeaconBlock {
+        // Distinct graffiti so body root differs from the full sample (empty-ops
+        // full vs blinded bodies otherwise share the same body HTR).
+        let mut body = external_vector_blinded_electra_body();
+        body.graffiti = [0xbe; 32];
         BlindedBeaconBlock {
             slot: 100,
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xbe, 0xef],
+            body: body.as_ssz_bytes(),
         }
     }
 
     fn sample_blob_sidecar() -> BlobSidecar {
         BlobSidecar { index: 0, blob: vec![0xab; 8] }
+    }
+
+    /// Pin `body_fork_layout` behaviour: exact, case-sensitive fork names only.
+    /// RF3-07 delegates onto `ForkName`; this table guards against accidental
+    /// leniency (lowercase, trimming) and against layout drift.
+    #[test]
+    fn test_body_fork_layout_unchanged_for_all_known_and_unknown_versions() {
+        let cases: &[(&str, Option<BodyForkLayout>)] = &[
+            ("phase0", None),
+            ("altair", None),
+            ("bellatrix", None),
+            ("capella", None),
+            ("deneb", Some(BodyForkLayout::Deneb)),
+            ("electra", Some(BodyForkLayout::Electra)),
+            ("fulu", Some(BodyForkLayout::Electra)),
+            // Exact-match only: trailing space / wrong case / empty / garbage → None
+            ("electra ", None),
+            ("Deneb", None),
+            ("ELECTRA", None),
+            ("", None),
+            ("not-a-fork", None),
+            ("deneb\n", None),
+        ];
+        for &(version, expected) in cases {
+            assert_eq!(
+                body_fork_layout(version),
+                expected,
+                "body_fork_layout({version:?}) mismatch"
+            );
+        }
     }
 
     #[test]
@@ -637,20 +663,136 @@ mod tests {
         assert_ne!(block.tree_hash_root(), blinded.tree_hash_root());
     }
 
-    // ── ISSUE-4.3 (L-3): extract_blob_kzg_commitments unit tests ────────────
+    // ── SEC-6c: typed body leaf + external-vector block root ─────────────────
 
-    /// Build a minimal body SSZ with `commitments` placed at the correct Deneb
-    /// fixed-portion offset (bytes 388–391 point to byte 392).
+    #[test]
+    fn test_beacon_block_body_leaf_is_typed_not_bytelist() {
+        // Old non-spec leaf was vec_u8_tree_hash_root(body_ssz). Spec leaf is
+        // hash_tree_root(typed body) == EXTERNAL_ELECTRA_BODY_ROOT.
+        let block = external_vector_electra_block();
+        let body_root = external_vector_electra_body().tree_hash_root();
+        assert_eq!(body_root.as_slice(), &hex::decode(EXTERNAL_ELECTRA_BODY_ROOT_HEX).unwrap()[..]);
+        // Reconstruct block root as independent 5-leaf container with body_root leaf.
+        let mut hasher = MerkleHasher::with_leaves(5);
+        hasher.write(block.slot.tree_hash_root().as_slice()).unwrap();
+        hasher.write(block.proposer_index.tree_hash_root().as_slice()).unwrap();
+        hasher.write(block.parent_root.tree_hash_root().as_slice()).unwrap();
+        hasher.write(block.state_root.tree_hash_root().as_slice()).unwrap();
+        hasher.write(body_root.as_slice()).unwrap();
+        let expected = hasher.finish().unwrap();
+        assert_eq!(block.tree_hash_root(), expected);
+        assert_eq!(
+            block.tree_hash_root().as_slice(),
+            &hex::decode(EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],
+            "block HTR must match external remerkleable KAT"
+        );
+    }
+
+    #[test]
+    fn test_beacon_block_tree_hash_matches_external_electra_vector() {
+        let block = external_vector_electra_block();
+        let root = block.try_tree_hash_root().expect("valid external vector body");
+        assert_eq!(
+            root.as_slice(),
+            &hex::decode(EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],
+            "BeaconBlock hash_tree_root must match remerkleable external vector"
+        );
+    }
+
+    #[test]
+    fn test_blinded_beacon_block_tree_hash_matches_external_electra_vector() {
+        // SEC-6d distinct-graffiti blinded Electra vector (not the full-body KAT).
+        let block = external_vector_electra_blinded_block();
+        let root = block.try_tree_hash_root().expect("valid external vector blinded body");
+        assert_eq!(
+            root.as_slice(),
+            &hex::decode(EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],
+            "BlindedBeaconBlock hash_tree_root must match remerkleable external vector"
+        );
+        assert_ne!(root.as_slice(), &hex::decode(EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],);
+    }
+
+    #[test]
+    fn test_beacon_block_tree_hash_matches_external_deneb_vector() {
+        let block = external_vector_deneb_block();
+        let root = block.try_tree_hash_root().expect("valid Deneb external vector body");
+        assert_eq!(
+            root.as_slice(),
+            &hex::decode(EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap()[..],
+            "Deneb BeaconBlock hash_tree_root must match remerkleable external vector"
+        );
+        // Explicit layout path matches auto-detect.
+        assert_eq!(block.try_tree_hash_root_for_layout(BodyForkLayout::Deneb).unwrap(), root);
+        // Body leaf is the typed Deneb body root.
+        assert_eq!(
+            external_vector_deneb_body().tree_hash_root().as_slice(),
+            &hex::decode(EXTERNAL_DENEB_BODY_ROOT_HEX).unwrap()[..],
+        );
+    }
+
+    #[test]
+    fn test_blinded_beacon_block_tree_hash_matches_external_deneb_vector() {
+        let block = external_vector_deneb_blinded_block();
+        let root = block.try_tree_hash_root().expect("valid Deneb blinded body");
+        // Empty-ops full/blinded Deneb share body HTR → same block root KAT.
+        assert_eq!(root.as_slice(), &hex::decode(EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap()[..],);
+        assert_eq!(block.try_tree_hash_root_for_layout(BodyForkLayout::Deneb).unwrap(), root);
+    }
+
+    #[test]
+    fn test_malformed_body_returns_error_not_panic() {
+        let block = BeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: vec![0xde, 0xad], // not valid Electra/Deneb body SSZ
+        };
+        let err = block.try_tree_hash_root().expect_err("malformed body must error");
+        assert!(
+            matches!(err, TreeHashError::InvalidBody { .. }),
+            "expected InvalidBody, got {err:?}"
+        );
+
+        let blinded = BlindedBeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: vec![0xbe, 0xef],
+        };
+        let err = blinded.try_tree_hash_root().expect_err("malformed blinded body must error");
+        assert!(matches!(err, TreeHashError::InvalidBody { .. }));
+    }
+
+    // ── ISSUE-4.3 (L-3): extract_blob_kzg_commitments unit tests ────────────
+    //
+    // Well-formed bodies use typed SSZ encode (external-vector fixtures + set
+    // blob_kzg_commitments). Malformed cases use truncated/corrupted bytes and
+    // must yield Err — never Ok(vec![]) (empty list is only for valid empty).
+
+    /// Spec cap `MAX_BLOB_COMMITMENTS_PER_BLOCK` (typed containers own the limit).
+    const MAX_BLOB_COMMITMENTS_PER_BLOCK: usize = 4096;
+
+    /// Valid Deneb body SSZ with the given `blob_kzg_commitments`.
     fn body_with_kzg_commitments(commitments: &[[u8; 48]]) -> Vec<u8> {
-        let mut body = vec![0u8; DENEB_BODY_FIXED_LEN];
-        // blob_kzg_commitments offset = start of variable data
-        let kzg_offset = DENEB_BODY_FIXED_LEN as u32;
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .copy_from_slice(&kzg_offset.to_le_bytes());
-        for c in commitments {
-            body.extend_from_slice(c.as_slice());
+        let mut body = crate::block_body::external_vector_deneb_body();
+        body.blob_kzg_commitments = commitments.to_vec().into();
+        body.as_ssz_bytes()
+    }
+
+    /// Valid Electra body SSZ with the given `blob_kzg_commitments`.
+    fn electra_body_with_kzg_commitments(commitments: &[[u8; 48]]) -> Vec<u8> {
+        let mut body = crate::block_body::external_vector_electra_body();
+        body.blob_kzg_commitments = commitments.to_vec().into();
+        body.as_ssz_bytes()
+    }
+
+    fn assert_body_ssz_err(result: Result<Vec<[u8; 48]>, BodySszError>) {
+        match result {
+            Err(BodySszError::InvalidEncoding(_)) => {}
+            other => panic!("expected BodySszError::InvalidEncoding, got {other:?}"),
         }
-        body
     }
 
     #[test]
@@ -658,122 +800,106 @@ mod tests {
         let c0 = [0x11; 48];
         let c1 = [0x22; 48];
         let body = body_with_kzg_commitments(&[c0, c1]);
-        let parsed = extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb);
+        let parsed = extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb).unwrap();
         assert_eq!(parsed, vec![c0, c1]);
     }
 
+    /// Genuinely empty commitment list on a well-formed body is Ok([]), not Err.
     #[test]
     fn test_extract_kzg_commitments_empty() {
         let body = body_with_kzg_commitments(&[]);
-        let parsed = extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb);
+        let parsed = extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb).unwrap();
         assert_eq!(parsed, Vec::<[u8; 48]>::new());
     }
 
+    /// Truncated body must be Err, not Ok([]) — empty list vs malformed distinction.
     #[test]
     fn test_extract_kzg_commitments_body_too_short() {
-        // Anything shorter than DENEB_BODY_FIXED_LEN must yield an empty vec.
-        let body = vec![0u8; DENEB_BODY_FIXED_LEN - 1];
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            Vec::<[u8; 48]>::new()
-        );
+        let body = vec![0u8; 100];
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Electra));
     }
 
+    /// Fixed-portion-only zeros (invalid offsets) must be Err, not Ok([]).
     #[test]
     fn test_extract_kzg_commitments_invalid_offset_zero() {
-        // Offset 0 points inside the fixed portion — must be rejected.
-        let mut body = vec![0u8; DENEB_BODY_FIXED_LEN + 48];
-        // leave bytes 388-391 as zero (offset = 0 < DENEB_BODY_FIXED_LEN)
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            Vec::<[u8; 48]>::new()
-        );
-        // Also test offset == DENEB_BODY_FIXED_LEN - 1 (one byte inside fixed)
-        let bad_offset = (DENEB_BODY_FIXED_LEN - 1) as u32;
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .copy_from_slice(&bad_offset.to_le_bytes());
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            Vec::<[u8; 48]>::new()
-        );
+        // 392 zero bytes: not a valid Deneb container (variable offsets are 0).
+        let body = vec![0u8; 392];
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
+
+        let mut longer = vec![0u8; 392 + 48];
+        // Offset pointing inside the fixed portion.
+        let bad_offset = 391u32;
+        longer[388..392].copy_from_slice(&bad_offset.to_le_bytes());
+        assert_body_ssz_err(extract_blob_kzg_commitments(&longer, BodyForkLayout::Deneb));
     }
 
+    /// Trailing bytes that break SSZ list alignment/length must be rejected.
     #[test]
     fn test_extract_kzg_commitments_misaligned_data_rejected() {
-        // Trailing bytes that are not divisible by 48 must be rejected.
         let mut body = body_with_kzg_commitments(&[[0xaa; 48]]);
-        body.push(0xff); // make length non-divisible by 48
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            Vec::<[u8; 48]>::new()
-        );
+        body.push(0xff); // corrupt trailing length of last variable field
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
     }
 
-    /// S-3: pin the boundary case `kzg_start == body.len()` — empty list is
-    /// returned without panic.  Guards against a future `>` → `>=` regression.
+    /// Well-formed body with empty KZG list: Ok([]) without panic.
     #[test]
     fn test_extract_kzg_commitments_offset_at_body_end() {
-        let mut body = vec![0u8; DENEB_BODY_FIXED_LEN];
-        let offset = DENEB_BODY_FIXED_LEN as u32;
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .copy_from_slice(&offset.to_le_bytes());
+        let body = body_with_kzg_commitments(&[]);
         assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
+            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb).unwrap(),
             Vec::<[u8; 48]>::new()
         );
     }
 
-    /// S-1: reject parses that would yield more than MAX_BLOB_COMMITMENTS_PER_BLOCK
-    /// entries.  Bounded by network size today, but the spec cap must hold.
+    /// Over `MAX_BLOB_COMMITMENTS_PER_BLOCK` entries: typed decode rejects.
     #[test]
     fn test_extract_kzg_commitments_over_max_rejected() {
-        let count = MAX_BLOB_COMMITMENTS_PER_BLOCK + 1;
-        let mut body = vec![0u8; DENEB_BODY_FIXED_LEN];
-        let offset = DENEB_BODY_FIXED_LEN as u32;
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .copy_from_slice(&offset.to_le_bytes());
-        body.extend(vec![0u8; count * KZG_COMMITMENT_BYTES]);
+        // Encode at the max, then append one extra commitment to the trailing list.
+        let max_list = vec![[0u8; 48]; MAX_BLOB_COMMITMENTS_PER_BLOCK];
+        let mut body = body_with_kzg_commitments(&max_list);
+        body.extend_from_slice(&[0u8; 48]);
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
+    }
+
+    /// Electra typed decoder returns only `blob_kzg_commitments` (not
+    /// `execution_requests`). Wrong layout (Deneb decoder on Electra SSZ) fails
+    /// closed rather than silently over-reading.
+    #[test]
+    fn test_extract_kzg_commitments_electra_bounds_at_next_offset() {
+        let real = [[0x11u8; 48], [0x22u8; 48]];
+        let body = electra_body_with_kzg_commitments(&real);
+
         assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            Vec::<[u8; 48]>::new()
+            extract_blob_kzg_commitments(&body, BodyForkLayout::Electra).unwrap(),
+            vec![[0x11u8; 48], [0x22u8; 48]],
+        );
+        // Deneb layout on an Electra body is a decode error (fail-closed).
+        assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
+    }
+
+    /// Round-trip: Electra encode → extract matches hand-set commitments.
+    #[test]
+    fn test_extract_kzg_commitments_electra_round_trip() {
+        let c0 = [0xab; 48];
+        let c1 = [0xcd; 48];
+        let body = electra_body_with_kzg_commitments(&[c0, c1]);
+        assert_eq!(
+            extract_blob_kzg_commitments(&body, BodyForkLayout::Electra).unwrap(),
+            vec![c0, c1]
         );
     }
 
-    /// W-2: Electra body layout has `execution_requests` as field 13 after
-    /// `blob_kzg_commitments` (field 12). The parser must bound the commitment
-    /// region using the next variable-field offset, not `body.len()`. Without
-    /// that bound, an Electra body with N real commitments + 48-aligned
-    /// execution_requests data would silently parse as N+1 commitments.
+    /// Empty list vs truncated body: Ok([]) vs Err (contract pin).
     #[test]
-    fn test_extract_kzg_commitments_electra_bounds_at_next_offset() {
-        const ELECTRA_FIXED_LEN: usize = 396;
-        let real = [[0x11u8; 48], [0x22u8; 48]];
-        let exec_padding = vec![0xffu8; 48]; // would alias as a 3rd commitment under Deneb layout
+    fn test_extract_empty_list_ok_truncated_err() {
+        let empty_ok =
+            extract_blob_kzg_commitments(&body_with_kzg_commitments(&[]), BodyForkLayout::Deneb)
+                .unwrap();
+        assert!(empty_ok.is_empty());
 
-        let mut body = vec![0u8; ELECTRA_FIXED_LEN];
-        // blob_kzg_commitments offset (bytes 388-391) -> start of variable region
-        let kzg_offset = ELECTRA_FIXED_LEN as u32;
-        body[KZG_COMMIT_OFFSET_POS..KZG_COMMIT_OFFSET_POS + 4]
-            .copy_from_slice(&kzg_offset.to_le_bytes());
-        // execution_requests offset (bytes 392-395) -> after the 2 commitments
-        let exec_offset = (ELECTRA_FIXED_LEN + real.len() * KZG_COMMITMENT_BYTES) as u32;
-        body[DENEB_BODY_FIXED_LEN..DENEB_BODY_FIXED_LEN + 4]
-            .copy_from_slice(&exec_offset.to_le_bytes());
-        for c in &real {
-            body.extend_from_slice(c);
-        }
-        body.extend_from_slice(&exec_padding);
-
-        // Deneb layout (wrong for Electra body) over-reads.
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb),
-            vec![[0x11u8; 48], [0x22u8; 48], [0xffu8; 48]],
-        );
-        // Electra layout bounds at the execution_requests offset.
-        assert_eq!(
-            extract_blob_kzg_commitments(&body, BodyForkLayout::Electra),
-            vec![[0x11u8; 48], [0x22u8; 48]],
-        );
+        let truncated_err = extract_blob_kzg_commitments(&[0u8; 50], BodyForkLayout::Deneb);
+        assert_body_ssz_err(truncated_err);
     }
 
     // ── ISSUE-4.3 (L-3): kzg_commitment_list_root unit tests ────────────────
@@ -821,7 +947,7 @@ mod tests {
             },
             blob_sidecars: vec![],
         };
-        assert_eq!(contents.blob_kzg_commitments(BodyForkLayout::Deneb), vec![c]);
+        assert_eq!(contents.blob_kzg_commitments(BodyForkLayout::Deneb).unwrap(), vec![c]);
     }
 
     #[test]
@@ -839,12 +965,12 @@ mod tests {
             blob_sidecars: vec![],
         };
 
-        let root_orig = make_block(body_orig).kzg_commitment_root(BodyForkLayout::Deneb);
+        let root_orig = make_block(body_orig).kzg_commitment_root(BodyForkLayout::Deneb).unwrap();
 
         let mut mutated = original;
         mutated[0] ^= 0x01;
         let body_mut = body_with_kzg_commitments(&[mutated]);
-        let root_mut = make_block(body_mut).kzg_commitment_root(BodyForkLayout::Deneb);
+        let root_mut = make_block(body_mut).kzg_commitment_root(BodyForkLayout::Deneb).unwrap();
 
         assert_ne!(root_orig, root_mut, "mutated commitment must change root");
     }
@@ -860,10 +986,26 @@ mod tests {
             body,
         });
         assert_eq!(
-            contents.blob_kzg_commitments(BodyForkLayout::Deneb),
+            contents.blob_kzg_commitments(BodyForkLayout::Deneb).unwrap(),
             Vec::<[u8; 48]>::new(),
             "Block variant must return empty commitments"
         );
+    }
+
+    #[test]
+    fn test_block_contents_malformed_body_kzg_root_errors() {
+        let contents = BlockContents::BlockAndBlobs {
+            block: BeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: [0; 32],
+                state_root: [0; 32],
+                body: vec![0u8; 50],
+            },
+            blob_sidecars: vec![],
+        };
+        assert!(contents.kzg_commitment_root(BodyForkLayout::Deneb).is_err());
+        assert!(contents.blob_kzg_commitments(BodyForkLayout::Deneb).is_err());
     }
 
     // ── FR-31 (Issue 1.4): BeaconBlockHeader SSZ + tree_hash_root KAT ────────

@@ -2,6 +2,7 @@ mod bls_to_execution;
 mod deposit;
 mod existing_mnemonic;
 mod exit;
+mod fs_util;
 mod network;
 mod new_mnemonic;
 mod password;
@@ -185,16 +186,19 @@ fn main() -> anyhow::Result<()> {
             backup_file,
         } => {
             let keystore_password = password::resolve_password(password_file.as_deref())?;
-            new_mnemonic::run(
-                &network,
-                &output_dir,
+            let args = new_mnemonic::GenerateArgs {
+                network,
+                output_dir,
                 num_validators,
                 start_index,
-                withdrawal_address.as_deref(),
-                &mnemonic_passphrase,
-                pbkdf2,
-                &keystore_password,
+                withdrawal_address,
+                kdf: new_mnemonic::kdf_from_pbkdf2_flag(pbkdf2),
                 dry_run,
+            };
+            new_mnemonic::run(
+                &args,
+                &mnemonic_passphrase,
+                &keystore_password,
                 backup_file.as_deref(),
             )
         }
@@ -210,17 +214,16 @@ fn main() -> anyhow::Result<()> {
             dry_run,
         } => {
             let keystore_password = password::resolve_password(password_file.as_deref())?;
-            existing_mnemonic::run(
-                &network,
-                &output_dir,
+            let args = new_mnemonic::GenerateArgs {
+                network,
+                output_dir,
                 num_validators,
                 start_index,
-                withdrawal_address.as_deref(),
-                &mnemonic_passphrase,
-                pbkdf2,
-                &keystore_password,
+                withdrawal_address,
+                kdf: new_mnemonic::kdf_from_pbkdf2_flag(pbkdf2),
                 dry_run,
-            )
+            };
+            existing_mnemonic::run(&args, &mnemonic_passphrase, &keystore_password)
         }
         Commands::BlsToExecution {
             network,

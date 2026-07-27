@@ -3,7 +3,7 @@
 //! Captures the structured field keys of a small, representative MULTI-CRATE hot-path event
 //! set and **fails the build** (a hard `assert!` surfaced under `cargo nextest run --workspace`)
 //! if any key on a COVERED event is not in the canonical registry
-//! (`crypto::logging::conformance`). Phase 4 (issue 4.13) wired this as an *advisory* report;
+//! (`observability::logging::conformance`). Phase 4 (issue 4.13) wired this as an *advisory* report;
 //! **Phase 5 / issue 5.2 escalates it to a blocking gate** — the curated covered set is now an
 //! enforced, auditable contract. The implicit `message` event field is excluded (it is the log
 //! message, not a structured key).
@@ -32,7 +32,7 @@
 //! `cache_type`. [`gate5_deferred_domain_keys_advisory_tail`] surfaces these via `eprintln!`
 //! (never `assert!`) so the backlog stays visible; their canonical registration /
 //! `ADVISORY_ALLOW` disposition is a separate later decision, out of scope for this severity
-//! flip. Do NOT add them to the blocking covered set or to `crypto::logging::fields`.
+//! flip. Do NOT add them to the blocking covered set or to `observability::logging::fields`.
 
 use std::sync::{Arc, Mutex};
 
@@ -95,7 +95,7 @@ struct CoveredEvent {
     /// Human label for the event (for the reviewer; not asserted on).
     event: &'static str,
     /// The canonical field keys the event emits — every one MUST be in
-    /// `crypto::logging::fields` (or an advisory-allowed key: `count` / `error` / `http.*`).
+    /// `observability::logging::fields` (or an advisory-allowed key: `count` / `error` / `http.*`).
     keys: &'static [&'static str],
 }
 
@@ -167,7 +167,7 @@ const COVERED_EVENTS: &[CoveredEvent] = &[
         event: "block proposed",
         keys: &["slot", "pubkey", "block_root"],
     },
-    // --- correlation kit (crypto::logging) — request_id / time_into_slot ---
+    // --- correlation kit (observability::logging) — request_id / time_into_slot ---
     CoveredEvent {
         crate_name: "correlation-kit",
         event: "signing request received",
@@ -199,7 +199,7 @@ const DEFERRED_DOMAIN_KEYS: &[&str] = &[
 ];
 
 /// Emits the curated PURELY-canonical multi-crate hot-path event set under `cap`. Every key here
-/// is either a canonical `crypto::logging::fields` const or an advisory-allowed key (`error`,
+/// is either a canonical `observability::logging::fields` const or an advisory-allowed key (`error`,
 /// `count`, `http.*`) — so a correct Phase-4 normalization makes `non_canonical_keys` empty over
 /// this set, and the BLOCKING gate passes. Read the captured keys back via `cap.flat()` (blocking
 /// diff) or `cap.per_event()` (table↔emission pin).
@@ -260,7 +260,7 @@ fn emit_canonical_hot_path_events(cap: &KeyCapture) {
         // --- block-service ---
         tracing::info!(slot = 1u64, pubkey = "0xtrunc", block_root = "0xtrunc", "block proposed");
 
-        // --- correlation kit (crypto::logging) — request_id / time_into_slot ---
+        // --- correlation kit (observability::logging) — request_id / time_into_slot ---
         tracing::info!(
             request_id = "00000000-0000-4000-8000-000000000000",
             "signing request received"
@@ -289,11 +289,11 @@ fn gate5_canonical_field_conformance_blocking() {
     assert!(observed.iter().any(|k| k == "slot"), "field capture failed (no `slot` seen)");
 
     let keys: Vec<&str> = observed.iter().map(String::as_str).collect();
-    let flagged = crypto::logging::conformance::non_canonical_keys(keys);
+    let flagged = observability::logging::conformance::non_canonical_keys(keys);
     assert!(
         flagged.is_empty(),
         "Gate 5 (BLOCKING): a covered hot-path event emitted non-canonical field keys: \
-         {flagged:?}. Either spell the field with its canonical `crypto::logging::fields` const \
+         {flagged:?}. Either spell the field with its canonical `observability::logging::fields` const \
          (no `rvc.` prefix, no synonyms), or — if it is a genuinely new field — register it in \
          the canonical registry + STANDARD.md §2 first."
     );
@@ -318,7 +318,7 @@ fn covered_event_table_matches_emission() {
     // the table cannot claim a non-canonical key is part of the BLOCKING surface.
     let table_keys: Vec<&str> =
         COVERED_EVENTS.iter().flat_map(|e| e.keys.iter().copied()).collect();
-    let flagged = crypto::logging::conformance::non_canonical_keys(table_keys);
+    let flagged = observability::logging::conformance::non_canonical_keys(table_keys);
     assert!(
         flagged.is_empty(),
         "COVERED_EVENTS documents non-canonical keys as part of the blocking surface: {flagged:?}"
@@ -377,7 +377,7 @@ fn non_canonical_key_is_flagged() {
 
     let observed = cap.flat();
     let keys: Vec<&str> = observed.iter().map(String::as_str).collect();
-    let flagged = crypto::logging::conformance::non_canonical_keys(keys);
+    let flagged = observability::logging::conformance::non_canonical_keys(keys);
     assert!(
         flagged.contains(&"rvc.slot"),
         "conformance diff failed to flag the planted `rvc.slot` synonym: {flagged:?}"
@@ -407,7 +407,8 @@ fn gate5_deferred_domain_keys_advisory_tail() {
         "DEFERRED_DOMAIN_KEYS contains duplicates: {DEFERRED_DOMAIN_KEYS:?}"
     );
 
-    let flagged = crypto::logging::conformance::non_canonical_keys(DEFERRED_DOMAIN_KEYS.to_vec());
+    let flagged =
+        observability::logging::conformance::non_canonical_keys(DEFERRED_DOMAIN_KEYS.to_vec());
 
     // Self-check: every deferred key is (still) non-canonical — if one became canonical, it
     // should graduate out of this list (and could then join the blocking covered set). With the

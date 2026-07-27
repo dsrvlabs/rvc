@@ -20,8 +20,8 @@ use rvc_keymanager_api::gate::DoppelgangerGate;
 use rvc_keymanager_api::handlers::{import_keystores, list_keystores, AppState};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
-    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, ValidatorConfigManager,
-    ValidatorManager,
+    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, SlashingProtectionError,
+    ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Mock implementations ─────────────────────────────────────────────────────
@@ -84,10 +84,10 @@ impl KeystoreManager for TrackingKeystoreManager {
 
 struct NoopSlashingProtection;
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(String::new())
     }
 }
@@ -197,8 +197,12 @@ fn make_state(
     Arc::new(AppState {
         keystore_manager: Arc::new(TrackingKeystoreManager::new()),
         slashing_protection: Arc::new(NoopSlashingProtection),
-        validator_manager: vm,
-        doppelganger_monitor: gate,
+        validator_manager: Arc::clone(&vm) as Arc<dyn ValidatorManager>,
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            window,
+            gate,
+            Arc::clone(&vm) as Arc<dyn ValidatorManager>,
+        )),
         remote_key_manager: Arc::new(NoopRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -206,9 +210,6 @@ fn make_state(
         attesting_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: window,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     })
 }
 

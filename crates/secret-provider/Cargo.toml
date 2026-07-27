@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 default = []
 gcp-secret = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-gax"]
@@ -14,12 +17,14 @@ test-utils = []
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
+observability.workspace = true
+eth-types.workspace = true
 lazy_static.workspace = true
 metrics.workspace = true
 prometheus.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 zeroize.workspace = true

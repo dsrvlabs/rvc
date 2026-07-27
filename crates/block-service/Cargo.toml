@@ -6,11 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 beacon.workspace = true
-builder.workspace = true
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -23,7 +26,8 @@ serde_json.workspace = true
 validator-store.workspace = true
 
 [dev-dependencies]
-crypto = { workspace = true, features = ["test-utils"] }
+crypto.workspace = true
+eth-types = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true
 tracing-test.workspace = true

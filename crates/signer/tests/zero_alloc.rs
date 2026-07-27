@@ -33,10 +33,13 @@
 //! `COUNTING` flag makes it a transparent `System` passthrough outside the
 //! measured region.
 
+// RF1-12: Counting GlobalAlloc for zero-alloc invariant requires unsafe impl GlobalAlloc.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crypto::logging::{TruncatedPubkey, TruncatedRoot};
+use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;
@@ -153,7 +156,7 @@ fn disabled_sign_hot_path_logging_is_zero_alloc() {
         // TRACE the `enabled!` guard short-circuits so the sampler is never consulted —
         // this mirrors the production guard shape and must still allocate nothing.
         if tracing::enabled!(tracing::Level::TRACE)
-            && crypto::logging::should_log_sampled(&SAMPLE_CTR, 16)
+            && observability::logging::should_log_sampled(&SAMPLE_CTR, 16)
         {
             tracing::trace!("staging attestation slashing-protection record (sampled 1-in-16)");
         }

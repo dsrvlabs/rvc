@@ -35,10 +35,26 @@ pub trait KeystoreManager: Send + Sync {
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError>;
 }
 
+/// Errors from [`SlashingProtection`] trait methods.
+///
+/// Client exposure is decided by the central mapper in [`crate::error`]:
+/// * [`Self::NotFound`] / [`Self::InvalidInterchange`] — safe to surface
+/// * [`Self::Backend`] — logged server-side only; clients get a generic message
+#[derive(Debug, Error)]
+pub enum SlashingProtectionError {
+    #[error("not found")]
+    NotFound,
+    #[error("invalid interchange: {0}")]
+    InvalidInterchange(String),
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
+    #[error("{0}")]
+    Backend(String),
+}
+
 /// Manages EIP-3076 slashing protection interchange data.
 pub trait SlashingProtection: Send + Sync {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), String>;
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String>;
+    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError>;
+    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
 }
 
 /// Manages validator configurations (enable/disable).
@@ -54,7 +70,22 @@ pub trait ValidatorManager: Send + Sync {
 /// Triggers doppelganger detection for newly imported keys.
 pub trait DoppelgangerMonitor: Send + Sync {
     fn start_monitoring(&self, pubkey: Pubkey);
+    /// Signal that the wall-clock M-12 import window has elapsed (or prune a
+    /// time-based pending entry).
+    ///
+    /// **Must not** tear down forward-window enablement state that still needs
+    /// network liveness satisfaction (SEC-2b/2c). Production
+    /// `ForwardWindowMachine` adapters treat this as a no-op for machine state;
+    /// only [`Self::cancel_monitoring`] (DELETE) removes machine registration.
     fn stop_monitoring(&self, pubkey: &Pubkey);
+    /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
+    /// a fresh window (`ForwardWindowMachine::cancel`).
+    ///
+    /// Default: same as [`Self::stop_monitoring`] (time-based gates where both
+    /// mean "prune pending").
+    fn cancel_monitoring(&self, pubkey: &Pubkey) {
+        self.stop_monitoring(pubkey);
+    }
     /// Returns `true` if the doppelganger window for this key has elapsed.
     ///
     /// Keys that are not under active monitoring (e.g. existing keys loaded at
@@ -62,18 +93,32 @@ pub trait DoppelgangerMonitor: Send + Sync {
     fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool;
 }
 
+/// Errors from remote-key import.
+///
+/// Client exposure is decided by the central mapper in [`crate::error`]:
+/// * [`Self::Duplicate`], [`Self::InvalidUrl`], [`Self::HostNotAllowed`] — safe
+/// * [`Self::Backend`] — logged server-side only
 #[derive(Debug, Error)]
 pub enum ImportRemoteKeyError {
     #[error("duplicate key")]
     Duplicate,
+    #[error("invalid remote signer URL: {0}")]
+    InvalidUrl(String),
+    #[error("remote signer host '{0}' is not in the allowed hosts list")]
+    HostNotAllowed(String),
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
-    Other(String),
+    Backend(String),
 }
 
+/// Errors from remote-key delete.
 #[derive(Debug, Error)]
 pub enum DeleteRemoteKeyError {
+    #[error("not found")]
+    NotFound,
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
-    Other(String),
+    Backend(String),
 }
 
 /// Manages remote signing keys (Web3Signer).
@@ -97,9 +142,22 @@ pub trait ValidatorConfigManager: Send + Sync {
     fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError>;
 }
 
-/// Manages voluntary exit signing for validators.
+/// Manages voluntary exit **signing** for validators.
+///
+/// # Submit semantics
+///
+/// `sign_voluntary_exit` only constructs and signs a [`eth_types::SignedVoluntaryExit`].
+/// It does **not** broadcast or submit the exit to the beacon chain. Both
+/// Keymanager routes that use this trait
+/// (`POST /eth/v1/validator/:pubkey/voluntary_exit` and
+/// `POST /rvc/v1/validator/:pubkey/prepare_exit`) therefore return the signed
+/// message for the operator to submit separately; they differ only in log
+/// framing, not in submit behavior.
 #[async_trait]
 pub trait VoluntaryExitManager: Send + Sync {
+    /// Sign a voluntary exit for `pubkey` at `epoch` (or current epoch when `None`).
+    ///
+    /// Returns the signed message only; does not submit it to the beacon chain.
     async fn sign_voluntary_exit(
         &self,
         pubkey: &Pubkey,

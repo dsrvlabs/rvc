@@ -1,6 +1,186 @@
 # Architecture
 
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 23 crates (3 binaries + 20 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, distributed tracing via OpenTelemetry, and remote/distributed signing via gRPC.
+<!-- BEGIN GENERATED -->
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
+
+> **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
+> ```
+> make architecture-doc   # or: cargo run -p rvc-architecture-tests --bin generate-architecture-md
+> ```
+
+## Crate Dependency Graph
+
+```mermaid
+graph TD
+    BEACON["beacon<br/><i>HTTP client</i>"]
+    RVC["rvc<br/><i>orchestrator</i>"]
+    RVC_ARCHITECTURE_TESTS["architecture-tests<br/><i>DAG + doc gates</i>"]
+    RVC_BIN["bin/rvc<br/><i>CLI entry point</i>"]
+    RVC_BLOCK_SERVICE["block-service<br/><i>block proposals</i>"]
+    RVC_BN_MANAGER["bn-manager<br/><i>multi-BN</i>"]
+    RVC_BUILDER["builder<br/><i>MEV registration</i>"]
+    RVC_CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
+    RVC_DOPPELGANGER["doppelganger<br/><i>duplicate detection</i>"]
+    RVC_DUTY_TRACKER["duty-tracker<br/><i>duty cache</i>"]
+    RVC_ETH_TYPES["eth-types<br/><i>consensus types</i>"]
+    RVC_GRPC_SIGNER["grpc-signer<br/><i>gRPC signer client</i>"]
+    RVC_KEYGEN["bin/rvc-keygen<br/><i>key generation</i>"]
+    RVC_KEYMANAGER_API["keymanager-api<br/><i>key mgmt REST</i>"]
+    RVC_METRICS["metrics<br/><i>prometheus</i>"]
+    RVC_OBSERVABILITY["observability<br/><i>logging helpers</i>"]
+    RVC_SECRET_PROVIDER["secret-provider<br/><i>cloud key mgmt</i>"]
+    RVC_SIGNER["signer<br/><i>safe signing</i>"]
+    RVC_SIGNER_BIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
+    RVC_SIGNER_PROTO["signer-proto<br/><i>gRPC protobuf</i>"]
+    RVC_SIGNER_REGISTRY["signer-registry<br/><i>sign type table</i>"]
+    RVC_SIGNER_SERVER["signer-server<br/><i>remote signing lib</i>"]
+    RVC_SLASHING["slashing<br/><i>EIP-3076</i>"]
+    RVC_SYNC_SERVICE["sync-service<br/><i>sync committees</i>"]
+    RVC_TELEMETRY["telemetry<br/><i>OTel tracing</i>"]
+    RVC_TEST_SUPPORT["test-support<br/><i>PKI + mTLS harness</i>"]
+    RVC_TIMING["timing<br/><i>slot clock</i>"]
+    RVC_VALIDATOR_STORE["validator-store<br/><i>validator config</i>"]
+    RVC_WEB3SIGNER_WIRE["web3signer-wire<br/><i>remote sign wire</i>"]
+
+    BEACON --> RVC_ETH_TYPES
+    BEACON --> RVC_OBSERVABILITY
+    BEACON --> RVC_TELEMETRY
+    RVC --> BEACON
+    RVC --> RVC_BLOCK_SERVICE
+    RVC --> RVC_BN_MANAGER
+    RVC --> RVC_BUILDER
+    RVC --> RVC_CRYPTO
+    RVC --> RVC_DOPPELGANGER
+    RVC --> RVC_DUTY_TRACKER
+    RVC --> RVC_ETH_TYPES
+    RVC --> RVC_GRPC_SIGNER
+    RVC --> RVC_KEYMANAGER_API
+    RVC --> RVC_METRICS
+    RVC --> RVC_OBSERVABILITY
+    RVC --> RVC_SECRET_PROVIDER
+    RVC --> RVC_SIGNER
+    RVC --> RVC_SLASHING
+    RVC --> RVC_TIMING
+    RVC --> RVC_VALIDATOR_STORE
+    RVC_BIN --> BEACON
+    RVC_BIN --> RVC
+    RVC_BIN --> RVC_BN_MANAGER
+    RVC_BIN --> RVC_BUILDER
+    RVC_BIN --> RVC_CRYPTO
+    RVC_BIN --> RVC_DOPPELGANGER
+    RVC_BIN --> RVC_ETH_TYPES
+    RVC_BIN --> RVC_GRPC_SIGNER
+    RVC_BIN --> RVC_KEYMANAGER_API
+    RVC_BIN --> RVC_METRICS
+    RVC_BIN --> RVC_OBSERVABILITY
+    RVC_BIN --> RVC_SECRET_PROVIDER
+    RVC_BIN --> RVC_SIGNER
+    RVC_BIN --> RVC_SLASHING
+    RVC_BIN --> RVC_TELEMETRY
+    RVC_BIN --> RVC_TIMING
+    RVC_BLOCK_SERVICE --> BEACON
+    RVC_BLOCK_SERVICE --> RVC_CRYPTO
+    RVC_BLOCK_SERVICE --> RVC_ETH_TYPES
+    RVC_BLOCK_SERVICE --> RVC_OBSERVABILITY
+    RVC_BLOCK_SERVICE --> RVC_SIGNER
+    RVC_BLOCK_SERVICE --> RVC_VALIDATOR_STORE
+    RVC_BN_MANAGER --> BEACON
+    RVC_BN_MANAGER --> RVC_ETH_TYPES
+    RVC_BN_MANAGER --> RVC_METRICS
+    RVC_BN_MANAGER --> RVC_OBSERVABILITY
+    RVC_BUILDER --> RVC_BN_MANAGER
+    RVC_BUILDER --> RVC_CRYPTO
+    RVC_BUILDER --> RVC_ETH_TYPES
+    RVC_BUILDER --> RVC_SIGNER
+    RVC_BUILDER --> RVC_VALIDATOR_STORE
+    RVC_CRYPTO --> RVC_ETH_TYPES
+    RVC_CRYPTO --> RVC_OBSERVABILITY
+    RVC_CRYPTO --> RVC_WEB3SIGNER_WIRE
+    RVC_DOPPELGANGER --> RVC_CRYPTO
+    RVC_DOPPELGANGER --> RVC_ETH_TYPES
+    RVC_DOPPELGANGER --> RVC_OBSERVABILITY
+    RVC_DOPPELGANGER --> RVC_SLASHING
+    RVC_DUTY_TRACKER --> RVC_BN_MANAGER
+    RVC_DUTY_TRACKER --> RVC_ETH_TYPES
+    RVC_DUTY_TRACKER --> RVC_METRICS
+    RVC_GRPC_SIGNER --> RVC_CRYPTO
+    RVC_GRPC_SIGNER --> RVC_ETH_TYPES
+    RVC_GRPC_SIGNER --> RVC_OBSERVABILITY
+    RVC_GRPC_SIGNER --> RVC_SIGNER_PROTO
+    RVC_KEYGEN --> RVC_CRYPTO
+    RVC_KEYGEN --> RVC_ETH_TYPES
+    RVC_KEYGEN --> RVC_OBSERVABILITY
+    RVC_KEYMANAGER_API --> RVC_ETH_TYPES
+    RVC_KEYMANAGER_API --> RVC_METRICS
+    RVC_KEYMANAGER_API --> RVC_OBSERVABILITY
+    RVC_SECRET_PROVIDER --> RVC_CRYPTO
+    RVC_SECRET_PROVIDER --> RVC_ETH_TYPES
+    RVC_SECRET_PROVIDER --> RVC_METRICS
+    RVC_SECRET_PROVIDER --> RVC_OBSERVABILITY
+    RVC_SIGNER --> RVC_CRYPTO
+    RVC_SIGNER --> RVC_DOPPELGANGER
+    RVC_SIGNER --> RVC_ETH_TYPES
+    RVC_SIGNER --> RVC_METRICS
+    RVC_SIGNER --> RVC_OBSERVABILITY
+    RVC_SIGNER --> RVC_SLASHING
+    RVC_SIGNER_BIN --> RVC_SIGNER_SERVER
+    RVC_SIGNER_BIN --> RVC_TELEMETRY
+    RVC_SIGNER_SERVER --> RVC_CRYPTO
+    RVC_SIGNER_SERVER --> RVC_ETH_TYPES
+    RVC_SIGNER_SERVER --> RVC_OBSERVABILITY
+    RVC_SIGNER_SERVER --> RVC_SIGNER
+    RVC_SIGNER_SERVER --> RVC_SIGNER_PROTO
+    RVC_SIGNER_SERVER --> RVC_SLASHING
+    RVC_SIGNER_SERVER --> RVC_TELEMETRY
+    RVC_SIGNER_SERVER --> RVC_WEB3SIGNER_WIRE
+    RVC_SLASHING --> RVC_ETH_TYPES
+    RVC_SLASHING --> RVC_METRICS
+    RVC_SLASHING --> RVC_OBSERVABILITY
+    RVC_TIMING --> RVC_ETH_TYPES
+    RVC_VALIDATOR_STORE --> RVC_ETH_TYPES
+    RVC_VALIDATOR_STORE --> RVC_OBSERVABILITY
+    RVC_WEB3SIGNER_WIRE --> RVC_ETH_TYPES
+
+    style BEACON fill:#51cf66,color:#fff
+    style RVC fill:#ff6b6b,color:#fff
+    style RVC_ARCHITECTURE_TESTS fill:#adb5bd,color:#333
+    style RVC_BIN fill:#4a9eff,color:#fff
+    style RVC_BLOCK_SERVICE fill:#ffd43b,color:#333
+    style RVC_BN_MANAGER fill:#51cf66,color:#fff
+    style RVC_BUILDER fill:#ffd43b,color:#333
+    style RVC_CRYPTO fill:#51cf66,color:#fff
+    style RVC_DOPPELGANGER fill:#ffd43b,color:#333
+    style RVC_DUTY_TRACKER fill:#ffd43b,color:#333
+    style RVC_ETH_TYPES fill:#51cf66,color:#fff
+    style RVC_GRPC_SIGNER fill:#51cf66,color:#fff
+    style RVC_KEYGEN fill:#4a9eff,color:#fff
+    style RVC_KEYMANAGER_API fill:#51cf66,color:#fff
+    style RVC_METRICS fill:#51cf66,color:#fff
+    style RVC_OBSERVABILITY fill:#51cf66,color:#fff
+    style RVC_SECRET_PROVIDER fill:#51cf66,color:#fff
+    style RVC_SIGNER fill:#ffd43b,color:#333
+    style RVC_SIGNER_BIN fill:#4a9eff,color:#fff
+    style RVC_SIGNER_PROTO fill:#51cf66,color:#fff
+    style RVC_SIGNER_REGISTRY fill:#51cf66,color:#fff
+    style RVC_SIGNER_SERVER fill:#ffd43b,color:#333
+    style RVC_SLASHING fill:#51cf66,color:#fff
+    style RVC_SYNC_SERVICE fill:#ffd43b,color:#333
+    style RVC_TELEMETRY fill:#51cf66,color:#fff
+    style RVC_TEST_SUPPORT fill:#adb5bd,color:#333
+    style RVC_TIMING fill:#ffd43b,color:#333
+    style RVC_VALIDATOR_STORE fill:#51cf66,color:#fff
+    style RVC_WEB3SIGNER_WIRE fill:#51cf66,color:#fff
+```
+
+**Layer colors:**
+- **Blue** — Binary entry point
+- **Red** — Core orchestrator (depends on domain + foundation crates)
+- **Yellow** — Domain crates (duty-specific logic)
+- **Green** — Foundation crates (infrastructure, no domain orchestration)
+- **Gray** — Meta / dev-only crates (architecture gates, test harnesses)
+<!-- END GENERATED -->
+
+RVC handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, distributed tracing via OpenTelemetry, and remote/distributed signing via gRPC.
 
 ## System Overview
 
@@ -47,136 +227,6 @@ graph TB
     TEL -->|OTLP/HTTP| OTEL
 ```
 
-## Crate Dependency Graph
-
-```mermaid
-graph TD
-    BIN["bin/rvc<br/><i>CLI entry point</i>"]
-    KEYGEN["bin/rvc-keygen<br/><i>key generation</i>"]
-    SIGBIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
-    RVC["rvc<br/><i>orchestrator</i>"]
-    BEACON["beacon<br/><i>HTTP client</i>"]
-    BNM["bn-manager<br/><i>multi-BN</i>"]
-    CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
-    GRPCSIGNER["grpc-signer<br/><i>gRPC signer client</i>"]
-    SIGNER["signer<br/><i>safe signing</i>"]
-    SLASHING["slashing<br/><i>EIP-3076</i>"]
-    DUTY["duty-tracker<br/><i>duty cache</i>"]
-    PROP["propagator<br/><i>message submit</i>"]
-    TIMING["timing<br/><i>slot clock</i>"]
-    METRICS["metrics<br/><i>prometheus</i>"]
-    ETH["eth-types<br/><i>consensus types</i>"]
-    BLOCK["block-service<br/><i>block proposals</i>"]
-    SYNC["sync-service<br/><i>sync committees</i>"]
-    DOPP["doppelganger<br/><i>duplicate detection</i>"]
-    BUILD["builder<br/><i>MEV registration</i>"]
-    VSTORE["validator-store<br/><i>validator config</i>"]
-    KMA["keymanager-api<br/><i>key mgmt REST</i>"]
-    TEL["telemetry<br/><i>OTel tracing</i>"]
-    SP["secret-provider<br/><i>cloud key mgmt</i>"]
-
-    BIN --> RVC
-    BIN --> BNM
-    BIN --> CRYPTO
-    BIN --> GRPCSIGNER
-    BIN --> METRICS
-    BIN --> KMA
-    BIN --> SLASHING
-    BIN --> TEL
-    BIN --> SP
-
-    SIGBIN --> CRYPTO
-
-    KEYGEN --> CRYPTO
-    KEYGEN --> ETH
-
-    RVC --> SIGNER
-    RVC --> DUTY
-    RVC --> PROP
-    RVC --> TIMING
-    RVC --> BNM
-    RVC --> CRYPTO
-    RVC --> SLASHING
-    RVC --> METRICS
-    RVC --> ETH
-    RVC --> BLOCK
-    RVC --> SYNC
-    RVC --> DOPP
-    RVC --> BUILD
-    RVC --> VSTORE
-
-    BLOCK --> CRYPTO
-    BLOCK --> SIGNER
-    BLOCK --> VSTORE
-    BLOCK --> ETH
-
-    SYNC --> ETH
-
-    BUILD --> BNM
-    BUILD --> CRYPTO
-    BUILD --> SIGNER
-    BUILD --> VSTORE
-    BUILD --> ETH
-
-    DOPP --> ETH
-
-    SIGNER --> CRYPTO
-    SIGNER --> SLASHING
-    SIGNER --> METRICS
-    SIGNER --> ETH
-
-    DUTY --> BNM
-    DUTY --> METRICS
-    DUTY --> ETH
-
-    PROP --> BNM
-    PROP --> METRICS
-
-    BNM --> BEACON
-    BNM --> ETH
-
-    TIMING --> ETH
-
-    CRYPTO --> ETH
-    SLASHING --> ETH
-    SLASHING --> METRICS
-
-    GRPCSIGNER --> CRYPTO
-
-    SP --> CRYPTO
-    SP --> METRICS
-
-    style BIN fill:#4a9eff,color:#fff
-    style KEYGEN fill:#4a9eff,color:#fff
-    style SIGBIN fill:#4a9eff,color:#fff
-    style RVC fill:#ff6b6b,color:#fff
-    style ETH fill:#51cf66,color:#fff
-    style METRICS fill:#51cf66,color:#fff
-    style BEACON fill:#51cf66,color:#fff
-    style BNM fill:#51cf66,color:#fff
-    style KMA fill:#51cf66,color:#fff
-    style VSTORE fill:#51cf66,color:#fff
-    style TEL fill:#51cf66,color:#fff
-    style SIGNER fill:#ffd43b,color:#333
-    style CRYPTO fill:#ffd43b,color:#333
-    style SLASHING fill:#ffd43b,color:#333
-    style DUTY fill:#ffd43b,color:#333
-    style PROP fill:#ffd43b,color:#333
-    style TIMING fill:#ffd43b,color:#333
-    style BLOCK fill:#ffd43b,color:#333
-    style SYNC fill:#ffd43b,color:#333
-    style DOPP fill:#ffd43b,color:#333
-    style BUILD fill:#ffd43b,color:#333
-    style SP fill:#51cf66,color:#fff
-    style GRPCSIGNER fill:#51cf66,color:#fff
-```
-
-**Layer colors:**
-- **Blue** — Binary entry point
-- **Red** — Core orchestrator (depends on all internal crates)
-- **Yellow** — Domain crates (duty-specific logic)
-- **Green** — Foundation crates (infrastructure, no domain logic)
-
 ## Crate Layer Diagram
 
 ```mermaid
@@ -200,7 +250,6 @@ block-beta
     block:domain:8
         SIGNER["signer"]
         DUTY["duty-tracker"]
-        PROP["propagator"]
         TIMING["timing"]
         BLOCK["block-service"]
         SYNC["sync-service"]
@@ -229,14 +278,12 @@ block-beta
     SIGBIN --> CRYPTO
     RVC --> SIGNER
     RVC --> DUTY
-    RVC --> PROP
     RVC --> TIMING
     RVC --> BLOCK
     RVC --> BUILD
     SIGNER --> CRYPTO
     SIGNER --> SLASHING
     DUTY --> BNM
-    PROP --> BNM
     BNM --> BEACON
 
     style binary fill:#4a9eff,color:#fff
@@ -254,7 +301,7 @@ sequenceDiagram
     participant DT as DutyTracker
     participant BNM as BnManager
     participant Block as BlockService
-    participant Sync as SyncService
+    participant Sync as SyncCommitteeService
     participant Signer as SignerService
     participant Prop as Propagator
     participant Builder as BuilderService
@@ -295,11 +342,11 @@ flowchart TD
     A[Slot start, validator is proposer] --> B[Sign RANDAO reveal<br/>DOMAIN_RANDAO]
     B --> C[produce_block_v3<br/>graffiti, builder_boost_factor]
     C --> D{Blinded?}
-    D -->|Yes| E[SlashingDb<br/>is_safe_to_propose]
+    D -->|Yes| E[SlashingDb<br/>stage_block]
     D -->|No| E
     E -->|Slashable| X1[REJECT: DoubleProposal]
     E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER]
-    F --> G[Record block in SlashingDb]
+    F --> G[commit staged block in SlashingDb]
     G --> H{Blinded?}
     H -->|Yes| I[publish_blinded_block<br/>broadcast to all BNs]
     H -->|No| J[publish_block<br/>broadcast to all BNs]
@@ -390,7 +437,7 @@ flowchart LR
     GRS -->|add remote signer| CS
 
     BNM --> DT[DutyTracker]
-    BNM --> PROP[Propagator]
+    BNM --> PROP[Propagator<br/>bn-manager::submit]
     BNM --> BUILD[BuilderService]
 
     CS --> SS[SignerService]
@@ -469,6 +516,7 @@ Manages connections to one or more Beacon Nodes with strategy-based selection, h
 
 - **`BeaconNodeClient` trait** — Unified async interface for all BN operations. All domain crates depend on this trait, not on `BeaconClient` directly.
 - **`BnManager`** — Wraps multiple `BeaconClient` instances. Selection strategies: `First` (lowest latency), `Best` (highest-value response for block production), `Broadcast` (submit to all BNs).
+- **`submit` module** — `Propagator` / `AttestationSubmitter` submit signed attestations and aggregate proofs with topic-gated multi-BN broadcast (absorbed from the former `crates/propagator`).
 - **Health scoring** — EMA latency (α=0.3), sliding window error rate, composite score (0.4×latency + 0.6×error).
 - **SSE events** — Head, ChainReorg, FinalizedCheckpoint, Block.
 - **Sync checking** — Monitors `el_offline`, `is_optimistic`, `sync_distance`.
@@ -481,13 +529,16 @@ Orchestrates the block proposal lifecycle: RANDAO reveal → block production �
 - **`BeaconBlockClient` trait** — `produce_block`, `publish_block`, `publish_blinded_block`.
 - Handles both full and blinded (MEV) blocks via `Eth-Execution-Payload-Blinded` header.
 
-### `crates/sync-service` — Sync Committees
+### `crates/sync-service` — Sync Committee Helpers
 
-Produces and submits sync committee messages (at t=slot/3) and contributions (at t=2*slot/3).
+Shared sync-committee constants and aggregator selection. Production message and contribution
+lifecycle is owned by the orchestrator's **`SyncCommitteeService`**
+(`crates/rvc/src/orchestrator/sync_committee.rs`), which signs via `SignerService` and submits
+via `BeaconNodeClient` (with timeouts and the D-3 doppelganger gate).
 
-- **`SyncService<S, B>`** — Generic over `SyncSigner` and `SyncBeaconClient`.
-- **Aggregator selection** — Computes selection proof, checks against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
-- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`.
+- **`is_sync_committee_aggregator`** — Selection-proof check against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
+- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`,
+  `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE = 16`.
 
 ### `crates/builder` — MEV & Builder Integration
 
@@ -531,7 +582,7 @@ Wraps the `blst` library for BLS12-381 operations and provides key generation:
 - **BIP-39 mnemonic** — Generation (24 words, 256-bit entropy) and seed derivation with optional passphrase.
 - **EIP-2335 keystore encryption** — Scrypt and PBKDF2 KDFs, AES-128-CTR cipher, checksum verification.
 - **Signing functions** — `sign_attestation`, `sign_block`, `sign_randao_reveal`, `sign_sync_committee_message`, `sign_contribution_and_proof`, `sign_aggregate_and_proof`, `sign_selection_proof`, `sign_voluntary_exit`, `sign_builder_registration`.
-- **`Zeroize` on drop**, `SecretString` for passwords, `DecryptionAttemptTracker` for brute-force protection.
+- **`Zeroize` on drop**, `SecretString` for passwords.
 
 ### `crates/signer` — Safe Signing with Slashing Protection
 
@@ -549,9 +600,20 @@ SQLite-backed slashing protection for attestations and blocks:
 - **Block rule** — Double proposal (same slot, different signing root).
 - **`check_and_record_attestation`** / **`check_and_record_block`** — Atomic check-and-record.
 - **Integrity checks** — `PRAGMA integrity_check` at startup, genesis root validation.
-- **Pruning** — Watermark-based pruning for source epoch, target epoch, and block slot.
+- **Pruning** — Watermark-based pruning for source epoch, target epoch, and block slot via
+  `SlashingDb::prune_below_watermarks`, exposed to operators as `rvc slashing prune`
+  (`--slashing-db-path`, `--dry-run`, `--yes`). The prune path refuses to create a fresh
+  empty DB on a missing path (same class of footgun as `--init-slashing-db` without opt-in).
+  The `rvc_slashing_db_prune_total` metric increments on real prunes.
 - **EIP-3076 interchange** — Import/export for keystore migration.
 - **Conformance** — 76 EIP-3076 tests (38 complete + 38 minimal strategy).
+
+**Wire-not-delete (B5 / RF2-12 + RF2-13):** the watermark + prune subsystem is intentionally
+wired rather than deleted. Phase 1 A1 pinned stage-path watermark equality (`<=` blocks at
+the watermark), A2 retargeted conformance + proptests onto `stage_* → commit/discard`, and
+the 38 minimal-strategy EIP-3076 conformance cases depend on watermark maxima projected from
+interchange import (RF2-12). Deleting watermarks would invalidate that oracle and weaken
+minimal-format import safety; RF2-13 completes the operator surface so pruning is reachable.
 
 ### `crates/keymanager-api` — Keymanager REST API
 
@@ -577,10 +639,6 @@ Fetches and caches attester, proposer, and sync committee duties from the beacon
 - **Proposer duties** — Per-epoch cache, prefetched at epoch start.
 - **Sync committee duties** — Per-sync-committee-period cache (~256 epochs).
 - Depends on `BnManager` via `BeaconNodeClient` trait.
-
-### `crates/propagator` — Message Propagation
-
-Submits signed messages to beacon node(s). Uses `AttestationSubmitter` trait for dependency injection. Supports attestations and aggregate attestation proofs. Depends on `BnManager` for multi-BN broadcast.
 
 ### `crates/timing` — Slot Clock
 
@@ -632,13 +690,18 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **Composite pattern** — `CompositeSigner` routes local/dynamic/remote keys. `BnManager` routes across multiple BNs.
 - **Adapter pattern** — 5 adapters in the orchestrator bridge keymanager-api traits to concrete services.
 - **Arc-wrapped services** — All long-lived services are `Arc<T>` for cheap cloning across async tasks.
-- **Fail-closed signing** — Any error in the slashing protection path refuses to sign.
-- **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward.
-- **Graceful shutdown** — `tokio::watch` channel signals completion of current slot before exiting.
+- **Fail-closed convention** — Safety-critical paths refuse to proceed on uncertainty rather than degrade open:
+  - **Signing / slashing DB** — Any slashing-protection error refuses to sign; staged rows are retained on remote-backend timeout when the backend kind is unknown (`RetainStagedRow`).
+  - **Enablement defaults** — Validators stay disabled until doppelganger/enablement gates clear; key import does not enable signing immediately.
+  - **Startup** — Slashing DB integrity failure, genesis-validators-root mismatch, and missing DB without `--init-slashing-db` refuse to start (no silent empty-DB create).
+  - Prefer typed `Result` flows with explicit allow-lists for any intentional degradation.
+- **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
+- **Shutdown idiom** — **`tokio_util::sync::CancellationToken`** is the workspace standard for service lifecycle (supports `child_token` hierarchies). Older loops still use `tokio::sync::watch` (orchestrator coordinator, bn-manager SSE/sync, timing); `bin/rvc` bridges the two. New code and opportunistic rewrites adopt `CancellationToken`; do not introduce new `watch`-based shutdown channels.
 - **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 - **Remote signing isolation** — `rvc-signer` runs as a standalone process with mTLS; keys never leave the signer. Slashing protection remains in `rvc`.
 - **DVT threshold signing** — Optional Shamir Secret Sharing backend with peer-to-peer partial signature coordination and Lagrange interpolation.
+- **KAT-first root tests** — Signing-root and container `hash_tree_root` tests assert against reference-client / consensus-spec vectors (`EXTERNAL_*` / `KAT_*` / `SPEC_*`); self-consistency-only checks are banned as sole coverage. Enforced by `crates/architecture-tests/tests/kat_policy.rs` (RF6-22 / H5). Review checklist: new `*_root` / `*tree_hash*` / `*signing_root*` tests must be KAT-anchored or `// kat_exempt: reason`.
 
 ## Consensus Protocol Parameters
 

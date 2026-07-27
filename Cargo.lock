@@ -645,14 +645,14 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beacon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "hex",
  "rand 0.8.5",
  "reqwest 0.12.28",
- "rvc-crypto",
  "rvc-eth-types",
+ "rvc-observability",
  "rvc-telemetry",
  "serde",
  "serde_json",
@@ -1114,9 +1114,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -3484,9 +3484,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -4062,9 +4062,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4092,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "rvc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4105,6 +4105,7 @@ dependencies = [
  "parking_lot",
  "prost 0.13.5",
  "reqwest 0.12.28",
+ "rusqlite",
  "rvc-block-service",
  "rvc-bn-manager",
  "rvc-builder",
@@ -4112,13 +4113,13 @@ dependencies = [
  "rvc-doppelganger",
  "rvc-duty-tracker",
  "rvc-eth-types",
+ "rvc-grpc-signer",
  "rvc-keymanager-api",
  "rvc-metrics",
- "rvc-propagator",
+ "rvc-observability",
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
- "rvc-sync-service",
  "rvc-timing",
  "rvc-validator-store",
  "secrecy",
@@ -4127,6 +4128,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml",
  "tonic 0.12.3",
@@ -4142,9 +4144,9 @@ dependencies = [
 
 [[package]]
 name = "rvc-architecture-tests"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
- "rvc-crypto",
+ "rvc-observability",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -4152,15 +4154,13 @@ dependencies = [
 
 [[package]]
 name = "rvc-bin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "beacon",
  "clap",
  "hex",
  "libc",
- "logroller",
  "parking_lot",
  "reqwest 0.12.28",
  "rustls",
@@ -4168,21 +4168,22 @@ dependencies = [
  "rvc-bn-manager",
  "rvc-builder",
  "rvc-crypto",
+ "rvc-doppelganger",
  "rvc-eth-types",
  "rvc-grpc-signer",
  "rvc-keymanager-api",
  "rvc-metrics",
+ "rvc-observability",
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
  "rvc-telemetry",
  "rvc-timing",
- "rvc-validator-store",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "toml",
  "tonic 0.12.3",
  "tracing",
  "tracing-appender",
@@ -4193,14 +4194,14 @@ dependencies = [
 
 [[package]]
 name = "rvc-block-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "beacon",
  "hex",
- "rvc-builder",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-observability",
  "rvc-signer",
  "rvc-validator-store",
  "serde",
@@ -4216,14 +4217,15 @@ dependencies = [
 
 [[package]]
 name = "rvc-bn-manager"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "beacon",
  "futures",
  "reqwest-eventsource",
- "rvc-crypto",
  "rvc-eth-types",
+ "rvc-metrics",
+ "rvc-observability",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4237,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-builder"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -4255,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-crypto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -4263,7 +4265,6 @@ dependencies = [
  "blst",
  "ctr",
  "ethereum_ssz 0.9.1",
- "ethereum_ssz_derive",
  "hex",
  "hkdf",
  "num-bigint",
@@ -4274,6 +4275,8 @@ dependencies = [
  "rayon",
  "reqwest 0.12.28",
  "rvc-eth-types",
+ "rvc-observability",
+ "rvc-web3signer-wire",
  "scrypt",
  "secrecy",
  "serde",
@@ -4287,7 +4290,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-test",
  "tree_hash",
- "tree_hash_derive",
  "url",
  "uuid",
  "wiremock",
@@ -4296,13 +4298,14 @@ dependencies = [
 
 [[package]]
 name = "rvc-doppelganger"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
  "parking_lot",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-observability",
  "rvc-slashing",
  "thiserror 2.0.18",
  "tokio",
@@ -4313,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-duty-tracker"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "beacon",
  "rvc-bn-manager",
@@ -4329,9 +4332,10 @@ dependencies = [
 
 [[package]]
 name = "rvc-eth-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ethereum_serde_utils 0.8.0",
+ "ethereum_ssz 0.8.3",
  "ethereum_ssz 0.9.1",
  "ethereum_ssz_derive",
  "hex",
@@ -4339,30 +4343,29 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ssz_types",
  "thiserror 2.0.18",
- "tracing",
- "tracing-test",
  "tree_hash",
  "tree_hash_derive",
 ]
 
 [[package]]
 name = "rvc-grpc-signer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
  "prost 0.13.5",
- "rcgen",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-observability",
+ "rvc-signer-proto",
  "rvc-slashing",
+ "rvc-test-support",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4371,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-keygen"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4379,6 +4382,7 @@ dependencies = [
  "rpassword",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-observability",
  "serde",
  "serde_json",
  "sha2",
@@ -4393,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-keymanager-api"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4402,9 +4406,9 @@ dependencies = [
  "hyper",
  "parking_lot",
  "rand 0.8.5",
- "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-observability",
  "serde",
  "serde_json",
  "sha2",
@@ -4424,13 +4428,12 @@ dependencies = [
 
 [[package]]
 name = "rvc-metrics"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum 0.7.9",
  "lazy_static",
  "prometheus",
  "serde",
- "serde_json",
  "tokio",
  "tower 0.5.3",
  "tracing",
@@ -4438,21 +4441,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "rvc-propagator"
-version = "0.6.0"
+name = "rvc-observability"
+version = "0.7.0"
 dependencies = [
- "rvc-bn-manager",
- "rvc-metrics",
+ "hex",
+ "proptest",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "url",
+ "uuid",
 ]
 
 [[package]]
 name = "rvc-secret-provider"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "google-cloud-gax",
@@ -4462,7 +4466,9 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "rvc-crypto",
+ "rvc-eth-types",
  "rvc-metrics",
+ "rvc-observability",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -4474,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -4484,6 +4490,7 @@ dependencies = [
  "rvc-doppelganger",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-observability",
  "rvc-slashing",
  "serde_json",
  "tempfile",
@@ -4495,7 +4502,40 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer-bin"
-version = "0.6.0"
+version = "0.7.0"
+dependencies = [
+ "clap",
+ "hex",
+ "libc",
+ "rvc-crypto",
+ "rvc-signer-server",
+ "rvc-telemetry",
+ "rvc-test-support",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "rvc-signer-proto"
+version = "0.7.0"
+dependencies = [
+ "prost 0.13.5",
+ "tonic 0.12.3",
+ "tonic-build",
+]
+
+[[package]]
+name = "rvc-signer-registry"
+version = "0.7.0"
+
+[[package]]
+name = "rvc-signer-server"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4511,17 +4551,20 @@ dependencies = [
  "proptest",
  "prost 0.13.5",
  "rand 0.8.5",
- "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-grpc-signer",
+ "rvc-observability",
  "rvc-signer",
+ "rvc-signer-proto",
  "rvc-signer-registry",
  "rvc-slashing",
  "rvc-telemetry",
+ "rvc-test-support",
+ "rvc-web3signer-wire",
  "serde",
  "serde_json",
  "tempfile",
@@ -4532,32 +4575,28 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic 0.12.3",
- "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "tree_hash",
  "vsss-rs",
  "x509-parser",
  "zeroize",
 ]
 
 [[package]]
-name = "rvc-signer-registry"
-version = "0.6.0"
-
-[[package]]
 name = "rvc-slashing"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "libc",
  "parking_lot",
  "proptest",
  "rusqlite",
- "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-observability",
  "serde",
  "serde_json",
  "tempfile",
@@ -4569,19 +4608,14 @@ dependencies = [
 
 [[package]]
 name = "rvc-sync-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
- "async-trait",
- "rvc-eth-types",
- "sha2",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "rvc-telemetry"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "logroller",
@@ -4600,26 +4634,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "rvc-timing"
-version = "0.6.0"
+name = "rvc-test-support"
+version = "0.7.0"
 dependencies = [
- "lazy_static",
- "prometheus",
- "rvc-eth-types",
- "rvc-metrics",
- "thiserror 2.0.18",
+ "rcgen",
  "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+]
+
+[[package]]
+name = "rvc-timing"
+version = "0.7.0"
+dependencies = [
+ "rvc-eth-types",
+ "thiserror 2.0.18",
  "tracing",
- "tracing-test",
 ]
 
 [[package]]
 name = "rvc-validator-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "parking_lot",
- "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-observability",
  "serde",
  "serde_json",
  "tempfile",
@@ -4627,6 +4667,16 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-test",
+]
+
+[[package]]
+name = "rvc-web3signer-wire"
+version = "0.7.0"
+dependencies = [
+ "hex",
+ "rvc-eth-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5051,6 +5101,22 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "ssz_types"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dad0fa7e9a85c06d0a6ba5100d733fff72e231eb6db2d86078225cf716fd2d95"
+dependencies = [
+ "ethereum_serde_utils 0.7.0",
+ "ethereum_ssz 0.8.3",
+ "itertools 0.13.0",
+ "serde",
+ "serde_derive",
+ "smallvec",
+ "tree_hash",
+ "typenum",
 ]
 
 [[package]]

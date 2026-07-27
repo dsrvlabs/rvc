@@ -32,11 +32,13 @@
 // CQ-2.2 adds an inline comment documenting WHY staging is absent.  This is the
 // correct outcome per the issue-spec fallback: "adjust the test accordingly."
 
+mod common;
+
 use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, SecretKey};
 use eth_types::{ForkSchedule, Root, VoluntaryExit};
-use rvc_signer::{SignerError, SignerService};
+use rvc_signer::{SignerError, SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -79,7 +81,8 @@ const GVR: Root = [0xaa; 32];
 async fn test_voluntary_exit_signer_error_is_propagated() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -114,7 +117,8 @@ async fn test_voluntary_exit_signer_error_is_propagated() {
 async fn test_voluntary_exit_retry_after_signer_failure_succeeds() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -131,7 +135,8 @@ async fn test_voluntary_exit_retry_after_signer_failure_succeeds() {
     let mut manager = KeyManager::new();
     manager.insert(sk);
     let real_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
-    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db));
+    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let ok_result = service_ok.sign_voluntary_exit(&exit, &pubkey, &fs, &GVR).await;
     assert!(

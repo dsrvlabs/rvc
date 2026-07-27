@@ -1,5 +1,5 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
-       docker-rvc docker-signer docker-keygen docker-all
+       docker-rvc docker-signer docker-keygen docker-all architecture-doc
 
 # Build
 build:
@@ -62,6 +62,11 @@ coverage-html:
 # Clean
 clean:
 	cargo clean
+
+# Regenerate ARCHITECTURE.md crate-count + dependency graph from cargo metadata.
+# CI enforces doc == generated via crates/architecture-tests.
+architecture-doc:
+	cargo run -p rvc-architecture-tests --bin generate-architecture-md
 
 # All checks (CI)
 ci: fmt-check clippy test

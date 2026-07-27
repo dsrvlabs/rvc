@@ -47,6 +47,13 @@
 //! `tokio::time::timeout`) so a stalled signer does not hold the lock
 //! indefinitely.
 //!
+//! ## Test inject (`test-utils`)
+//!
+//! With the `test-utils` feature, [`SlashingDb::fail_next_commits`] forces the
+//! next N commits on **that** DB instance to fail before INSERT/`COMMIT`
+//! (snapshotted onto the staged guard at `stage_*`). Drop still rolls back.
+//! Used by RF4-03 path-level `CommitFailed` tests in `rvc-signer`.
+//!
 //! ## `!Send` guarantee
 //!
 //! `parking_lot::MutexGuard<'_, Connection>` is `!Send` (it must be released
@@ -56,12 +63,18 @@
 //! thread (e.g. via `spawn_blocking`).
 
 use parking_lot::MutexGuard;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
+use crate::db::watermarks::{read_watermark, WatermarkKind};
+use crate::error::SlashingError;
+use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
+use crate::rules::{
+    check_attestation, check_block, AttestationCandidate, AttestationVerdict,
+    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
+};
 use crate::SlashingDb;
-use crypto::logging::TruncatedPubkey;
 use eth_types::{Epoch, Root, Slot};
+use observability::logging::TruncatedPubkey;
 
 use std::sync::atomic::Ordering;
 
@@ -70,16 +83,6 @@ use std::sync::atomic::Ordering;
 /// Per-CN audit visibility now flows through [`crate::audit_log`] instead.
 /// `pub(crate)` so `db.rs` can use the same constant for `check_and_record_*`.
 pub(crate) const AUDIT_ORIGIN: &str = "local-vc";
-
-/// Result of the EIP-3076 violation check for a staged block.
-///
-/// `Stage` means the row is new and `commit()` will run the INSERT.
-/// `Resign` means the row already exists with an identical signing root, so
-/// `commit()` skips the INSERT and just closes the transaction.
-enum BlockStageOutcome {
-    Stage,
-    Resign,
-}
 
 // ── BlockRow ──────────────────────────────────────────────────────────────────
 
@@ -139,6 +142,8 @@ pub struct StagedBlock<'db> {
     guard: Option<MutexGuard<'db, Connection>>,
     row: BlockRow,
     committed: bool,
+    /// Snapshotted from [`SlashingDb::take_injected_commit_failure`] at stage time.
+    inject_fail_commit: bool,
 }
 
 impl std::fmt::Debug for StagedBlock<'_> {
@@ -159,6 +164,12 @@ impl<'db> StagedBlock<'db> {
     ///
     /// Consumes the guard and releases the database mutex.
     pub fn commit(mut self) -> Result<(), SlashingError> {
+        if self.inject_fail_commit {
+            return Err(SlashingError::MigrationFailed(
+                "injected commit failure (test-utils)".into(),
+            ));
+        }
+
         let guard = self.guard.as_mut().expect("guard is always Some before Drop");
 
         if !self.row.is_resign {
@@ -216,6 +227,8 @@ pub struct StagedAttestation<'db> {
     guard: Option<MutexGuard<'db, Connection>>,
     row: AttestationRow,
     committed: bool,
+    /// Snapshotted from [`SlashingDb::take_injected_commit_failure`] at stage time.
+    inject_fail_commit: bool,
 }
 
 impl std::fmt::Debug for StagedAttestation<'_> {
@@ -233,6 +246,12 @@ impl<'db> StagedAttestation<'db> {
     /// Execute the staged INSERT (if not a duplicate re-sign) and commit the
     /// transaction.
     pub fn commit(mut self) -> Result<(), SlashingError> {
+        if self.inject_fail_commit {
+            return Err(SlashingError::MigrationFailed(
+                "injected commit failure (test-utils)".into(),
+            ));
+        }
+
         let guard = self.guard.as_mut().expect("guard is always Some before Drop");
 
         if !self.row.is_duplicate {
@@ -344,71 +363,13 @@ impl SlashingDb {
         // SQL error between `BEGIN IMMEDIATE` and the guard transfer would
         // drop the MutexGuard with the transaction still open, leaving the
         // connection in a broken "transaction within transaction" state.
-        let outcome = (|| -> Result<BlockStageOutcome, SlashingError> {
-            let watermark: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(wm) = watermark {
-                if (slot as i64) < wm {
-                    return Err(SlashingError::BelowBlockWatermark {
-                        slot,
-                        watermark_slot: wm as Slot,
-                    });
-                }
-            }
+        let outcome = (|| -> Result<BlockVerdict, SlashingError> {
+            let watermark = read_watermark(&guard, &pubkey, WatermarkKind::Block)?;
 
-            let existing: Option<Option<String>> = guard
-                .query_row(
-                    "SELECT signing_root FROM blocks \
-                     WHERE pubkey = ?1 AND slot = ?2",
-                    (&pubkey, slot as i64),
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            if let Some(existing_root) = existing {
-                let is_resign = match (&existing_root, &signing_root_hex) {
-                    (Some(er), Some(nr)) if er == nr => true,
-                    (None, None) if !strict => true,
-                    _ => false,
-                };
-                if !is_resign {
-                    // The decision is logged at debug; the terminal rejection is
-                    // logged once by the terminal caller (signer/gate/DVT error!)
-                    // per "log once at the layer that decides it is terminal".
-                    tracing::debug!(
-                        pubkey = %TruncatedPubkey::new(&pubkey),
-                        slot,
-                        rejection_reason = "double_block_proposal",
-                        "stage_block slashing check blocked"
-                    );
-                    return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
-                }
-                return Ok(BlockStageOutcome::Resign);
-            }
-
-            let min_slot: Option<i64> = guard
-                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", (&pubkey,), |row| {
-                    row.get(0)
-                })
-                .optional()?
-                .flatten();
-
-            if let Some(min) = min_slot {
-                if (slot as i64) < min {
-                    return Err(BlockSlashingViolation::SlotBelowMinimum {
-                        slot,
-                        min_slot: min as Slot,
-                    }
-                    .into());
-                }
-            }
-
-            Ok(BlockStageOutcome::Stage)
+            let history = TargetedSqlBlockHistory::new(&guard, &pubkey);
+            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
+            let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
+            check_block(&pubkey, &history, &watermarks, &candidate, strict)
         })();
 
         let outcome = match outcome {
@@ -423,6 +384,7 @@ impl SlashingDb {
         // `commit()` skip the INSERT but still close the transaction. A
         // `discard()` or bare drop issues `ROLLBACK`, which is harmless on
         // a read-only transaction.
+        let inject_fail_commit = self.take_injected_commit_failure();
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
@@ -430,9 +392,10 @@ impl SlashingDb {
                 slot,
                 signing_root: signing_root_hex,
                 gvr_hex,
-                is_resign: matches!(outcome, BlockStageOutcome::Resign),
+                is_resign: matches!(outcome, BlockVerdict::Resign),
             },
             committed: false,
+            inject_fail_commit,
         })
     }
 
@@ -478,153 +441,32 @@ impl SlashingDb {
         // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
         // funnels through a single ROLLBACK before we return.  See the
         // matching note in `stage_block`.
-        let outcome = (|| -> Result<bool, SlashingError> {
-            let wm_source: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(ws) = wm_source {
-                if (source_epoch as i64) < ws {
-                    return Err(SlashingError::BelowAttestationSourceWatermark {
-                        source_epoch,
-                        watermark_source: ws as Epoch,
-                    });
-                }
-            }
+        let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
+            let wm_source = read_watermark(&guard, &pubkey, WatermarkKind::AttestationSource)?;
+            let wm_target = read_watermark(&guard, &pubkey, WatermarkKind::AttestationTarget)?;
 
-            let wm_target: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(wt) = wm_target {
-                if (target_epoch as i64) < wt {
-                    return Err(SlashingError::BelowAttestationWatermark {
-                        target_epoch,
-                        watermark_target: wt as Epoch,
-                    });
-                }
-            }
-
-            let existing: Vec<(Epoch, Epoch, Option<String>)> = {
-                let mut stmt = guard.prepare(
-                    "SELECT source_epoch, target_epoch, signing_root \
-                     FROM attestations \
-                     WHERE pubkey = ?1",
-                )?;
-                let rows = stmt
-                    .query_map((&pubkey,), |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? as Epoch,
-                            row.get::<_, i64>(1)? as Epoch,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
+            let history = TargetedSqlAttestationHistory::new(&guard, &pubkey);
+            let watermarks = AttestationWatermarks {
+                source: wm_source.map(|w| w as Epoch),
+                target: wm_target.map(|w| w as Epoch),
             };
-
-            let mut is_duplicate = false;
-
-            for (existing_source, existing_target, existing_root) in &existing {
-                if target_epoch == *existing_target {
-                    match (existing_root, &signing_root_hex) {
-                        (Some(er), Some(nr)) if er == nr => {
-                            if source_epoch != *existing_source {
-                                tracing::warn!(
-                                    pubkey = %TruncatedPubkey::new(&pubkey),
-                                    target_epoch,
-                                    existing_source = *existing_source,
-                                    new_source = source_epoch,
-                                    "stage_attestation: same signing root but different source epoch"
-                                );
-                            }
-                            is_duplicate = true;
-                            continue;
-                        }
-                        (None, None) if !strict => {
-                            is_duplicate = true;
-                            continue;
-                        }
-                        _ => {
-                            tracing::debug!(
-                                pubkey = %TruncatedPubkey::new(&pubkey),
-                                source_epoch,
-                                target_epoch,
-                                rejection_reason = "double_vote",
-                                "stage_attestation slashing check blocked"
-                            );
-                            return Err(
-                                AttestationSlashingViolation::DoubleVote { target_epoch }.into()
-                            );
-                        }
-                    }
-                }
-
-                if source_epoch < *existing_source && target_epoch > *existing_target {
-                    tracing::debug!(
-                        pubkey = %TruncatedPubkey::new(&pubkey),
-                        source_epoch,
-                        target_epoch,
-                        rejection_reason = "surrounding_vote",
-                        "stage_attestation slashing check blocked"
-                    );
-                    return Err(AttestationSlashingViolation::SurroundingVote {
-                        new_source: source_epoch,
-                        new_target: target_epoch,
-                        existing_source: *existing_source,
-                        existing_target: *existing_target,
-                    }
-                    .into());
-                }
-
-                if *existing_source < source_epoch && *existing_target > target_epoch {
-                    tracing::debug!(
-                        pubkey = %TruncatedPubkey::new(&pubkey),
-                        source_epoch,
-                        target_epoch,
-                        rejection_reason = "surrounded_vote",
-                        "stage_attestation slashing check blocked"
-                    );
-                    return Err(AttestationSlashingViolation::SurroundedVote {
-                        new_source: source_epoch,
-                        new_target: target_epoch,
-                        existing_source: *existing_source,
-                        existing_target: *existing_target,
-                    }
-                    .into());
-                }
-            }
-
-            if !is_duplicate {
-                let min_target = existing.iter().map(|(_, t, _)| *t).min();
-                if let Some(min) = min_target {
-                    if target_epoch < min {
-                        return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
-                            target_epoch,
-                            min_target: min,
-                        }
-                        .into());
-                    }
-                }
-            }
-
-            Ok(is_duplicate)
+            let candidate = AttestationCandidate {
+                source_epoch,
+                target_epoch,
+                signing_root: signing_root_hex.clone(),
+            };
+            check_attestation(&pubkey, &history, &watermarks, &candidate, strict)
         })();
 
-        let is_duplicate = match outcome {
-            Ok(d) => d,
+        let verdict = match outcome {
+            Ok(v) => v,
             Err(e) => {
                 let _ = guard.execute_batch("ROLLBACK");
                 return Err(e);
             }
         };
 
+        let inject_fail_commit = self.take_injected_commit_failure();
         Ok(StagedAttestation {
             guard: Some(guard),
             row: AttestationRow {
@@ -633,9 +475,10 @@ impl SlashingDb {
                 target_epoch,
                 signing_root: signing_root_hex,
                 gvr_hex,
-                is_duplicate,
+                is_duplicate: matches!(verdict, AttestationVerdict::Duplicate),
             },
             committed: false,
+            inject_fail_commit,
         })
     }
 }

@@ -22,6 +22,9 @@
 //! full validator stack to be runnable; the gate behaviour is fully covered
 //! by these contract tests against the same helper.
 
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
+
 use crypto::insecure::{InsecureGate, InsecureMode};
 
 const ENV_VAR: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";

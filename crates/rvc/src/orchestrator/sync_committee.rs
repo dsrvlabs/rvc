@@ -4,23 +4,19 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use bn_manager::BeaconNodeClient;
-use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ContributionAndProof, SignedContributionAndProof, Slot, SyncCommitteeDuty};
-use signer::SignerService;
-use sync_service::is_sync_committee_aggregator;
+use eth_types::{
+    is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
+    SignedContributionAndProof, Slot, SyncCommitteeDuty,
+};
+use observability::logging::TruncatedRoot;
+use signer::{SignerService, ValidatorSigner};
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::slot_context::SlotContext;
 use super::utils;
-
-/// Total validators in a sync committee.
-const SYNC_COMMITTEE_SIZE: u64 = 512;
-
-/// Number of subnets the sync committee is split across.
-const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
 pub(crate) struct SyncCommitteeService {
     signer: Arc<SignerService>,
@@ -167,7 +163,7 @@ impl SyncCommitteeService {
             let subcommittee_indices: BTreeSet<u64> = duty
                 .validator_sync_committee_indices
                 .iter()
-                .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
+                .map(|&pos| subcommittee_index(pos))
                 .collect();
 
             for subcommittee_index in &subcommittee_indices {
@@ -306,14 +302,14 @@ impl SyncCommitteeService {
         let mut matching_pubkeys = Vec::new();
 
         for duty in duties {
-            if let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
+            if let Some(pk) = utils::find_pubkey_bytes(&self.pubkey_map, &duty.pubkey) {
                 // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
                 // `pk` is the already-resolved typed PublicKey — use its infallible
                 // `to_bytes()` instead of re-decoding the hex string (no fail-open).
                 let pk_bytes = pk.to_bytes();
                 if !self.validator_store.is_signing_enabled(&pk_bytes) {
                     warn!(
-                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                        pubkey = %TruncatedRoot::new(&duty.pubkey),
                         "Skipping sync committee duty: validator is inside the \
                          post-import doppelganger window (D-3)"
                     );
@@ -340,24 +336,12 @@ mod tests {
         },
     };
 
-    use async_trait::async_trait;
-    use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootData, BlockRootResponse, ConfigSpecResponse, DataResponse,
-        ExecutionOptimisticResponse, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
-        ProposerPreparation, SignedContributionAndProof as BeaconSignedContributionAndProof,
-        StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
-        SyncCommitteeDutiesResponse, SyncCommitteeMessage as BeaconSyncCommitteeMessage,
-        SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-        VersionedSignedAggregateAndProof,
-    };
+    use beacon::{BlockRootData, DataResponse, ExecutionOptimisticResponse};
+    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
-    use eth_types::{
-        ForkSchedule, Root, SignedBeaconBlock, SignedBlindedBeaconBlock,
-        SignedValidatorRegistration,
-    };
-    use signer::SignerService;
+    use eth_types::{ForkSchedule, Root, SyncCommitteeDuty};
+    use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
@@ -388,185 +372,122 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ToctouBeacon: tracks get_block_root calls and captures submitted messages.
-    //
-    // Used to prove that neither phase calls get_block_root after the H-5 fix.
-    // The mock returns r_from_bn_hex for any get_block_root call, which is
-    // intentionally different from the SlotContext's r_captured. If the
-    // production code were to call get_block_root, the counter would become
-    // non-zero and the submitted messages would contain the wrong root.
+    // Shared mock builders (RF4-24) — preserve Toctou / Contrib / Isolation behaviors.
     // -----------------------------------------------------------------------
-    struct ToctouBeacon {
-        /// Total calls to get_block_root — must be 0 after the fix.
+
+    /// TOCTOU mock: counts get_block_root, captures submitted message roots, serves duties.
+    fn toctou_beacon(
         get_block_root_call_count: Arc<AtomicUsize>,
-        /// beacon_block_root values from submitted sync committee messages.
         submitted_roots: Arc<Mutex<Vec<Root>>>,
-        /// Root the BN would return for head queries (different from SlotContext's root).
         r_from_bn_hex: String,
-        /// Pubkey for the duty entry returned from post_sync_committee_duties.
-        duty_pubkey: String,
+        duty_pubkey: [u8; 48],
+    ) -> MockBeaconNodeClient {
+        let count = Arc::clone(&get_block_root_call_count);
+        let roots = Arc::clone(&submitted_roots);
+        MockBeaconNodeClient::new()
+            .with_get_block_root(move |_block_id| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(DataResponse { data: BlockRootData { root: r_from_bn_hex.clone() } })
+            })
+            .with_post_sync_committee_duties(move |_epoch, _indices| {
+                Ok(ExecutionOptimisticResponse {
+                    execution_optimistic: false,
+                    data: vec![SyncCommitteeDuty {
+                        pubkey: duty_pubkey,
+                        validator_index: 1,
+                        validator_sync_committee_indices: vec![0],
+                    }],
+                })
+            })
+            .with_submit_sync_committee_messages(move |messages| {
+                let mut guard = roots.lock().unwrap();
+                for msg in messages {
+                    guard.push(msg.beacon_block_root);
+                }
+                Ok(())
+            })
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
     }
 
-    #[async_trait]
-    impl BeaconNodeClient for ToctouBeacon {
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            self.get_block_root_call_count.fetch_add(1, Ordering::SeqCst);
-            Ok(DataResponse { data: BlockRootData { root: self.r_from_bn_hex.clone() } })
-        }
-
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Ok(ExecutionOptimisticResponse {
-                execution_optimistic: false,
-                data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey.clone(),
-                    validator_index: 1,
-                    validator_sync_committee_indices: vec![0],
-                }],
+    /// Contrib-gate mock: counts get_sync_committee_contribution fetches.
+    fn contrib_gate_beacon(
+        contrib_fetch_calls: Arc<AtomicUsize>,
+        duty_pubkey: [u8; 48],
+    ) -> MockBeaconNodeClient {
+        let calls = Arc::clone(&contrib_fetch_calls);
+        MockBeaconNodeClient::new()
+            .with_post_sync_committee_duties(move |_epoch, _indices| {
+                Ok(ExecutionOptimisticResponse {
+                    execution_optimistic: false,
+                    data: vec![SyncCommitteeDuty {
+                        pubkey: duty_pubkey,
+                        validator_index: 1,
+                        validator_sync_committee_indices: vec![0],
+                    }],
+                })
             })
-        }
+            .with_get_sync_committee_contribution(move |slot, subcommittee_index, _root| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(DataResponse {
+                    data: eth_types::SyncCommitteeContribution {
+                        slot,
+                        beacon_block_root: [0xAA; 32],
+                        subcommittee_index,
+                        aggregation_bits: vec![0xFF, 0x01],
+                        signature: vec![0u8; 96],
+                    },
+                })
+            })
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
+    }
 
-        async fn submit_sync_committee_messages(
-            &self,
-            messages: &[BeaconSyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            let mut roots = self.submitted_roots.lock().unwrap();
-            for msg in messages {
-                roots.push(msg.beacon_block_root);
-            }
-            Ok(())
-        }
-
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_validators(
-            &self,
-            _pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(
-            &self,
-            _epoch: u64,
-        ) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _slot: u64,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(
-            &self,
-            _signed_block: &SignedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _signed_blinded_block: &SignedBlindedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _attestations: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _slot: u64,
-            _attestation_data_root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _slot: u64,
-            _subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _proofs: &[BeaconSignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Ok(())
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
+    /// Multi-validator isolation mock for H-6.
+    fn isolation_beacon(
+        duties: Vec<SyncCommitteeDuty>,
+        submitted_message_indices: Arc<Mutex<Vec<u64>>>,
+        contrib_fetch_calls: Arc<AtomicUsize>,
+        submitted_proof_count: Arc<AtomicUsize>,
+    ) -> MockBeaconNodeClient {
+        let indices = Arc::clone(&submitted_message_indices);
+        let contrib = Arc::clone(&contrib_fetch_calls);
+        let proofs = Arc::clone(&submitted_proof_count);
+        MockBeaconNodeClient::new()
+            .with_post_sync_committee_duties(move |_epoch, _indices| {
+                Ok(ExecutionOptimisticResponse {
+                    execution_optimistic: false,
+                    data: duties.clone(),
+                })
+            })
+            .with_submit_sync_committee_messages(move |messages| {
+                let mut guard = indices.lock().unwrap();
+                for msg in messages {
+                    guard.push(msg.validator_index);
+                }
+                Ok(())
+            })
+            .with_get_sync_committee_contribution(move |slot, subcommittee_index, _root| {
+                contrib.fetch_add(1, Ordering::SeqCst);
+                Ok(DataResponse {
+                    data: eth_types::SyncCommitteeContribution {
+                        slot,
+                        beacon_block_root: [0xAA; 32],
+                        subcommittee_index,
+                        aggregation_bits: vec![0xFF, 0x01],
+                        signature: vec![0u8; 96],
+                    },
+                })
+            })
+            .with_submit_contribution_and_proofs(move |ps| {
+                proofs.fetch_add(ps.len(), Ordering::SeqCst);
+                Ok(())
+            })
     }
 
     // -----------------------------------------------------------------------
-    // Setup helper: creates a SyncCommitteeService with a real BLS key and
-    // a ToctouBeacon mock with pre-loaded duties.
+    // Setup helper: SyncCommitteeService with a real BLS key and shared mock.
     // -----------------------------------------------------------------------
     async fn setup_service(
-        beacon: Arc<ToctouBeacon>,
+        beacon: Arc<dyn BeaconNodeClient>,
         pk_hex: String,
         pk: crypto::PublicKey,
         sk: SecretKey,
@@ -582,8 +503,8 @@ mod tests {
     }
 
     async fn setup_service_with_store(
-        beacon: Arc<ToctouBeacon>,
-        pk_hex: String,
+        beacon: Arc<dyn BeaconNodeClient>,
+        _pk_hex: String,
         pk: crypto::PublicKey,
         sk: SecretKey,
         validator_store: Arc<ValidatorStore>,
@@ -600,14 +521,15 @@ mod tests {
         let local_signer = LocalSigner::new(key_manager);
         let composite = Arc::new(CompositeSigner::new(local_signer));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         // Pre-populate sync committee duties for period 0 (epoch 0 / 256 = 0)
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(pk_hex, pk);
+        map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         SyncCommitteeService::new(
@@ -647,12 +569,12 @@ mod tests {
         let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
         let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(ToctouBeacon {
-            get_block_root_call_count: get_block_root_call_count.clone(),
-            submitted_roots: submitted_roots.clone(),
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            get_block_root_call_count.clone(),
+            submitted_roots.clone(),
             r_from_bn_hex,
-            duty_pubkey: pk_hex.clone(),
-        });
+            pk.to_bytes(),
+        ));
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
@@ -699,13 +621,12 @@ mod tests {
         let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
         let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(ToctouBeacon {
-            get_block_root_call_count: get_block_root_call_count.clone(),
-            submitted_roots: submitted_roots.clone(),
-            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .to_string(),
-            duty_pubkey: pk_hex.clone(),
-        });
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            get_block_root_call_count.clone(),
+            submitted_roots.clone(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pk.to_bytes(),
+        ));
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
@@ -737,13 +658,12 @@ mod tests {
         let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
         let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(ToctouBeacon {
-            get_block_root_call_count: get_block_root_call_count.clone(),
-            submitted_roots: submitted_roots.clone(),
-            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .to_string(),
-            duty_pubkey: pk_hex.clone(),
-        });
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            get_block_root_call_count.clone(),
+            submitted_roots.clone(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pk.to_bytes(),
+        ));
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
@@ -772,13 +692,12 @@ mod tests {
         let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
         let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
 
-        let beacon = Arc::new(ToctouBeacon {
-            get_block_root_call_count: get_block_root_call_count.clone(),
-            submitted_roots: submitted_roots.clone(),
-            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .to_string(),
-            duty_pubkey: pk_hex.clone(),
-        });
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            get_block_root_call_count.clone(),
+            submitted_roots.clone(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pk_bytes,
+        ));
 
         // Set up a store where the validator is disabled (doppelganger window).
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
@@ -810,166 +729,6 @@ mod tests {
     // selected as a sync committee aggregator — `get_sync_committee_contribution`
     // is called, incrementing the counter.
     // -----------------------------------------------------------------------
-
-    struct ContribGateBeacon {
-        /// Counts calls to `get_sync_committee_contribution`.
-        /// Must be 0 in GREEN (gate fires); > 0 in RED (validator passes filter
-        /// AND is selected as aggregator).
-        contrib_fetch_calls: Arc<AtomicUsize>,
-        duty_pubkey: String,
-    }
-
-    #[async_trait]
-    impl BeaconNodeClient for ContribGateBeacon {
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Ok(ExecutionOptimisticResponse {
-                execution_optimistic: false,
-                data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey.clone(),
-                    validator_index: 1,
-                    validator_sync_committee_indices: vec![0],
-                }],
-            })
-        }
-
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[BeaconSyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn get_sync_committee_contribution(
-            &self,
-            slot: u64,
-            subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            self.contrib_fetch_calls.fetch_add(1, Ordering::SeqCst);
-            // Return a valid (stub) contribution so the signing path continues
-            // and we can observe whether `submit_contribution_and_proofs` is reached.
-            Ok(DataResponse {
-                data: eth_types::SyncCommitteeContribution {
-                    slot,
-                    beacon_block_root: [0xAA; 32],
-                    subcommittee_index,
-                    aggregation_bits: vec![0xFF, 0x01],
-                    signature: vec![0u8; 96],
-                },
-            })
-        }
-
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[BeaconSignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Ok(())
-        }
-
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
 
     /// Returns a `(SecretKey, PublicKey)` pair that is deterministically
     /// selected as a sync committee aggregator for slot=0 / subcommittee=0
@@ -1018,14 +777,12 @@ mod tests {
         // proof is signed, `is_sync_committee_aggregator` returns true, and
         // `get_sync_committee_contribution` is reached — incrementing the counter.
         let (sk, pk) = find_aggregator_sk();
-        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let _pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
         let pk_bytes: [u8; 48] = pk.to_bytes();
 
         let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
-        let beacon = Arc::new(ContribGateBeacon {
-            contrib_fetch_calls: contrib_fetch_calls.clone(),
-            duty_pubkey: pk_hex.clone(),
-        });
+        let beacon: Arc<dyn BeaconNodeClient> =
+            Arc::new(contrib_gate_beacon(contrib_fetch_calls.clone(), pk_bytes));
 
         // Validator is disabled (inside post-import doppelganger window).
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
@@ -1039,13 +796,14 @@ mod tests {
         let local_signer = LocalSigner::new(key_manager);
         let composite = Arc::new(CompositeSigner::new(local_signer));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(pk_hex, pk);
+        map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         let service = SyncCommitteeService::new(
@@ -1073,6 +831,200 @@ mod tests {
             0,
             "D-3: get_sync_committee_contribution must not be called for a disabled \
              validator (is_signing_enabled=false)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H-6 (RF2-01 port): multi-validator sign-failure isolation.
+    //
+    // Ported from the deleted `sync-service` twin suite
+    // (`test_one_signer_failure_does_not_abort_others` and related). One
+    // validator's KeyNotFound must not abort the slot: other validators still
+    // produce, and the phase returns (does not panic / propagate).
+    // -----------------------------------------------------------------------
+
+    /// H-6: three validators A/B/C on the messages path; B's secret key is absent
+    /// from the KeyManager (KeyNotFound). A and C must still submit; the phase
+    /// must complete without aborting the remaining validators.
+    #[tokio::test]
+    async fn test_h6_one_signer_failure_does_not_abort_sync_messages() {
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let sk_c = SecretKey::generate();
+        let pk_a = sk_a.public_key();
+        let pk_b = sk_b.public_key();
+        let pk_c = sk_c.public_key();
+        let _hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let _hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let _hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+
+        let duties = vec![
+            SyncCommitteeDuty {
+                pubkey: pk_a.to_bytes(),
+                validator_index: 10,
+                validator_sync_committee_indices: vec![0],
+            },
+            SyncCommitteeDuty {
+                pubkey: pk_b.to_bytes(),
+                validator_index: 11,
+                validator_sync_committee_indices: vec![1],
+            },
+            SyncCommitteeDuty {
+                pubkey: pk_c.to_bytes(),
+                validator_index: 12,
+                validator_sync_committee_indices: vec![2],
+            },
+        ];
+
+        let submitted_message_indices = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(isolation_beacon(
+            duties,
+            submitted_message_indices.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        ));
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        for pk in [&pk_a, &pk_b, &pk_c] {
+            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        }
+
+        // KeyManager holds A and C only — B signs with KeyNotFound.
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk_a);
+        key_manager.insert(sk_c);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(pk_a.to_bytes(), pk_a);
+        map.insert(pk_b.to_bytes(), pk_b);
+        map.insert(pk_c.to_bytes(), pk_c);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        // Must complete without panic / hang — isolation property.
+        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+
+        let mut indices = submitted_message_indices.lock().unwrap().clone();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![10, 12],
+            "H-6: A and C must submit messages; B (KeyNotFound) must be skipped"
+        );
+    }
+
+    /// H-6: three aggregator-eligible validators on the contributions path; B's
+    /// secret key is absent. Selection-proof signing fails for B with continue;
+    /// A and C must still fetch contributions and submit proofs.
+    #[tokio::test]
+    async fn test_h6_one_signer_failure_does_not_abort_sync_contributions() {
+        let (sk_a, pk_a) = find_aggregator_sk();
+        let sk_b = SecretKey::generate();
+        let pk_b = sk_b.public_key();
+        let (sk_c, pk_c) = find_aggregator_sk();
+        let _hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let _hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let _hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+
+        // Distinct subcommittees (pos 0 / 128 / 256 → subnet 0 / 1 / 2). For A
+        // and C we still need aggregator selection on their subcommittee.
+        // find_aggregator_sk is for subcommittee 0 only — put A and C on
+        // subcommittee 0 (indices 0 and 1) and B on the same path so B's
+        // selection-proof KeyNotFound is the isolation fault.
+        let duties = vec![
+            SyncCommitteeDuty {
+                pubkey: pk_a.to_bytes(),
+                validator_index: 10,
+                validator_sync_committee_indices: vec![0],
+            },
+            SyncCommitteeDuty {
+                pubkey: pk_b.to_bytes(),
+                validator_index: 11,
+                validator_sync_committee_indices: vec![1],
+            },
+            SyncCommitteeDuty {
+                pubkey: pk_c.to_bytes(),
+                validator_index: 12,
+                validator_sync_committee_indices: vec![2],
+            },
+        ];
+
+        let submitted_message_indices = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let submitted_proof_count = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(isolation_beacon(
+            duties,
+            submitted_message_indices,
+            contrib_fetch_calls.clone(),
+            submitted_proof_count.clone(),
+        ));
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        for pk in [&pk_a, &pk_b, &pk_c] {
+            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        }
+
+        // KeyManager holds A and C only — B's selection proof fails KeyNotFound.
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk_a);
+        key_manager.insert(sk_c);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(pk_a.to_bytes(), pk_a);
+        map.insert(pk_b.to_bytes(), pk_b);
+        map.insert(pk_c.to_bytes(), pk_c);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+
+        // A and C are aggregators for subcommittee 0 → two contribution fetches
+        // and two submitted proofs. B skipped after selection-proof KeyNotFound.
+        assert_eq!(
+            contrib_fetch_calls.load(Ordering::SeqCst),
+            2,
+            "H-6: contribution fetch must run for A and C only"
+        );
+        assert_eq!(
+            submitted_proof_count.load(Ordering::SeqCst),
+            2,
+            "H-6: proofs from A and C must be submitted; B must not abort the loop"
         );
     }
 }

@@ -1,4 +1,8 @@
-#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+#![allow(clippy::disallowed_methods)]
+// Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -6,12 +10,12 @@ use std::sync::Arc;
 use crypto::typed_signer::{SignContext, TypedSigner};
 use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey, Signer, SigningError};
 use eth_types::{BeaconBlock, ForkInfo};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rvc_grpc_signer::{
     GrpcRemoteSigner, GrpcRemoteSignerConfig, SignerServiceServerV2, SignerServiceV2,
 };
+use rvc_test_support::TestPki;
 use tokio::net::TcpListener;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::{Request, Response, Status};
 
 // V2 proto types needed for the mock implementation
@@ -72,7 +76,7 @@ impl SignerServiceV2 for TestSignerServiceV2 {
     // ── Signing RPCs — Unimplemented in the test mock ────────────────────────
     // The integration tests only exercise the connect path (list_public_keys)
     // and the client-side key-not-found guard (no RPC sent).  Full signing
-    // round-trips are covered by the rvc-signer-bin integration tests.
+    // round-trips are covered by the rvc-signer-server integration tests.
 
     async fn sign_beacon_block(
         &self,
@@ -146,44 +150,6 @@ impl SignerServiceV2 for TestSignerServiceV2 {
 }
 
 // ---------------------------------------------------------------------------
-// TLS certificate generation helpers
-// ---------------------------------------------------------------------------
-
-struct TestPki {
-    ca_cert_pem: Vec<u8>,
-    server_cert_pem: Vec<u8>,
-    server_key_pem: Vec<u8>,
-    client_cert_pem: Vec<u8>,
-    client_key_pem: Vec<u8>,
-}
-
-fn generate_test_pki() -> TestPki {
-    // CA
-    let mut ca_params = CertificateParams::new(vec!["rvc-test-ca".to_string()]).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    // Server cert signed by CA (SAN = localhost)
-    let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    let server_key = KeyPair::generate().unwrap();
-    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
-
-    // Client cert signed by same CA
-    let client_params = CertificateParams::new(vec!["rvc-client".to_string()]).unwrap();
-    let client_key = KeyPair::generate().unwrap();
-    let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
-
-    TestPki {
-        ca_cert_pem: ca_cert.pem().into_bytes(),
-        server_cert_pem: server_cert.pem().into_bytes(),
-        server_key_pem: server_key.serialize_pem().into_bytes(),
-        client_cert_pem: client_cert.pem().into_bytes(),
-        client_key_pem: client_key.serialize_pem().into_bytes(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Server helpers — serve only the v2 SignerService (matching production)
 // ---------------------------------------------------------------------------
 
@@ -191,25 +157,10 @@ async fn start_mtls_server(
     service: TestSignerServiceV2,
     pki: &TestPki,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let tls_config = ServerTlsConfig::new()
-        .identity(Identity::from_pem(&pki.server_cert_pem, &pki.server_key_pem))
-        .client_ca_root(Certificate::from_pem(&pki.ca_cert_pem));
-
-    let handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .tls_config(tls_config)
-            .unwrap()
-            .add_service(SignerServiceServerV2::new(service))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    (addr, handle)
+    rvc_test_support::start_mtls_server(pki, move |mut server| {
+        server.add_service(SignerServiceServerV2::new(service))
+    })
+    .await
 }
 
 async fn start_plaintext_server(
@@ -250,6 +201,7 @@ fn test_sign_ctx(pk: crypto::PublicKey) -> SignContext {
             current_version: [0x00, 0x00, 0x00, 0x00], // Phase0
             genesis_validators_root: [0xaa; 32],
         },
+        fork_name: eth_types::ForkName::Phase0,
     }
 }
 
@@ -263,7 +215,7 @@ async fn test_e2e_connect_and_list_keys_with_mtls() {
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     let config = create_mtls_config(addr, &pki);
@@ -282,7 +234,7 @@ async fn test_e2e_connect_and_list_keys_with_mtls() {
 #[tokio::test]
 async fn test_mtls_rejects_client_without_cert() {
     let sk = SecretKey::generate();
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     // Connect with only CA cert (no client identity) — should fail
@@ -314,11 +266,11 @@ async fn test_mtls_rejects_client_without_cert() {
 #[tokio::test]
 async fn test_mtls_rejects_client_with_wrong_ca() {
     let sk = SecretKey::generate();
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     // Generate a completely separate PKI (different CA)
-    let rogue_pki = generate_test_pki();
+    let rogue_pki = TestPki::new();
 
     let config = create_mtls_config(addr, &rogue_pki);
     let result = GrpcRemoteSigner::connect(config).await;
@@ -336,7 +288,7 @@ async fn test_unknown_key_returns_key_not_found() {
     let unknown_sk = SecretKey::generate();
     let unknown_pk = unknown_sk.public_key();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     let config = create_mtls_config(addr, &pki);
@@ -372,7 +324,7 @@ async fn test_list_public_keys_returns_all() {
     let pk1 = sk1.public_key().to_bytes();
     let pk2 = sk2.public_key().to_bytes();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk1, sk2]), &pki).await;
 
     let config = create_mtls_config(addr, &pki);
@@ -393,7 +345,7 @@ async fn test_get_status_via_raw_client() {
     let sk1 = SecretKey::generate();
     let sk2 = SecretKey::generate();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk1, sk2]), &pki).await;
 
     // Use raw v2 gRPC client to call GetStatus
@@ -429,7 +381,7 @@ async fn test_composite_signer_registers_grpc_remote_keys() {
     let grpc_pk = grpc_sk.public_key();
     let grpc_pk_bytes = grpc_pk.to_bytes();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![grpc_sk]), &pki).await;
 
     let config = create_mtls_config(addr, &pki);
@@ -456,7 +408,7 @@ async fn test_composite_signer_grpc_remote_takes_priority_over_local_in_key_list
     let sk_bytes = sk.to_bytes();
     let pk_bytes = sk.public_key().to_bytes();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     let config = create_mtls_config(addr, &pki);
@@ -525,7 +477,7 @@ async fn test_e2e_multiple_keys_mtls() {
     let pk2_bytes = sk2.public_key().to_bytes();
     let pk3_bytes = sk3.public_key().to_bytes();
 
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) =
         start_mtls_server(TestSignerServiceV2::new(vec![sk1, sk2, sk3]), &pki).await;
 
@@ -541,7 +493,7 @@ async fn test_e2e_multiple_keys_mtls() {
 #[tokio::test]
 async fn test_connect_strips_trailing_slash() {
     let sk = SecretKey::generate();
-    let pki = generate_test_pki();
+    let pki = TestPki::new();
     let (addr, _handle) = start_mtls_server(TestSignerServiceV2::new(vec![sk]), &pki).await;
 
     let config = GrpcRemoteSignerConfig::new(format!("https://localhost:{}/", addr.port()))

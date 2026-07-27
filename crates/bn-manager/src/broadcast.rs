@@ -7,7 +7,7 @@ use beacon::BeaconError;
 pub struct BnOutcome<T = ()> {
     pub endpoint: String,
     pub result: Result<T, BeaconError>,
-    #[allow(dead_code)]
+    /// Wall-clock duration of this BN attempt (used in partial-failure logs).
     pub latency: Duration,
 }
 

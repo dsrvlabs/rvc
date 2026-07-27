@@ -9,11 +9,13 @@
 //! the row is only committed if `signer.sign` succeeds; on signer failure
 //! `discard()` rolls the transaction back, leaving the DB pristine.
 
+mod common;
+
 use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
-use rvc_signer::SignerService;
+use rvc_signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -59,7 +61,8 @@ async fn test_signer_failure_does_not_commit_row_attestation() {
     // Signer with no keys — signing will fail with KeyNotFound.
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -86,7 +89,8 @@ async fn test_signer_failure_does_not_commit_row_attestation() {
 async fn test_signer_failure_does_not_commit_row_block() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -122,7 +126,8 @@ async fn test_retry_after_signer_failure_succeeds() {
     // First call: signer with no key.
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let data_first = make_attestation_data(10, 11);
     let fs = make_fork_schedule();
@@ -138,7 +143,8 @@ async fn test_retry_after_signer_failure_succeeds() {
     let mut manager = KeyManager::new();
     manager.insert(sk);
     let real_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
-    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db));
+    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let data_retry = make_attestation_data(10, 11);
     let ok_result = service_ok.sign_attestation(&data_retry, &pubkey, &fs, &GVR).await;
@@ -169,7 +175,8 @@ async fn test_successful_sign_commits_row_and_double_vote_rejected() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let data_first = make_attestation_data(20, 30);
     let fs = make_fork_schedule();
@@ -195,8 +202,8 @@ async fn test_successful_sign_commits_row_and_double_vote_rejected() {
     let conflict = service.sign_attestation(&data_conflict, &pubkey, &fs, &GVR).await;
     assert!(conflict.is_err(), "conflicting sign must be rejected as DoubleVote after commit");
     match conflict.err().unwrap() {
-        rvc_signer::SignerError::SlashingProtectionBlocked(_) => {}
-        other => panic!("expected SlashingProtectionBlocked, got: {other}"),
+        rvc_signer::SignerError::SlashingBlocked(_) => {}
+        other => panic!("expected SlashingBlocked, got: {other}"),
     }
 }
 
@@ -211,7 +218,8 @@ async fn test_successful_sign_block_commits_row_and_double_proposal_rejected() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let block_root_a: Root = [0xaa; 32];
     let slot = 200u64;
@@ -230,7 +238,7 @@ async fn test_successful_sign_block_commits_row_and_double_proposal_rejected() {
     let conflict = service.sign_block(&block_root_b, slot, &pubkey, &fs, &GVR).await;
     assert!(conflict.is_err(), "double block proposal must be rejected");
     match conflict.err().unwrap() {
-        rvc_signer::SignerError::SlashingProtectionBlocked(_) => {}
-        other => panic!("expected SlashingProtectionBlocked, got: {other}"),
+        rvc_signer::SignerError::SlashingBlocked(_) => {}
+        other => panic!("expected SlashingBlocked, got: {other}"),
     }
 }

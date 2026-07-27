@@ -5,34 +5,12 @@
 //! the slashing DB at all.  This test asserts that the DB remains empty after
 //! a successful `sign_aggregate_and_proof` call, pinning the invariant.
 
+mod common;
+
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
-use doppelganger::SigningEnablement;
+use crypto::SecretKey;
 use eth_types::Root;
-use rvc_signer::{SigningGate, ValidatorLockMap};
-use slashing::SlashingDb;
-
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-
-fn make_gate(sk: SecretKey, db: Arc<SlashingDb>) -> (PublicKey, SigningGate) {
-    let pubkey = sk.public_key();
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let gate = SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    );
-    (pubkey, gate)
-}
 
 /// SS-2/SS-3 invariant: a successful `sign_aggregate_and_proof` must return a
 /// 96-byte signature AND leave BOTH the attestation table and the block table
@@ -43,8 +21,8 @@ fn make_gate(sk: SecretKey, db: Arc<SlashingDb>) -> (PublicKey, SigningGate) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sign_aggregate_and_proof_no_slashing_row_committed() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_allowed(sk, Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     let signing_root: Root = [0xaa; 32];

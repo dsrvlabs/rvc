@@ -538,7 +538,8 @@ mod tests {
 
         let parent_root = [0xa1; 32];
         let state_root = [0xa2; 32];
-        let body = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        // Valid Electra body so tree_hash_root (typed body leaf, SEC-6c) succeeds.
+        let body = eth_types::external_vector_electra_body().as_ssz_bytes();
 
         let block_ssz = build_beacon_block_ssz(1234, 567, parent_root, state_root, &body);
         let block_len = block_ssz.len() as u32;
@@ -672,7 +673,7 @@ mod tests {
 
         let parent_root = [0xaa; 32];
         let state_root = [0xbb; 32];
-        let body = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let body = eth_types::external_vector_electra_body().as_ssz_bytes();
 
         let expected = BeaconBlock {
             slot: 999,

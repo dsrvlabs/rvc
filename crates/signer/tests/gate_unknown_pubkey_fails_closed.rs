@@ -8,14 +8,15 @@
 //! This test is intentionally reused by Issue 2.11; keep its assertions about
 //! the fail-closed semantic stable.
 
+mod common;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
+use crypto::{PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
-use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
+use rvc_signer::SigningGateError;
 
 /// A `SigningEnablement` mock that only allows a pre-registered set of pubkeys.
 /// Any unknown pubkey returns `false` — the fail-closed default.
@@ -36,22 +37,6 @@ impl SigningEnablement for KnownOnlyEnablement {
     }
 }
 
-fn make_gate(
-    signer_sk: SecretKey,
-    db: Arc<SlashingDb>,
-    enablement: Arc<dyn SigningEnablement>,
-) -> SigningGate {
-    let mut km = KeyManager::new();
-    km.insert(signer_sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    SigningGate::new(
-        Arc::clone(&db),
-        enablement,
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    )
-}
-
 const GVR: Root = [0xd3; 32];
 
 /// Slashable path (sign_block): an unregistered pubkey must be refused
@@ -66,11 +51,11 @@ async fn test_unknown_pubkey_slashable_path_fails_closed() {
     let unknown_sk = SecretKey::generate();
     let unknown_pubkey = unknown_sk.public_key();
 
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
     let enablement = Arc::new(KnownOnlyEnablement::new([known_pubkey]));
 
     // Signer only has the "known" key, but we sign for the unknown pubkey.
-    let gate = make_gate(known_sk, Arc::clone(&db), enablement);
+    let (_, gate) = common::gate_fixture(known_sk, Arc::clone(&db), enablement);
 
     let result = gate.sign_block(&unknown_pubkey, 42, [0xfe; 32], GVR, "test").await;
 
@@ -98,10 +83,10 @@ async fn test_unknown_pubkey_nonslashable_path_fails_closed() {
     let unknown_sk = SecretKey::generate();
     let unknown_pubkey = unknown_sk.public_key();
 
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
     let enablement = Arc::new(KnownOnlyEnablement::new([known_pubkey]));
 
-    let gate = make_gate(known_sk, Arc::clone(&db), enablement);
+    let (_, gate) = common::gate_fixture(known_sk, Arc::clone(&db), enablement);
 
     let signing_root: Root = [0xef; 32];
     let result = gate.sign_randao_reveal(&unknown_pubkey, signing_root).await;

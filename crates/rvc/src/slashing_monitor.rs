@@ -1,42 +1,44 @@
 //! Background task that monitors validators for slashing events.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use bn_manager::BeaconNodeClient;
 use metrics::definitions::RVC_VALIDATORS_SLASHED_TOTAL;
-use tokio::sync::watch;
-use tracing::{debug, error, warn};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use validator_store::ValidatorStore;
 
+/// Re-export config-typed enum so callers keep a single definition.
+pub use crate::config::SlashedAction;
+
+/// Result of a single slashed-validator check pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashedAction {
-    DisableOnly,
-    Shutdown,
-    None,
+pub enum SlashedOutcome {
+    /// No configured shutdown action was taken (including disable-only success).
+    NoAction,
+    /// A slashed validator was found and the action is [`SlashedAction::Shutdown`].
+    ShutdownRequested,
 }
 
-impl std::str::FromStr for SlashedAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "disable-only" => Ok(Self::DisableOnly),
-            "shutdown" => Ok(Self::Shutdown),
-            "none" => Ok(Self::None),
-            other => Err(format!(
-                "invalid slashed-validators-action '{}': must be one of disable-only, shutdown, none",
-                other
-            )),
-        }
-    }
+/// Epoch interval between slashing checks (`SECONDS_PER_SLOT * SLOTS_PER_EPOCH`).
+pub fn epoch_check_interval() -> Duration {
+    Duration::from_secs(eth_types::SECONDS_PER_SLOT.saturating_mul(eth_types::SLOTS_PER_EPOCH))
 }
 
+/// Query enabled validators and apply the configured slashed action.
+///
+/// Returns [`SlashedOutcome::ShutdownRequested`] when a slashed validator is
+/// found and `action` is [`SlashedAction::Shutdown`]; otherwise
+/// [`SlashedOutcome::NoAction`]. Beacon errors fail open.
 pub async fn check_slashed_validators(
     beacon: &dyn BeaconNodeClient,
     validator_store: &ValidatorStore,
     action: SlashedAction,
-    shutdown_tx: &watch::Sender<bool>,
-) {
+) -> SlashedOutcome {
     if action == SlashedAction::None {
-        return;
+        return SlashedOutcome::NoAction;
     }
 
     let pubkeys: Vec<String> = validator_store
@@ -47,14 +49,14 @@ pub async fn check_slashed_validators(
 
     if pubkeys.is_empty() {
         debug!("No enabled validators to check for slashing");
-        return;
+        return SlashedOutcome::NoAction;
     }
 
     let validators = match beacon.get_validators(&pubkeys).await {
         Ok(resp) => resp.data,
         Err(e) => {
             warn!(error = %e, "Failed to query beacon node for validator statuses (fail-open)");
-            return;
+            return SlashedOutcome::NoAction;
         }
     };
 
@@ -84,187 +86,80 @@ pub async fn check_slashed_validators(
                 }
                 SlashedAction::Shutdown => {
                     error!("Shutting down due to slashed validator detection");
-                    let _ = shutdown_tx.send(true);
-                    return;
+                    return SlashedOutcome::ShutdownRequested;
                 }
                 SlashedAction::None => unreachable!(),
             }
         }
     }
+
+    SlashedOutcome::NoAction
+}
+
+/// Spawn the background epoch-tick slashing monitor.
+///
+/// When a check returns [`SlashedOutcome::ShutdownRequested`], cancels
+/// `shutdown_token` so the main runtime `select!` can exit cleanly.
+///
+/// Does nothing (returns a finished handle) when `action` is
+/// [`SlashedAction::None`].
+pub fn spawn(
+    beacon: Arc<dyn BeaconNodeClient>,
+    store: Arc<ValidatorStore>,
+    action: SlashedAction,
+    shutdown_token: CancellationToken,
+) -> JoinHandle<()> {
+    spawn_with_interval(beacon, store, action, shutdown_token, epoch_check_interval())
+}
+
+fn spawn_with_interval(
+    beacon: Arc<dyn BeaconNodeClient>,
+    store: Arc<ValidatorStore>,
+    action: SlashedAction,
+    shutdown_token: CancellationToken,
+    interval: Duration,
+) -> JoinHandle<()> {
+    if action == SlashedAction::None {
+        return tokio::spawn(async {});
+    }
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown_token.cancelled() => {
+                    debug!("Slashing monitor shutting down");
+                    break;
+                }
+            }
+
+            let outcome = check_slashed_validators(beacon.as_ref(), store.as_ref(), action).await;
+
+            if outcome == SlashedOutcome::ShutdownRequested {
+                info!("Slashing monitor requested process shutdown");
+                shutdown_token.cancel();
+                break;
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-        ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingResponse, ValidatorData, ValidatorInfo, ValidatorsResponse,
-        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    };
-    use eth_types::{
-        ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
-    };
+    use beacon::{ValidatorData, ValidatorInfo, ValidatorsResponse};
+    use bn_manager::MockBeaconNodeClient;
 
-    struct MockBeacon {
-        validators: Vec<ValidatorData>,
-        should_fail: bool,
+    fn mock_with_validators(validators: Vec<ValidatorData>) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_validators(move |_pubkeys| {
+            Ok(ValidatorsResponse { data: validators.clone() })
+        })
     }
 
-    impl MockBeacon {
-        fn new(validators: Vec<ValidatorData>) -> Self {
-            Self { validators, should_fail: false }
-        }
-
-        fn failing() -> Self {
-            Self { validators: vec![], should_fail: true }
-        }
-    }
-
-    #[async_trait]
-    impl BeaconNodeClient for MockBeacon {
-        async fn get_validators(
-            &self,
-            _pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            if self.should_fail {
-                return Err(BeaconError::HttpError("mock failure".to_string()));
-            }
-            Ok(ValidatorsResponse { data: self.validators.clone() })
-        }
-
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(
-            &self,
-            _epoch: u64,
-        ) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _slot: u64,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(
-            &self,
-            _signed_block: &SignedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _signed_blinded_block: &SignedBlindedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _attestations: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _slot: u64,
-            _attestation_data_root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_sync_committee_messages(
-            &self,
-            _messages: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _slot: u64,
-            _subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _proofs: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
+    fn mock_failing() -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_validators(|_| {
+            Err(beacon::BeaconError::HttpError("mock failure".to_string()))
+        })
     }
 
     fn test_pubkey() -> [u8; 48] {
@@ -285,73 +180,78 @@ mod tests {
     #[tokio::test]
     async fn test_slashed_validator_disables() {
         let pk = test_pubkey();
-        let beacon = MockBeacon::new(vec![make_validator_data(&pk, "active_slashed")]);
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(!store.list_enabled_pubkeys().contains(&pk));
-        assert!(!*shutdown_rx.borrow());
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[tokio::test]
     async fn test_healthy_status_no_action() {
         let pk = test_pubkey();
-        let beacon = MockBeacon::new(vec![make_validator_data(&pk, "active_ongoing")]);
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_ongoing")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(store.list_enabled_pubkeys().contains(&pk));
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[tokio::test]
     async fn test_beacon_error_fail_open() {
         let pk = test_pubkey();
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(store.list_enabled_pubkeys().contains(&pk));
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[tokio::test]
-    async fn test_shutdown_mode_sends_signal() {
+    async fn test_check_slashed_validators_returns_shutdown_requested_for_configured_action() {
         let pk = test_pubkey();
-        let beacon = MockBeacon::new(vec![make_validator_data(&pk, "exited_slashed")]);
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "exited_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::Shutdown).await;
 
-        check_slashed_validators(&beacon, &store, SlashedAction::Shutdown, &shutdown_tx).await;
+        assert_eq!(outcome, SlashedOutcome::ShutdownRequested);
+    }
 
-        assert!(*shutdown_rx.borrow());
+    #[tokio::test]
+    async fn test_check_slashed_validators_returns_no_action_when_none_slashed() {
+        let pk = test_pubkey();
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_ongoing")]);
+        let store = ValidatorStore::new([0u8; 20], 100);
+        store.add_validator(validator_store::ValidatorConfig::new(pk));
+
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::Shutdown).await;
+
+        assert_eq!(outcome, SlashedOutcome::NoAction);
+        assert!(store.list_enabled_pubkeys().contains(&pk));
     }
 
     #[tokio::test]
     async fn test_none_action_no_op() {
         let pk = test_pubkey();
-        let beacon = MockBeacon::new(vec![make_validator_data(&pk, "active_slashed")]);
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::None, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::None).await;
 
         assert!(store.list_enabled_pubkeys().contains(&pk));
-        assert!(!*shutdown_rx.borrow());
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[test]
@@ -360,5 +260,67 @@ mod tests {
         assert_eq!("shutdown".parse::<SlashedAction>().unwrap(), SlashedAction::Shutdown);
         assert_eq!("none".parse::<SlashedAction>().unwrap(), SlashedAction::None);
         assert!("invalid".parse::<SlashedAction>().is_err());
+    }
+
+    #[test]
+    fn test_spawn_uses_epoch_tick_from_eth_types_constants() {
+        let interval = epoch_check_interval();
+        assert_eq!(
+            interval,
+            Duration::from_secs(eth_types::SECONDS_PER_SLOT * eth_types::SLOTS_PER_EPOCH)
+        );
+        // Guard against accidental reintroduction of a hardcoded 12s * 32 loop.
+        assert_eq!(interval, Duration::from_secs(12 * 32));
+        assert_eq!(eth_types::SECONDS_PER_SLOT, 12);
+        assert_eq!(eth_types::SLOTS_PER_EPOCH, 32);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cancels_shutdown_token_on_shutdown_requested() {
+        let pk = test_pubkey();
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_slashed")]);
+        let store = ValidatorStore::new([0u8; 20], 100);
+        store.add_validator(validator_store::ValidatorConfig::new(pk));
+
+        let token = CancellationToken::new();
+        let handle = spawn_with_interval(
+            Arc::new(beacon),
+            Arc::new(store),
+            SlashedAction::Shutdown,
+            token.clone(),
+            Duration::from_millis(5),
+        );
+
+        // Wait until the monitor cancels the token (or time out).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !token.is_cancelled() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        assert!(token.is_cancelled(), "spawn must cancel shutdown token on ShutdownRequested");
+        handle.await.expect("slashing monitor task should complete");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_exits_when_shutdown_token_cancelled_externally() {
+        let pk = test_pubkey();
+        let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_ongoing")]);
+        let store = ValidatorStore::new([0u8; 20], 100);
+        store.add_validator(validator_store::ValidatorConfig::new(pk));
+
+        let token = CancellationToken::new();
+        let handle = spawn_with_interval(
+            Arc::new(beacon),
+            Arc::new(store),
+            SlashedAction::DisableOnly,
+            token.clone(),
+            Duration::from_secs(3600),
+        );
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("slashing monitor task should exit promptly on token cancel")
+            .expect("slashing monitor task should complete");
     }
 }

@@ -4,7 +4,7 @@
 //! now that `client_cn` is no longer a slashing-check discriminator (Issue 2.4).
 //! Call sites are wired in Issue 2.5; this module just lands the function and a test.
 
-use crypto::logging::TruncatedPubkey;
+use observability::logging::TruncatedPubkey;
 
 /// Emit a structured audit record for a slashing-protection signing operation.
 ///

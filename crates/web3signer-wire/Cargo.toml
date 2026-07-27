@@ -1,0 +1,19 @@
+[package]
+name = "rvc-web3signer-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Web3Signer HTTP sign-request wire types (Serialize + Deserialize)"
+
+[lints]
+workspace = true
+
+[dependencies]
+eth-types.workspace = true
+hex.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

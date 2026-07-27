@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -31,6 +32,42 @@ impl EpochDutyCache {
         Self { duties: HashMap::new(), dependent_root }
     }
 
+    /// Parse attester duties from a BN response into a keyed epoch cache.
+    ///
+    /// Duties with unparseable slot / committee_index / validator_index are
+    /// skipped (with a warn log). Per-duty cache inserts are traced.
+    fn from_response(dependent_root: String, duties: &[AttesterDuty], epoch: u64) -> Self {
+        let mut epoch_cache = Self::new(dependent_root);
+        for duty in duties {
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
+                    continue;
+                }
+            };
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
+                    continue;
+                }
+            };
+            let validator_index: u64 = match duty.validator_index.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
+                    continue;
+                }
+            };
+
+            let key = DutyCacheKey { slot, committee_index, validator_index };
+            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
+            epoch_cache.insert(key, duty.clone());
+        }
+        epoch_cache
+    }
+
     fn insert(&mut self, key: DutyCacheKey, duty: AttesterDuty) {
         self.duties.insert(key, duty);
     }
@@ -51,12 +88,43 @@ impl ProposerEpochDutyCache {
         Self { duties: HashMap::new(), dependent_root }
     }
 
+    /// Parse proposer duties from a BN response into a slot-keyed epoch cache.
+    ///
+    /// Duties with an unparseable slot are skipped (with a warn log).
+    fn from_response(dependent_root: String, duties: &[ProposerDuty]) -> Self {
+        let mut epoch_cache = Self::new(dependent_root);
+        for duty in duties {
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
+                    continue;
+                }
+            };
+            epoch_cache.insert(slot, duty.clone());
+        }
+        epoch_cache
+    }
+
     fn insert(&mut self, slot: u64, duty: ProposerDuty) {
         self.duties.insert(slot, duty);
     }
 
     fn get(&self, slot: &u64) -> Option<&ProposerDuty> {
         self.duties.get(slot)
+    }
+}
+
+/// Sync-committee duties for one sync committee period.
+#[derive(Debug)]
+struct SyncPeriodDutyCache {
+    duties: Vec<SyncCommitteeDuty>,
+}
+
+impl SyncPeriodDutyCache {
+    /// Construct a period cache from a BN sync-committee duties response body.
+    fn from_response(duties: Vec<SyncCommitteeDuty>) -> Self {
+        Self { duties }
     }
 }
 
@@ -67,7 +135,9 @@ pub struct DutyTracker {
     /// Proposer duties keyed by epoch -> ProposerEpochDutyCache.
     proposer_cache: RwLock<HashMap<u64, ProposerEpochDutyCache>>,
     /// Sync committee duties keyed by sync committee period.
-    sync_committee_cache: RwLock<HashMap<u64, Vec<SyncCommitteeDuty>>>,
+    sync_committee_cache: RwLock<HashMap<u64, SyncPeriodDutyCache>>,
+    /// Count of [`Self::get_duties_for_slot`] calls (complexity tests; RF6-31).
+    slot_duty_lookups: AtomicU64,
 }
 
 impl DutyTracker {
@@ -78,7 +148,13 @@ impl DutyTracker {
             cache: RwLock::new(HashMap::new()),
             proposer_cache: RwLock::new(HashMap::new()),
             sync_committee_cache: RwLock::new(HashMap::new()),
+            slot_duty_lookups: AtomicU64::new(0),
         }
+    }
+
+    /// Number of times [`Self::get_duties_for_slot`] has been called (tests).
+    pub fn slot_duty_lookup_count(&self) -> u64 {
+        self.slot_duty_lookups.load(Ordering::Relaxed)
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch))]
@@ -109,35 +185,8 @@ impl DutyTracker {
             }
         }
 
-        let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
-
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                    continue;
-                }
-            };
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                    continue;
-                }
-            };
-            let validator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
-                    continue;
-                }
-            };
-
-            let key = DutyCacheKey { slot, committee_index, validator_index };
-            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
-            epoch_cache.insert(key, duty.clone());
-        }
+        let epoch_cache =
+            EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
 
         info!(
             epoch = epoch,
@@ -200,34 +249,8 @@ impl DutyTracker {
             "Dependent root changed, refetching duties"
         );
 
-        let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
-
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                    continue;
-                }
-            };
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                    continue;
-                }
-            };
-            let validator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
-                    continue;
-                }
-            };
-            let key = DutyCacheKey { slot, committee_index, validator_index };
-            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
-            epoch_cache.insert(key, duty.clone());
-        }
+        let epoch_cache =
+            EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
 
         cache.insert(epoch, epoch_cache);
         Ok(true)
@@ -271,6 +294,7 @@ impl DutyTracker {
     }
 
     pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<AttesterDuty> {
+        self.slot_duty_lookups.fetch_add(1, Ordering::Relaxed);
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.cache.read().await;
 
@@ -299,6 +323,7 @@ impl DutyTracker {
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
         self.proposer_cache.write().await.clear();
+        self.sync_committee_cache.write().await.clear();
         debug!("Cleared all duty caches");
     }
 
@@ -322,17 +347,8 @@ impl DutyTracker {
         let response =
             self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
 
-        let mut epoch_cache = ProposerEpochDutyCache::new(response.dependent_root.clone());
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
-                    continue;
-                }
-            };
-            epoch_cache.insert(slot, duty.clone());
-        }
+        let epoch_cache =
+            ProposerEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
 
         info!(epoch = epoch, count = response.data.len(), "Cached proposer duties for epoch");
 
@@ -385,17 +401,10 @@ impl DutyTracker {
                 "Proposer dependent root changed, refetching duties"
             );
 
-            let mut epoch_cache = ProposerEpochDutyCache::new(response.dependent_root.clone());
-            for duty in &response.data {
-                let slot: u64 = match duty.slot.parse() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
-                        continue;
-                    }
-                };
-                epoch_cache.insert(slot, duty.clone());
-            }
+            let epoch_cache = ProposerEpochDutyCache::from_response(
+                response.dependent_root.clone(),
+                &response.data,
+            );
 
             let mut cache = self.proposer_cache.write().await;
             cache.insert(epoch, epoch_cache);
@@ -431,8 +440,9 @@ impl DutyTracker {
             "Cached sync committee duties for period"
         );
 
+        let period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
         let mut cache = self.sync_committee_cache.write().await;
-        cache.insert(period, response.data.clone());
+        cache.insert(period, period_cache);
 
         Ok(response.data)
     }
@@ -442,9 +452,9 @@ impl DutyTracker {
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         let cache = self.sync_committee_cache.read().await;
         match cache.get(&period) {
-            Some(duties) => {
+            Some(period_cache) => {
                 debug!(slot, epoch, cache_type = "sync", "Cache hit");
-                duties.clone()
+                period_cache.duties.clone()
             }
             None => {
                 debug!(slot, epoch, cache_type = "sync", "Cache miss");
@@ -480,62 +490,156 @@ impl DutyTracker {
         let proposer_count =
             self.proposer_cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let sync_count = self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.len());
+        let sync_count =
+            self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.duties.len());
         (attester_count, proposer_count, sync_count)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
-    use wiremock::matchers::{body_json, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use beacon::{BeaconClient, BeaconClientConfig};
-    use bn_manager::BeaconNodeClient;
+    use bn_manager::{
+        AttesterDutiesResponse, AttesterDuty, BeaconError, BeaconNodeClient, MockBeaconNodeClient,
+        ProposerDutiesResponse, ProposerDuty, SyncCommitteeDutiesResponse,
+    };
+    use eth_types::SyncCommitteeDuty;
 
     use super::*;
 
-    async fn setup_mock_beacon() -> (MockServer, Arc<dyn BeaconNodeClient>) {
-        let mock_server = MockServer::start().await;
-        let config = BeaconClientConfig::new(mock_server.uri())
-            .with_timeout(Duration::from_secs(5))
-            .with_max_retries(1);
-        let client = BeaconClient::new(config).unwrap();
-        (mock_server, Arc::new(client) as Arc<dyn BeaconNodeClient>)
+    fn empty_beacon() -> Arc<dyn BeaconNodeClient> {
+        Arc::new(MockBeaconNodeClient::new())
     }
 
-    fn create_mock_duty_response(
-        _epoch: u64,
+    fn attester_duty(slot: u64, committee_index: u64, validator_index: &str) -> AttesterDuty {
+        AttesterDuty {
+            pubkey: format!("0xpubkey_{validator_index}"),
+            validator_index: validator_index.to_string(),
+            committee_index: committee_index.to_string(),
+            committee_length: "128".to_string(),
+            committees_at_slot: "64".to_string(),
+            validator_committee_index: "25".to_string(),
+            slot: slot.to_string(),
+        }
+    }
+
+    fn attester_response(
         duties: Vec<(u64, u64, &str)>,
         dependent_root: &str,
-    ) -> serde_json::Value {
-        let data: Vec<serde_json::Value> = duties
-            .into_iter()
-            .map(|(slot, committee_index, validator_index)| {
-                serde_json::json!({
-                    "pubkey": format!("0xpubkey_{}", validator_index),
-                    "validator_index": validator_index,
-                    "committee_index": committee_index.to_string(),
-                    "committee_length": "128",
-                    "committees_at_slot": "64",
-                    "validator_committee_index": "25",
-                    "slot": slot.to_string()
+    ) -> AttesterDutiesResponse {
+        AttesterDutiesResponse {
+            dependent_root: dependent_root.to_string(),
+            execution_optimistic: false,
+            data: duties
+                .into_iter()
+                .map(|(slot, committee_index, validator_index)| {
+                    attester_duty(slot, committee_index, validator_index)
                 })
-            })
-            .collect();
+                .collect(),
+        }
+    }
 
-        serde_json::json!({
-            "dependent_root": dependent_root,
-            "execution_optimistic": false,
-            "data": data
+    fn proposer_duty(slot: u64, validator_index: &str, pubkey: &str) -> ProposerDuty {
+        ProposerDuty {
+            pubkey: pubkey.to_string(),
+            validator_index: validator_index.to_string(),
+            slot: slot.to_string(),
+        }
+    }
+
+    fn proposer_response(
+        duties: Vec<(u64, &str, &str)>,
+        dependent_root: &str,
+    ) -> ProposerDutiesResponse {
+        ProposerDutiesResponse {
+            dependent_root: dependent_root.to_string(),
+            execution_optimistic: false,
+            data: duties
+                .into_iter()
+                .map(|(slot, validator_index, pubkey)| proposer_duty(slot, validator_index, pubkey))
+                .collect(),
+        }
+    }
+
+    fn mock_sync_pubkey() -> [u8; 48] {
+        [0x11; 48]
+    }
+
+    fn sync_response(duties: Vec<(u64, [u8; 48], Vec<u64>)>) -> SyncCommitteeDutiesResponse {
+        SyncCommitteeDutiesResponse {
+            execution_optimistic: false,
+            data: duties
+                .into_iter()
+                .map(|(validator_index, pubkey, indices)| SyncCommitteeDuty {
+                    pubkey,
+                    validator_index,
+                    validator_sync_committee_indices: indices,
+                })
+                .collect(),
+        }
+    }
+
+    fn mock_attester(resp: AttesterDutiesResponse) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(move |_epoch, _indices| Ok(resp.clone()))
+    }
+
+    fn mock_attester_queue(responses: Vec<AttesterDutiesResponse>) -> MockBeaconNodeClient {
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        MockBeaconNodeClient::new().with_get_attester_duties(move |_epoch, _indices| {
+            queue
+                .lock()
+                .expect("queue")
+                .pop_front()
+                .ok_or_else(|| BeaconError::HttpError("attester response queue exhausted".into()))
         })
+    }
+
+    fn mock_attester_by_epoch(map: HashMap<u64, AttesterDutiesResponse>) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_attester_duties(move |epoch, _indices| {
+            map.get(&epoch).cloned().ok_or_else(|| {
+                BeaconError::HttpError(format!("no attester mock for epoch {epoch}"))
+            })
+        })
+    }
+
+    fn mock_proposer(resp: ProposerDutiesResponse) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_proposer_duties(move |_epoch| Ok(resp.clone()))
+    }
+
+    fn mock_proposer_queue(responses: Vec<ProposerDutiesResponse>) -> MockBeaconNodeClient {
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        MockBeaconNodeClient::new().with_get_proposer_duties(move |_epoch| {
+            queue
+                .lock()
+                .expect("queue")
+                .pop_front()
+                .ok_or_else(|| BeaconError::HttpError("proposer response queue exhausted".into()))
+        })
+    }
+
+    fn mock_proposer_by_epoch(map: HashMap<u64, ProposerDutiesResponse>) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_get_proposer_duties(move |epoch| {
+            map.get(&epoch).cloned().ok_or_else(|| {
+                BeaconError::HttpError(format!("no proposer mock for epoch {epoch}"))
+            })
+        })
+    }
+
+    fn mock_sync(resp: SyncCommitteeDutiesResponse) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_post_sync_committee_duties(move |_epoch, _indices| Ok(resp.clone()))
+    }
+
+    fn as_beacon(mock: MockBeaconNodeClient) -> Arc<dyn BeaconNodeClient> {
+        Arc::new(mock)
     }
 
     #[tokio::test]
     async fn test_duty_tracker_new() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string(), "5678".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -545,45 +649,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_duties_for_epoch_success() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
-        let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_duty_response(
-            10,
+        let mock = Arc::new(mock_attester(attester_response(
             vec![(320, 1, "1234"), (321, 2, "1234")],
             "0xdeproot_abc123",
-        );
+        )));
+        let validator_indices = vec!["1234".to_string()];
 
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .and(body_json(["1234"]))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let tracker = DutyTracker::new(beacon, validator_indices);
+        let tracker = DutyTracker::new(mock.clone(), validator_indices);
         let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         assert_eq!(duties.len(), 2);
         assert_eq!(duties[0].slot, "320");
         assert_eq!(duties[1].slot, "321");
         assert!(tracker.is_epoch_cached(10).await);
+
+        let calls = mock.get_attester_duties_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 10);
+        assert_eq!(calls[0].1, vec!["1234".to_string()]);
     }
 
     #[tokio::test]
     async fn test_get_duty_from_cache() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_attester(attester_response(vec![(320, 1, "1234")], "0xdeproot_abc123")));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -600,21 +690,15 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn test_duty_logging_levels_and_canonical_fields() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_attester(attester_response(vec![(320, 1, "1234")], "0xdeproot_abc123")));
         let validator_indices = vec!["1234".to_string()];
-        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
         let _ = tracker.get_duty(320, 1, 1234).await.unwrap();
 
         logs_assert(|lines: &[&str]| {
-            // Per-duty fetch-loop detail is TRACE with canonical validator_index.
             let cached = lines
                 .iter()
                 .find(|l| l.contains("cached attester duty"))
@@ -625,7 +709,6 @@ mod tests {
             if !cached.contains("validator_index=1234") {
                 return Err(format!("canonical validator_index missing: {cached}"));
             }
-            // Cache hit is DEBUG with the canonical `epoch` key.
             let hit = lines
                 .iter()
                 .find(|l| l.contains("Cache hit") && l.contains("attester"))
@@ -642,17 +725,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_not_found() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_attester(attester_response(vec![(320, 1, "1234")], "0xdeproot_abc123")));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -663,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_epoch_not_cached() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -674,27 +749,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dependent_root_change_detection() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_attester_queue(vec![
+            attester_response(vec![(320, 1, "1234")], "0xroot_first"),
+            attester_response(vec![(320, 2, "1234")], "0xroot_second"),
+        ]));
         let validator_indices = vec!["1234".to_string()];
-
-        let response1 = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_first");
-
-        let response2 = create_mock_duty_response(10, vec![(320, 2, "1234")], "0xroot_second");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response1))
-            .expect(1)
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response2))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -711,17 +770,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dependent_root_no_change() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_attester(attester_response(vec![(320, 1, "1234")], "0xroot_same")));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_same");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(2)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -733,17 +784,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_epoch_cache() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_attester(attester_response(vec![(320, 1, "1234")], "0xdeproot")));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -778,21 +821,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_validators() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let mock = Arc::new(mock_attester(attester_response(
+            vec![(320, 1, "1234"), (321, 2, "5678")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string(), "5678".to_string()];
 
-        let response =
-            create_mock_duty_response(10, vec![(320, 1, "1234"), (321, 2, "5678")], "0xdeproot");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .and(body_json(["1234", "5678"]))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let tracker = DutyTracker::new(beacon, validator_indices);
+        let tracker = DutyTracker::new(mock.clone(), validator_indices);
         let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         assert_eq!(duties.len(), 2);
@@ -802,19 +837,19 @@ mod tests {
 
         let duty2 = tracker.get_duty(321, 2, 5678).await.unwrap();
         assert_eq!(duty2.validator_index, "5678");
+
+        let calls = mock.get_attester_duties_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec!["1234".to_string(), "5678".to_string()]);
     }
 
     #[tokio::test]
     async fn test_fetch_duties_beacon_error() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(MockBeaconNodeClient::new().with_get_attester_duties(|_epoch, _indices| {
+                Err(BeaconError::HttpError("Invalid epoch".into()))
+            }));
         let validator_indices = vec!["1234".to_string()];
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         let result = tracker.fetch_duties_for_epoch(10).await;
@@ -824,25 +859,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_next_epoch_while_current_cached() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let mut map = HashMap::new();
+        map.insert(10, attester_response(vec![(320, 1, "1234")], "0xroot_epoch10"));
+        map.insert(11, attester_response(vec![(352, 2, "1234")], "0xroot_epoch11"));
+        let beacon = as_beacon(mock_attester_by_epoch(map));
         let validator_indices = vec!["1234".to_string()];
-
-        let response10 = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_epoch10");
-        let response11 = create_mock_duty_response(11, vec![(352, 2, "1234")], "0xroot_epoch11");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response10))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/11"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response11))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -878,41 +899,13 @@ mod tests {
 
     // --- Proposer duty tests ---
 
-    fn create_mock_proposer_response(duties: Vec<(u64, &str, &str)>) -> serde_json::Value {
-        let data: Vec<serde_json::Value> = duties
-            .into_iter()
-            .map(|(slot, validator_index, pubkey)| {
-                serde_json::json!({
-                    "pubkey": pubkey,
-                    "validator_index": validator_index,
-                    "slot": slot.to_string()
-                })
-            })
-            .collect();
-
-        serde_json::json!({
-            "dependent_root": "0xdeproot",
-            "execution_optimistic": false,
-            "data": data
-        })
-    }
-
     #[tokio::test]
     async fn test_fetch_proposer_duties_success() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234"), (325, "5678", "0xpubkey_5678")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![
-            (320, "1234", "0xpubkey_1234"),
-            (325, "5678", "0xpubkey_5678"),
-        ]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         let duties = tracker.fetch_proposer_duties(10).await.unwrap();
@@ -923,17 +916,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_proposer_duty_found() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_proposer_duties(10).await.unwrap();
@@ -945,17 +932,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_proposer_duty_not_found() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_proposer_duties(10).await.unwrap();
@@ -966,7 +947,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_proposer_duty_epoch_not_cached() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -977,17 +958,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_cached_proposer_dependent_root() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_proposer_duties(10).await.unwrap();
@@ -998,7 +973,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_cached_proposer_dependent_root_not_cached() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -1009,29 +984,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_proposer_dependent_root_changes_with_refetch() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer_queue(vec![
+            proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xfirst_root"),
+            proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xsecond_root"),
+        ]));
         let validator_indices = vec!["1234".to_string()];
-
-        let mut response1 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-        response1["dependent_root"] = serde_json::json!("0xfirst_root");
-
-        let mut response2 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-        response2["dependent_root"] = serde_json::json!("0xsecond_root");
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response1))
-            .expect(1)
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response2))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1046,17 +1003,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_and_refetch_proposer_if_root_changed_uncached() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1067,29 +1018,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_and_refetch_proposer_if_root_changed_detects_change() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer_queue(vec![
+            proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xfirst_root"),
+            proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xsecond_root"),
+        ]));
         let validator_indices = vec!["1234".to_string()];
-
-        let mut response1 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-        response1["dependent_root"] = serde_json::json!("0xfirst_root");
-
-        let mut response2 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-        response2["dependent_root"] = serde_json::json!("0xsecond_root");
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response1))
-            .expect(1)
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response2))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1106,17 +1039,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_and_refetch_proposer_if_root_unchanged() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_proposer(proposer_response(
+            vec![(320, "1234", "0xpubkey_1234")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["1234".to_string()];
-
-        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/duties/proposer/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(2)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1128,62 +1055,25 @@ mod tests {
 
     // --- Sync committee duty tests ---
 
-    fn create_mock_sync_committee_response(
-        duties: Vec<(u64, &str, Vec<u64>)>,
-    ) -> serde_json::Value {
-        let data: Vec<serde_json::Value> = duties
-            .into_iter()
-            .map(|(validator_index, pubkey, indices)| {
-                serde_json::json!({
-                    "pubkey": pubkey,
-                    "validator_index": validator_index,
-                    "validator_sync_committee_indices": indices.iter().map(|i| i.to_string()).collect::<Vec<_>>()
-                })
-            })
-            .collect();
-
-        serde_json::json!({
-            "execution_optimistic": false,
-            "data": data
-        })
-    }
-
     #[tokio::test]
     async fn test_fetch_sync_committee_duties_success() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_sync(sync_response(vec![(1234, mock_sync_pubkey(), vec![10, 20])])));
         let validator_indices = vec!["1234".to_string()];
-
-        let response =
-            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/sync/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         let duties = tracker.fetch_sync_committee_duties(10).await.unwrap();
 
         assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].pubkey, [0x11; 48]);
         assert!(tracker.is_sync_period_cached(10).await);
     }
 
     #[tokio::test]
     async fn test_get_sync_committee_duties_cached() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon =
+            as_beacon(mock_sync(sync_response(vec![(1234, mock_sync_pubkey(), vec![10, 20])])));
         let validator_indices = vec!["1234".to_string()];
-
-        let response =
-            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/sync/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_sync_committee_duties(10).await.unwrap();
@@ -1195,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_sync_committee_duties_not_cached() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -1223,21 +1113,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duties_for_slot() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
-        let validator_indices = vec!["1234".to_string(), "5678".to_string()];
-
-        let response = create_mock_duty_response(
-            10,
+        let beacon = as_beacon(mock_attester(attester_response(
             vec![(320, 1, "1234"), (320, 2, "5678"), (321, 0, "1234")],
             "0xdeproot",
-        );
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
+        )));
+        let validator_indices = vec!["1234".to_string(), "5678".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -1254,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duties_for_slot_uncached_epoch() {
-        let (_, beacon) = setup_mock_beacon().await;
+        let beacon = empty_beacon();
         let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -1265,23 +1145,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_evict_old_caches() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
-        let validator_indices = vec!["1234".to_string()];
-
-        // Set up responses for epochs 5, 6, 7, 8, 9
+        let mut map = HashMap::new();
         for epoch in 5..=9 {
             let slot_base = epoch * 32;
-            let response = create_mock_duty_response(
+            map.insert(
                 epoch,
-                vec![(slot_base, 0, "1234")],
-                &format!("0xroot_{}", epoch),
+                attester_response(vec![(slot_base, 0, "1234")], &format!("0xroot_{epoch}")),
             );
-            Mock::given(method("POST"))
-                .and(path(format!("/eth/v1/validator/duties/attester/{}", epoch)))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-                .mount(&mock_server)
-                .await;
         }
+        let beacon = as_beacon(mock_attester_by_epoch(map));
+        let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1304,19 +1177,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_evict_old_caches_proposer() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
-        let validator_indices = vec!["1234".to_string()];
-
+        let mut map = HashMap::new();
         for epoch in 5..=9 {
             let slot_base = epoch * 32;
-            let response =
-                create_mock_proposer_response(vec![(slot_base, "1234", "0xpubkey_1234")]);
-            Mock::given(method("GET"))
-                .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-                .mount(&mock_server)
-                .await;
+            map.insert(
+                epoch,
+                proposer_response(vec![(slot_base, "1234", "0xpubkey_1234")], "0xdeproot"),
+            );
         }
+        let beacon = as_beacon(mock_proposer_by_epoch(map));
+        let validator_indices = vec!["1234".to_string()];
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
@@ -1338,42 +1208,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_duties_skips_unparseable_slot() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let mut data = vec![attester_duty(320, 1, "1234"), attester_duty(320, 1, "1234")];
+        data[0].slot = "invalid".to_string();
+        // second entry already has slot 320
+
+        let resp = AttesterDutiesResponse {
+            dependent_root: "0xdeproot".to_string(),
+            execution_optimistic: false,
+            data,
+        };
+        let beacon = as_beacon(mock_attester(resp));
         let validator_indices = vec!["1234".to_string()];
-
-        let data = vec![
-            serde_json::json!({
-                "pubkey": "0xpubkey_1234",
-                "validator_index": "1234",
-                "committee_index": "1",
-                "committee_length": "128",
-                "committees_at_slot": "64",
-                "validator_committee_index": "25",
-                "slot": "invalid"
-            }),
-            serde_json::json!({
-                "pubkey": "0xpubkey_1234",
-                "validator_index": "1234",
-                "committee_index": "1",
-                "committee_length": "128",
-                "committees_at_slot": "64",
-                "validator_committee_index": "25",
-                "slot": "320"
-            }),
-        ];
-
-        let response = serde_json::json!({
-            "dependent_root": "0xdeproot",
-            "execution_optimistic": false,
-            "data": data
-        });
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -1391,19 +1236,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_slot_committee_different_validators_both_stored() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_attester(attester_response(
+            vec![(320, 1, "100"), (320, 1, "200")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["100".to_string(), "200".to_string()];
-
-        // Two validators in the same (slot=320, committee_index=1)
-        let response =
-            create_mock_duty_response(10, vec![(320, 1, "100"), (320, 1, "200")], "0xdeproot");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
@@ -1414,71 +1251,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_with_validator_index() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_attester(attester_response(
+            vec![(320, 1, "100"), (320, 1, "200")],
+            "0xdeproot",
+        )));
         let validator_indices = vec!["100".to_string(), "200".to_string()];
-
-        let response =
-            create_mock_duty_response(10, vec![(320, 1, "100"), (320, 1, "200")], "0xdeproot");
-
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/10"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
-        // Found with correct validator_index
         let duty = tracker.get_duty(320, 1, 100).await.unwrap();
         assert_eq!(duty.validator_index, "100");
 
         let duty = tracker.get_duty(320, 1, 200).await.unwrap();
         assert_eq!(duty.validator_index, "200");
 
-        // Not found with wrong validator_index
         let result = tracker.get_duty(320, 1, 999).await;
         assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
     }
 
     #[tokio::test]
     async fn test_check_and_refetch_atomic_compare_and_swap() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_attester_queue(vec![
+            attester_response(vec![(0, 0, "100")], "0xroot_a"),
+            attester_response(vec![(0, 0, "100")], "0xroot_a"),
+            attester_response(vec![(0, 0, "100")], "0xroot_b"),
+        ]));
         let validator_indices = vec!["100".to_string()];
-
-        // First fetch: initial root
-        let initial_response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_a");
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&initial_response))
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
         assert!(changed, "first fetch should report changed");
 
-        // Second check: same root — no change
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&initial_response))
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
-
         let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
         assert!(!changed, "same root should not report changed");
-
-        // Third check: different root — changed
-        let changed_response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_b");
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&changed_response))
-            .up_to_n_times(1)
-            .mount(&mock_server)
-            .await;
 
         let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
         assert!(changed, "different root should report changed");
@@ -1486,15 +1292,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_cache_empties_all_caches() {
-        let (mock_server, beacon) = setup_mock_beacon().await;
+        let beacon = as_beacon(mock_attester(attester_response(vec![(0, 0, "100")], "0xroot_a")));
         let validator_indices = vec!["100".to_string()];
-
-        let response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_a");
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/duties/attester/0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .mount(&mock_server)
-            .await;
 
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(0).await.unwrap();
@@ -1502,5 +1301,170 @@ mod tests {
 
         tracker.clear_cache().await;
         assert!(!tracker.is_epoch_cached(0).await);
+    }
+
+    /// RF4-29: `clear_cache` must clear the sync-committee cache as well as
+    /// attester/proposer caches. Key-gen invalidation and reorg recovery call
+    /// this path; leaving sync duties live after a key removal is a correctness bug.
+    #[tokio::test]
+    async fn test_clear_cache_clears_sync_committee_cache() {
+        let beacon = as_beacon(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(|_epoch, _indices| {
+                    Ok(attester_response(vec![(320, 1, "1234")], "0xdeproot"))
+                })
+                .with_get_proposer_duties(|_epoch| {
+                    Ok(proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xdeproot"))
+                })
+                .with_post_sync_committee_duties(|_epoch, _indices| {
+                    Ok(sync_response(vec![(1234, mock_sync_pubkey(), vec![10, 20])]))
+                }),
+        );
+        let validator_indices = vec!["1234".to_string()];
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+        tracker.fetch_proposer_duties(10).await.unwrap();
+        tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        assert!(tracker.is_epoch_cached(10).await);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+        assert!(tracker.is_sync_period_cached(10).await);
+        assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
+
+        tracker.clear_cache().await;
+
+        assert!(!tracker.is_epoch_cached(10).await);
+        assert!(!tracker.is_proposer_epoch_cached(10).await);
+        assert!(!tracker.is_sync_period_cached(10).await);
+        assert!(
+            tracker.get_sync_committee_duties(320).await.is_empty(),
+            "clear_cache must empty the sync-committee cache"
+        );
+    }
+
+    /// RF4-29: `from_response` constructors produce the same cache contents
+    /// as the previous inline parse loops (keyed by parsed fields, skip bad rows).
+    #[test]
+    fn test_from_response_constructors_produce_identical_caches() {
+        let attester_duties = vec![
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "10".into(),
+                committee_index: "2".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "320".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "not_a_number".into(),
+                committee_index: "1".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "321".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk3".into(),
+                validator_index: "11".into(),
+                committee_index: "bad".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "322".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk4".into(),
+                validator_index: "12".into(),
+                committee_index: "3".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "not_a_slot".into(),
+            },
+        ];
+
+        let attester_cache = EpochDutyCache::from_response("0xroot".into(), &attester_duties, 10);
+        assert_eq!(attester_cache.dependent_root, "0xroot");
+        assert_eq!(attester_cache.duties.len(), 1);
+        let key = DutyCacheKey { slot: 320, committee_index: 2, validator_index: 10 };
+        assert_eq!(attester_cache.get(&key).map(|d| d.pubkey.as_str()), Some("0xpk1"));
+
+        let proposer_duties = vec![
+            ProposerDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "10".into(),
+                slot: "320".into(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "11".into(),
+                slot: "invalid".into(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk3".into(),
+                validator_index: "12".into(),
+                slot: "325".into(),
+            },
+        ];
+        let proposer_cache =
+            ProposerEpochDutyCache::from_response("0xproot".into(), &proposer_duties);
+        assert_eq!(proposer_cache.dependent_root, "0xproot");
+        assert_eq!(proposer_cache.duties.len(), 2);
+        assert!(proposer_cache.get(&320).is_some());
+        assert!(proposer_cache.get(&325).is_some());
+        assert!(proposer_cache.get(&321).is_none());
+
+        let sync_duties = vec![SyncCommitteeDuty {
+            pubkey: [0x11; 48],
+            validator_index: 1234,
+            validator_sync_committee_indices: vec![1, 2],
+        }];
+        let sync_cache = SyncPeriodDutyCache::from_response(sync_duties.clone());
+        assert_eq!(sync_cache.duties, sync_duties);
+    }
+
+    /// RF4-29: `clear_epoch_cache` remains scoped to a single attester epoch
+    /// and does not touch proposer or sync caches.
+    #[tokio::test]
+    async fn test_clear_epoch_cache_still_scoped_to_one_epoch() {
+        let mut attester_map = HashMap::new();
+        for epoch in [10u64, 11] {
+            attester_map
+                .insert(epoch, attester_response(vec![(epoch * 32, 1, "1234")], "0xdeproot"));
+        }
+        let attester_map = Arc::new(attester_map);
+        let attester_map_c = Arc::clone(&attester_map);
+        let beacon = as_beacon(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |epoch, _indices| {
+                    attester_map_c.get(&epoch).cloned().ok_or_else(|| {
+                        BeaconError::HttpError(format!("no attester mock for epoch {epoch}"))
+                    })
+                })
+                .with_get_proposer_duties(|_epoch| {
+                    Ok(proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xdeproot"))
+                })
+                .with_post_sync_committee_duties(|_epoch, _indices| {
+                    Ok(sync_response(vec![(1234, mock_sync_pubkey(), vec![10])]))
+                }),
+        );
+        let validator_indices = vec!["1234".to_string()];
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+        tracker.fetch_duties_for_epoch(11).await.unwrap();
+        tracker.fetch_proposer_duties(10).await.unwrap();
+        tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        tracker.clear_epoch_cache(10).await;
+
+        assert!(!tracker.is_epoch_cached(10).await);
+        assert!(tracker.is_epoch_cached(11).await);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+        assert!(tracker.is_sync_period_cached(10).await);
+        assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
     }
 }

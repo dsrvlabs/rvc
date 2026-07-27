@@ -1,0 +1,366 @@
+//! Local keystore manager adapter for the Keymanager API.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use crypto::{CompositeSigner, Keystore};
+use keymanager_api::traits::{DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey};
+use observability::logging::TruncatedPubkey;
+use tokio::sync::watch;
+use tracing::{error, info, warn};
+
+use crate::deletion_denylist::DeletionDenylist;
+use crate::orchestrator::PubkeyMap;
+
+use super::notifier::{pubkey_hex, KeyChangeNotifier};
+
+/// Adapts `CompositeSigner` local keys to the Keymanager `KeystoreManager` trait.
+///
+/// # Canonical registry
+///
+/// The source of truth for "which local keys can this VC sign with" is
+/// [`CompositeSigner::local_public_keys`] / [`CompositeSigner::has_local_key`] —
+/// the union of boot-loaded keys (keystore-dir / secret-provider in
+/// `LocalSigner`) and keys added via `add_local_key` (API import, secret-provider
+/// refresh). `list_keys` / `has_key` / `delete_keystore` all consult that set.
+///
+/// `tracked_keys` is retained only as an import serialization lock and a record of
+/// keys imported through this adapter (for concurrent import TOCTOU safety); it is
+/// **not** the registry for list/has/delete.
+///
+/// # Deletion denylist (SEC-1b)
+///
+/// On successful `delete_keystore`, the pubkey is recorded in
+/// [`DeletionDenylist`] so keystore-dir / secret-provider loaders skip it on
+/// the next boot. Intentional re-import via `import_keystore` clears the entry.
+pub struct KeystoreManagerAdapter {
+    keystore_dir: PathBuf,
+    composite_signer: Arc<CompositeSigner>,
+    /// API-imported keys; also serializes concurrent `import_keystore` / `delete_keystore`.
+    pub(crate) tracked_keys: Mutex<Vec<Pubkey>>,
+    /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
+    notifier: KeyChangeNotifier,
+    /// Durable deletion denylist; `None` disables persistence (tests).
+    denylist: Option<Arc<DeletionDenylist>>,
+}
+
+impl KeystoreManagerAdapter {
+    pub fn new(
+        keystore_dir: PathBuf,
+        composite_signer: Arc<CompositeSigner>,
+        pubkey_map: PubkeyMap,
+        key_gen_tx: watch::Sender<u64>,
+    ) -> Self {
+        Self {
+            keystore_dir,
+            composite_signer,
+            tracked_keys: Mutex::new(Vec::new()),
+            notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
+            denylist: None,
+        }
+    }
+
+    /// Attach the process-wide deletion denylist (SEC-1b).
+    pub fn with_denylist(mut self, denylist: Arc<DeletionDenylist>) -> Self {
+        self.denylist = Some(denylist);
+        self
+    }
+}
+
+/// Returns the path for the M-12 import-time metadata sidecar for `pubkey`.
+///
+/// Format: `<keystore_dir>/0x<hex_pubkey>.import_meta.json`
+pub(crate) fn import_meta_path(keystore_dir: &Path, pubkey: &Pubkey) -> PathBuf {
+    keystore_dir.join(format!("{}.import_meta.json", pubkey_hex(pubkey)))
+}
+
+/// Unlink every keystore JSON under `keystore_dir` whose EIP-2335 `pubkey`
+/// field matches `pubkey` (plus the canonical API-import name
+/// `0x{hex}.json`).
+///
+/// Boot load accepts any `*.json` name (`KeyManager::load_from_directory`);
+/// DELETE must therefore not rely solely on the API-import filename
+/// convention. Secret-provider keys with no on-disk file are fine — this
+/// returns `Ok` when nothing matches.
+///
+/// Path-traversal: each candidate is canonicalized and required to stay
+/// under `keystore_dir` before unlink (same rule as key load).
+fn remove_matching_keystore_files(
+    keystore_dir: &Path,
+    pubkey: &Pubkey,
+) -> Result<(), DeleteKeystoreError> {
+    let target_hex = hex::encode(pubkey);
+    let canonical_name = format!("0x{target_hex}.json");
+    let canonical_path = keystore_dir.join(&canonical_name);
+
+    match std::fs::remove_file(&canonical_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
+    }
+
+    let entries = match std::fs::read_dir(keystore_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
+    };
+
+    let canonical_dir = match keystore_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Only keystore JSON; never the import-meta sidecar (handled separately).
+        if !name.ends_with(".json") || name.ends_with(".import_meta.json") {
+            continue;
+        }
+        // Already attempted above; skip re-stat of the canonical name.
+        if name == canonical_name {
+            continue;
+        }
+
+        let canonical_file = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical_file.starts_with(&canonical_dir) {
+            warn!(
+                path = %path.display(),
+                "Skipping keystore candidate outside keystore directory during delete"
+            );
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(pk_str) = value.get("pubkey").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let pk_norm =
+            pk_str.strip_prefix("0x").or_else(|| pk_str.strip_prefix("0X")).unwrap_or(pk_str);
+        if !pk_norm.eq_ignore_ascii_case(&target_hex) {
+            continue;
+        }
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                info!(
+                    path = %path.display(),
+                    pubkey = %TruncatedPubkey::new(&target_hex),
+                    "Removed non-canonical keystore file on delete"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
+        }
+    }
+
+    Ok(())
+}
+impl KeystoreManager for KeystoreManagerAdapter {
+    /// Local keys the VC can sign with (`CompositeSigner::local_public_keys`).
+    fn list_keys(&self) -> Vec<Pubkey> {
+        self.composite_signer.local_public_keys()
+    }
+
+    /// Whether `pubkey` is a local signing key (boot-loaded or API-imported).
+    fn has_key(&self, pubkey: &Pubkey) -> bool {
+        self.composite_signer.has_local_key(pubkey)
+    }
+
+    fn import_keystore(
+        &self,
+        keystore_json: &str,
+        password: &str,
+    ) -> Result<Pubkey, ImportKeystoreError> {
+        let keystore: Keystore = serde_json::from_str(keystore_json)
+            .map_err(|e| ImportKeystoreError::InvalidKeystore(e.to_string()))?;
+
+        let secret_key = keystore
+            .decrypt(password.as_bytes())
+            .map_err(|e| ImportKeystoreError::DecryptionFailed(e.to_string()))?;
+
+        let pubkey_bytes = secret_key.public_key().to_bytes();
+
+        // Hold lock for the entire check-and-insert to prevent TOCTOU race.
+        // Duplicate check uses the real local registry (not only API-tracked keys).
+        let mut keys = self.tracked_keys.lock();
+        if self.composite_signer.has_local_key(&pubkey_bytes) {
+            return Err(ImportKeystoreError::Duplicate);
+        }
+
+        // Save keystore file to disk with restricted permissions (0o600)
+        let filename = format!("{}.json", pubkey_hex(pubkey_bytes));
+        let file_path = self.keystore_dir.join(&filename);
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file_path)
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+            file.write_all(keystore_json.as_bytes())
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&file_path, keystore_json)
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+        }
+
+        // M-12 (Critical #2): persist the import timestamp so that after a
+        // restart the doppelganger gate can detect keys whose window is still
+        // active and re-arm monitoring rather than treating them as safe.
+        let meta_path = import_meta_path(&self.keystore_dir, &pubkey_bytes);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let meta_json = format!("{{\"imported_unix_seconds\":{}}}", now_unix);
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if let Ok(mut f) = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&meta_path)
+            {
+                let _ = f.write_all(meta_json.as_bytes());
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&meta_path, meta_json.as_bytes());
+        }
+
+        // Add to composite signer for signing
+        let public_key = secret_key.public_key();
+        self.composite_signer.add_local_key(secret_key);
+
+        // Track the key (lock still held)
+        keys.push(pubkey_bytes);
+
+        // Update shared pubkey_map and notify orchestrator (required at construction).
+        self.notifier.insert_and_notify(&pubkey_bytes, public_key);
+
+        // SEC-1b: clear denylist only *after* successful persistence + registry
+        // add so a mid-import IO failure cannot un-delete a previously deleted
+        // key (restart would otherwise re-load it from secret-provider).
+        if let Some(ref denylist) = self.denylist {
+            if let Err(e) = denylist.remove(&pubkey_bytes) {
+                // Key is already loaded and signable; surface IO so operators
+                // can repair the denylist file. Do not roll back the import.
+                return Err(ImportKeystoreError::Io(e.to_string()));
+            }
+        }
+
+        info!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey_bytes)),
+            "Imported keystore"
+        );
+        Ok(pubkey_bytes)
+    }
+
+    fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
+        // Serialize with import via the same lock so concurrent import/delete
+        // cannot race. Registry membership is the real local signing set.
+        let mut keys = self.tracked_keys.lock();
+        if !self.composite_signer.has_local_key(pubkey) {
+            // Retry / break-glass: a prior DELETE may have removed the key from
+            // the registry before denylist durability failed. Allow authenticated
+            // DELETE of a non-local pubkey to force-insert the denylist entry so
+            // secret-provider keys cannot resurrect on the next boot.
+            if let Some(ref denylist) = self.denylist {
+                denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
+            }
+            return Ok(false);
+        }
+
+        // Order (SEC-1b fail-closed for durability):
+        //   1. Unlink keystore files (IO failure leaves memory intact)
+        //   2. Durable denylist.insert (IO failure leaves key still local → retryable)
+        //   3. Remove from signing registry
+        //
+        // Writing the denylist *before* remove_local_key ensures a failed
+        // insert does not leave a non-signable key that cannot be re-deleted.
+
+        // Matches any `*.json` whose EIP-2335 pubkey field equals this key
+        // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).
+        // No matching file is OK (secret-provider / already removed).
+        remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
+
+        // M-12 (Critical #2): remove the import-time sidecar so a
+        // subsequent re-import starts with a clean timestamp.
+        let meta_path = import_meta_path(&self.keystore_dir, pubkey);
+        let _ = std::fs::remove_file(&meta_path);
+
+        // SEC-1b: persist deletion *before* registry removal so durability
+        // failure leaves the key still present for DELETE retry.
+        if let Some(ref denylist) = self.denylist {
+            denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
+        }
+
+        // Drop bookkeeping after denylist succeeds (lock still held for
+        // remove_local_key + map update so concurrent deletes/imports serialize).
+        if let Some(pos) = keys.iter().position(|k| k == pubkey) {
+            keys.remove(pos);
+        }
+
+        // Remove from the real signing registry (dynamic + boot-loaded).
+        let removed = self.composite_signer.remove_local_key(pubkey);
+
+        // Map remove + notify under the same `tracked_keys` lock as registry
+        // mutation (S1). If we released the lock first, a concurrent re-import
+        // could re-insert the map entry and then be erased by our late remove.
+        self.notifier.remove_and_notify(pubkey);
+        drop(keys);
+
+        // After a positive membership check under this lock, `!removed` is an
+        // inconsistency (or an external concurrent remover). Disk side effects
+        // already happened — do not map this to dishonest `not_found`.
+        if !removed {
+            debug_assert!(removed, "remove_local_key returned false after has_local_key was true");
+            error!(
+                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                "remove_local_key returned false after positive membership; \
+                 treating delete as success (key is not signable)"
+            );
+        }
+
+        info!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "Deleted keystore"
+        );
+        Ok(true)
+    }
+}

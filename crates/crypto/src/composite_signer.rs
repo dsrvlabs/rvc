@@ -7,11 +7,11 @@ use tracing::{debug, info, warn};
 use async_trait::async_trait;
 
 use super::bls::{SecretKey, Signature, PUBLIC_KEY_BYTES_LEN};
-use super::logging::TruncatedPubkey;
 use super::remote_signer::RemoteSigner;
 use super::signer_trait::{LocalSigner, Signer, SigningError};
 use super::typed_signer::TypedSigner;
 use eth_types::Root;
+use observability::logging::TruncatedPubkey;
 
 pub struct CompositeSigner {
     local: LocalSigner,
@@ -73,6 +73,11 @@ impl CompositeSigner {
         self.grpc_remote.read().contains_key(pubkey)
     }
 
+    /// Returns true if an HTTP (Web3Signer) remote is registered for the pubkey.
+    pub fn has_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.remote.read().contains_key(pubkey)
+    }
+
     pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
         let pubkey_hex = hex::encode(pubkey);
         info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added remote signer key");
@@ -95,13 +100,43 @@ impl CompositeSigner {
         self.dynamic_local.write().insert(pubkey, secret_key);
     }
 
+    /// Removes a local key from the signing registry.
+    ///
+    /// Checks both the dynamically-added set (`add_local_key` / keymanager import)
+    /// and the boot-loaded `LocalSigner` / `KeyManager` set (keystore-dir and
+    /// secret-provider). Returns `true` if the key was present in either.
     pub fn remove_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        let removed = self.dynamic_local.write().remove(pubkey).is_some();
+        let dynamic_removed = self.dynamic_local.write().remove(pubkey).is_some();
+        let boot_removed = self.local.remove_key(pubkey);
+        let removed = dynamic_removed || boot_removed;
         if removed {
             let pubkey_hex = hex::encode(pubkey);
             warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Removed local signer key");
         }
         removed
+    }
+
+    /// Local (non-remote) public keys the VC can sign with.
+    ///
+    /// Canonical "local keystores" set for the Keymanager API: union of boot-loaded
+    /// keys (`LocalSigner` / keystore-dir / secret-provider) and keys added via
+    /// `add_local_key` (API import / secret-provider refresh). Does **not** include
+    /// HTTP or gRPC remote keys — those are managed via `RemoteKeyManager`.
+    pub fn local_public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+        let mut keys = self.local.public_keys();
+        let dynamic = self.dynamic_local.read();
+        keys.extend(dynamic.keys());
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Returns `true` if `pubkey` is a local (non-remote) signing key.
+    pub fn has_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        if self.dynamic_local.read().contains_key(pubkey) {
+            return true;
+        }
+        self.local.contains_key(pubkey)
     }
 }
 
@@ -125,7 +160,8 @@ impl Signer for CompositeSigner {
                     pubkey = %TruncatedPubkey::new(&pk_hex),
                     "raw-root Signer::sign called for a gRPC remote key — use TypedSigner instead"
                 );
-                return Err(SigningError::RemoteSignerError(
+                // LocalRejected: never contacted the remote — staged-row discard is safe.
+                return Err(SigningError::LocalRejected(
                     "raw-root signing is not supported for gRPC remote signers; \
                      use TypedSigner::sign_block / sign_attestation / etc."
                         .to_string(),
@@ -192,8 +228,7 @@ mod tests {
     use crate::bls::PublicKey;
     use crate::key_manager::KeyManager;
     use crate::remote_signer::RemoteSignerConfig;
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::MockServer;
 
     fn create_empty_local_signer() -> LocalSigner {
         LocalSigner::new(KeyManager::new())
@@ -219,30 +254,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_composite_signer_remote_sign() {
+    async fn test_composite_signer_remote_raw_sign_returns_unsupported() {
+        // SEC-8: Web3Signer HTTP refuses raw-root signing (typed body required).
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
-        let expected_sig = sk.sign(&signing_root);
-        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
 
         let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/api/v1/eth2/sign/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
-            )
-            .mount(&mock_server)
-            .await;
-
         let config = RemoteSignerConfig::new(mock_server.uri());
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
         composite.add_remote_key(pk_bytes, remote_signer);
 
-        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+        let result = composite.sign(&signing_root, &pk_bytes).await;
+        match result.unwrap_err() {
+            SigningError::UnsupportedSigningType(msg) => {
+                assert!(msg.contains("TypedSigner"), "msg={msg}");
+            }
+            other => panic!("expected UnsupportedSigningType, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -329,6 +360,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_composite_signer_remove_boot_loaded_local_key() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xcd; 32];
+
+        let composite = CompositeSigner::new(create_local_signer_with_key(sk));
+        assert!(composite.has_local_key(&pk_bytes));
+        assert!(composite.local_public_keys().contains(&pk_bytes));
+        assert!(composite.sign(&signing_root, &pk_bytes).await.is_ok());
+
+        let removed = composite.remove_local_key(&pk_bytes);
+        assert!(removed);
+        assert!(!composite.has_local_key(&pk_bytes));
+        assert!(composite.local_public_keys().is_empty());
+        assert!(matches!(
+            composite.sign(&signing_root, &pk_bytes).await,
+            Err(SigningError::KeyNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_composite_signer_remove_nonexistent_key() {
         let composite = CompositeSigner::new(create_empty_local_signer());
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
@@ -342,30 +394,20 @@ mod tests {
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
 
-        // Use the same key so the remote signature is valid for this pubkey
-        let expected_sig = sk.sign(&signing_root);
-        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
-
         let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/api/v1/eth2/sign/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
-            )
-            .expect(1) // Verifies the remote signer was called (not local)
-            .mount(&mock_server)
-            .await;
-
         let config = RemoteSignerConfig::new(mock_server.uri());
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
-        // Same key in both local and remote
+        // Same key in both local and remote — remote is consulted first and
+        // refuses raw-root (SEC-8). Local is never reached for this pubkey.
         let composite = CompositeSigner::new(create_local_signer_with_key(sk));
         composite.add_remote_key(pk_bytes, remote_signer);
 
-        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-        // Mock expectation (expect(1)) verifies remote path was used
-        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+        let result = composite.sign(&signing_root, &pk_bytes).await;
+        match result.unwrap_err() {
+            SigningError::UnsupportedSigningType(_) => {}
+            other => panic!("expected UnsupportedSigningType from remote priority, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -385,7 +427,7 @@ mod tests {
     // --- gRPC remote signer tests ---
     // MockGrpcSigner implements TypedSigner (not Signer) to mirror GrpcRemoteSigner.
 
-    use crate::signing::{compute_domain, compute_signing_root};
+    use crate::signing_root::signing_root_with_fork_version;
     use crate::typed_signer::SignContext;
     use eth_types::{
         AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
@@ -427,12 +469,12 @@ mod tests {
             block: &BeaconBlock,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(block, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_blinded_block(
@@ -440,12 +482,12 @@ mod tests {
             block: &BlindedBeaconBlock,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(block, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_attestation(
@@ -453,12 +495,12 @@ mod tests {
             data: &AttestationData,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                data,
                 DOMAIN_BEACON_ATTESTER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(data, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_aggregate_and_proof(
@@ -466,12 +508,12 @@ mod tests {
             agg: &AggregateAndProof,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                agg,
                 DOMAIN_AGGREGATE_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(agg, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_sync_committee_message(
@@ -480,12 +522,12 @@ mod tests {
             beacon_block_root: EthRoot,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                &beacon_block_root,
                 DOMAIN_SYNC_COMMITTEE,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(&beacon_block_root, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_sync_aggregator_selection(
@@ -494,13 +536,13 @@ mod tests {
             subcommittee_index: u64,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let sel = SyncAggregatorSelectionData { slot, subcommittee_index };
+            let root = signing_root_with_fork_version(
+                &sel,
                 DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let sel = SyncAggregatorSelectionData { slot, subcommittee_index };
-            let root = compute_signing_root(&sel, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_contribution_and_proof(
@@ -508,12 +550,12 @@ mod tests {
             c: &ContributionAndProof,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                c,
                 DOMAIN_CONTRIBUTION_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(c, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_builder_registration(
@@ -522,9 +564,12 @@ mod tests {
             genesis_fork_version: [u8; 4],
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let zero_gvr = [0u8; 32];
-            let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
-            let root = compute_signing_root(reg, domain);
+            let root = signing_root_with_fork_version(
+                reg,
+                DOMAIN_APPLICATION_BUILDER,
+                genesis_fork_version,
+                [0u8; 32],
+            );
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_randao_reveal(
@@ -532,12 +577,12 @@ mod tests {
             epoch: Epoch,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                &epoch,
                 DOMAIN_RANDAO,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(&epoch, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_voluntary_exit(
@@ -545,12 +590,12 @@ mod tests {
             exit: &VoluntaryExit,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                exit,
                 DOMAIN_VOLUNTARY_EXIT,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(exit, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
     }
@@ -564,7 +609,11 @@ mod tests {
     }
 
     fn test_sign_ctx(pk: PublicKey) -> SignContext {
-        SignContext { pubkey: pk, fork_info: test_fork_info() }
+        SignContext {
+            pubkey: pk,
+            fork_info: test_fork_info(),
+            fork_name: eth_types::ForkName::Deneb,
+        }
     }
 
     #[tokio::test]
@@ -583,11 +632,12 @@ mod tests {
         let result = composite.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_err(), "raw-root sign on gRPC remote key must fail");
         let err = result.unwrap_err();
+        assert!(err.is_unambiguous_no_signature(), "gRPC raw-root reject must be discard-safe");
         match err {
-            SigningError::RemoteSignerError(msg) => {
+            SigningError::LocalRejected(msg) => {
                 assert!(msg.contains("TypedSigner"), "error message should mention TypedSigner");
             }
-            other => panic!("expected RemoteSignerError, got: {other:?}"),
+            other => panic!("expected LocalRejected, got: {other:?}"),
         }
     }
 
@@ -689,7 +739,7 @@ mod tests {
             proposer_index: 1,
             parent_root: [0x11; 32],
             state_root: [0x22; 32],
-            body: vec![0xde, 0xad],
+            body: eth_types::external_vector_electra_body().as_ssz_bytes(),
         };
 
         let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
@@ -700,13 +750,13 @@ mod tests {
         let typed = composite.get_grpc_remote(&pk_bytes).expect("should have grpc remote");
         let sig = typed.sign_block(&block, &ctx).await.unwrap();
 
-        // Verify the signature
-        let domain = compute_domain(
+        // Verify the signature against the shared derivation helper.
+        let signing_root = signing_root_with_fork_version(
+            &block,
             DOMAIN_BEACON_PROPOSER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(&block, domain);
         assert!(sig.verify(&pk, &signing_root).is_ok());
     }
 

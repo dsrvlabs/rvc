@@ -1,21 +1,15 @@
 use async_trait::async_trait;
-use thiserror::Error;
+use parking_lot::RwLock;
 
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use super::key_manager::KeyManager;
 use eth_types::Root;
 
-#[derive(Debug, Error)]
-pub enum SigningError {
-    #[error("key not found: {0}")]
-    KeyNotFound(String),
-
-    #[error("remote signer error: {0}")]
-    RemoteSignerError(String),
-
-    #[error("remote signer returned invalid signature")]
-    InvalidRemoteSignature,
-}
+// Canonical home is `crate::error::SigningError` (re-exported as `crypto::SigningError`).
+// This re-export keeps in-crate `use super::signer_trait::SigningError` compiling for
+// one release while call sites migrate. Includes RF4-06 `LocalRejected` /
+// `is_unambiguous_no_signature` on the enum in `error.rs`.
+pub use super::error::SigningError;
 
 #[async_trait]
 pub trait Signer: Send + Sync {
@@ -29,12 +23,24 @@ pub trait Signer: Send + Sync {
 }
 
 pub struct LocalSigner {
-    key_manager: KeyManager,
+    /// Boot-loaded keys (keystore-dir / secret-provider). `RwLock` so Keymanager
+    /// `DELETE` can remove a key without exclusive ownership of `CompositeSigner`.
+    key_manager: RwLock<KeyManager>,
 }
 
 impl LocalSigner {
     pub fn new(key_manager: KeyManager) -> Self {
-        Self { key_manager }
+        Self { key_manager: RwLock::new(key_manager) }
+    }
+
+    /// Removes a boot-loaded key. Returns `true` if the key was present.
+    pub fn remove_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.key_manager.write().remove(pubkey)
+    }
+
+    /// Returns `true` if the boot-loaded key set contains `pubkey`.
+    pub fn contains_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.key_manager.read().contains(pubkey)
     }
 }
 
@@ -47,15 +53,14 @@ impl Signer for LocalSigner {
     ) -> Result<Signature, SigningError> {
         let pk = PublicKey::from_bytes(pubkey)
             .map_err(|_| SigningError::KeyNotFound(hex::encode(pubkey)))?;
-        let sk = self
-            .key_manager
-            .get_secret_key(&pk)
-            .ok_or_else(|| SigningError::KeyNotFound(hex::encode(pubkey)))?;
+        let km = self.key_manager.read();
+        let sk =
+            km.get_secret_key(&pk).ok_or_else(|| SigningError::KeyNotFound(hex::encode(pubkey)))?;
         Ok(sk.sign(signing_root))
     }
 
     fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
-        self.key_manager.list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
+        self.key_manager.read().list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
     }
 }
 

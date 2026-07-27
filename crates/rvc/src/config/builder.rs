@@ -1,30 +1,30 @@
 //! Service builder for constructing all services from configuration.
 
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{error, info, warn};
 
-use crypto::logging::RedactedUrl;
+use observability::logging::RedactedUrl;
 
-use crate::beacon_adapter::BeaconBlockAdapter;
-use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
-use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};
+use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use beacon::{BeaconClient, BeaconClientConfig};
-use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
-use crypto::{CompositeSigner, KeyManager, LocalSigner};
-use doppelganger::DoppelgangerService;
+use crypto::{CompositeSigner, KeyManager};
+use doppelganger::{
+    DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
+    DEFAULT_MONITORING_EPOCHS,
+};
 use duty_tracker::DutyTracker;
-use eth_types::{ForkSchedule, Root};
-use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use eth_types::{Epoch, ForkSchedule, Root};
+use signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
-use timing::{SlotClock, SystemSlotClock};
+use timing::SystemSlotClock;
 use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
@@ -36,26 +36,86 @@ fn format_version(v: eth_types::Version) -> String {
     format!("0x{}", hex::encode(v))
 }
 
-/// Contains all the built services ready for use.
-pub struct BuiltServices<C, S>
-where
-    C: SlotClock + 'static,
-    S: AttestationSubmitter + 'static,
-{
-    pub beacon: Arc<dyn BeaconNodeClient>,
-    pub beacon_client: Arc<BeaconClient>,
-    pub composite_signer: Arc<CompositeSigner>,
-    pub slashing_db: Arc<SlashingDb>,
-    pub signer: Arc<SignerService>,
-    pub propagator: Arc<Propagator<S>>,
-    pub duty_tracker: Arc<DutyTracker>,
-    pub slot_clock: Arc<C>,
-    pub validator_store: Arc<ValidatorStore>,
-    pub pubkey_map: PubkeyMap,
-    pub genesis_validators_root: Root,
-    pub fork_schedule: Arc<ForkSchedule>,
-    pub doppelganger_service: Option<DoppelgangerService>,
-    pub builder_service: Option<Arc<BuilderService>>,
+/// Resolve a filesystem identity for `path` by walking up to the nearest existing
+/// ancestor (Unix: `st_dev`). Returns `None` when the device cannot be determined
+/// (non-Unix, or no existing ancestor).
+fn filesystem_id(path: &Path) -> Option<u64> {
+    let mut current = path;
+    loop {
+        if let Ok(meta) = std::fs::metadata(current) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Some(meta.dev());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                return None;
+            }
+        }
+        current = current.parent()?;
+        if current.as_os_str().is_empty() {
+            return None;
+        }
+    }
+}
+
+/// Returns `Some(true)` when the two paths resolve to different filesystems,
+/// `Some(false)` when they share a device, and `None` when the comparison is
+/// unavailable (non-Unix or neither path has an existing ancestor).
+fn paths_on_different_filesystems(a: &Path, b: &Path) -> Option<bool> {
+    let a_id = filesystem_id(a)?;
+    let b_id = filesystem_id(b)?;
+    Some(a_id != b_id)
+}
+
+/// SEC-3 post-open gate: a fresh create without opt-in must never proceed to sign.
+///
+/// Closes the TOCTOU between the builder's pre-open `path.exists()` check and
+/// `SlashingDb::open_with_create_info` (volume unmount / concurrent delete).
+fn reject_accidental_fresh_create(
+    path: &std::path::Path,
+    created_fresh: bool,
+    allow_fresh_db: bool,
+) -> Result<(), ConfigError> {
+    if created_fresh && !allow_fresh_db {
+        error!(
+            path = %path.display(),
+            "Refusing accidental fresh slashing DB (created without allow_fresh_db / \
+             --init-slashing-db). Path was missing at open time — possible TOCTOU \
+             (volume unmounted, concurrent delete, or path race). Restore history \
+             from backup or re-run with explicit opt-in for a genuine first deploy."
+        );
+        return Err(ConfigError::SlashingDbMissing(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Best-effort cleanup of a DB file created without opt-in (and SQLite sidecars).
+///
+/// SQLite WAL filenames use `-wal` / `-shm` suffixes (no separator dot).
+fn remove_accidental_fresh_db(path: &std::path::Path) {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let candidates = [
+        path.to_path_buf(),
+        parent.join(format!("{stem}-wal")),
+        parent.join(format!("{stem}-shm")),
+    ];
+    for p in &candidates {
+        if !p.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(p) {
+            error!(
+                path = %p.display(),
+                error = %e,
+                "failed to remove accidental fresh slashing DB artifact; \
+                 delete it manually before retrying"
+            );
+        }
+    }
 }
 
 /// Builder for constructing services from configuration.
@@ -83,7 +143,7 @@ impl ServiceBuilder {
             features = %format!(
                 "doppelganger={}, builder=true, keymanager={}",
                 self.config.doppelganger_detection,
-                self.config.keymanager_enabled
+                self.config.keymanager.enabled
             ),
             "Effective configuration"
         );
@@ -91,11 +151,44 @@ impl ServiceBuilder {
         info!(
             doppelganger_enabled = self.config.doppelganger_detection,
             builder_enabled = true,
-            keymanager_enabled = self.config.keymanager_enabled,
+            keymanager_enabled = self.config.keymanager.enabled,
             "Feature toggles"
         );
+
+        self.warn_keystore_slashing_path_divergence();
     }
 
+    /// Warn when `keystore_path` and `slashing_db_path` resolve to different
+    /// filesystems (SEC-10).
+    ///
+    /// Independently settable paths can hide a copied-data-dir deployment where
+    /// only one of the two volumes is moved to a new host, defeating same-host
+    /// mutual exclusion and risking double-signing.
+    pub fn warn_keystore_slashing_path_divergence(&self) {
+        let keystore = &self.config.keystore_path;
+        let slashing = &self.config.slashing_db_path;
+        if paths_on_different_filesystems(keystore, slashing) == Some(true) {
+            warn!(
+                keystore_path = %keystore.display(),
+                slashing_db_path = %slashing.display(),
+                "keystore_path and slashing_db_path appear to be on different \
+                 filesystems; a partial data-dir copy can leave the slashing DB \
+                 behind and enable double-signing. Keep both on the same durable \
+                 volume, and never run the same keys on two hosts."
+            );
+        }
+    }
+
+    /// Build a single-endpoint [`BeaconClient`] for exit tooling.
+    ///
+    /// Runtime block production, duties, and attestation paths must use
+    /// [`Self::build_bn_manager`] / [`Self::build_proposer_bn_manager`] so
+    /// multi-BN failover applies. This helper is intentionally limited to
+    /// single-client needs (keymanager voluntary exit and similar).
+    ///
+    /// Unlike `BnManager` (which sets `max_retries = 0` and relies on pool
+    /// failover — see `bn_manager::BnManager`), a standalone client keeps a
+    /// small HTTP retry budget.
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
         let beacon_config = BeaconClientConfig::new(&self.config.beacon_url)
             .with_timeout(Duration::from_secs(30))
@@ -106,24 +199,41 @@ impl ServiceBuilder {
         info!(
             url = %self.config.beacon_url,
             max_body_bytes = self.config.beacon_max_body_bytes,
-            "Created beacon client"
+            "Created beacon client (exit tooling)"
         );
         Ok(Arc::new(client))
     }
 
+    /// Shared pool config for main and proposer `BnManager`s: H-12 body cap and
+    /// global broadcast-topic policy (including `blocks` for publish path).
+    fn pool_bn_manager_config(&self, endpoints: Vec<String>) -> BnManagerConfig {
+        let mut config =
+            BnManagerConfig::new(endpoints).with_max_body_bytes(self.config.beacon_max_body_bytes);
+        config.broadcast_topics = self.config.effective_broadcast_topics();
+        config
+    }
+
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
+        self.build_bn_manager_with_timeouts(bn_manager::OperationTimeouts::default())
+    }
+
+    /// Build the main-pool [`BnManager`] with operator-configured per-op timeouts.
+    pub fn build_bn_manager_with_timeouts(
+        &self,
+        timeouts: bn_manager::OperationTimeouts,
+    ) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
-        let broadcast_topics = self.config.effective_broadcast_topics();
-        let mut config = BnManagerConfig::new(endpoints.clone());
-        config.broadcast_topics = broadcast_topics.clone();
+        let config = self.pool_bn_manager_config(endpoints.clone());
+        let broadcast_topics = config.broadcast_topics.clone();
         let manager = BnManager::new(config)
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
             })?
-            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+            .with_operation_timeouts(timeouts);
         info!(
             endpoints = ?endpoints,
             broadcast_topics = ?broadcast_topics,
+            max_body_bytes = self.config.beacon_max_body_bytes,
             "Created BnManager with {} beacon nodes",
             endpoints.len()
         );
@@ -133,12 +243,16 @@ impl ServiceBuilder {
     /// Builds a separate BnManager for proposer nodes if configured.
     ///
     /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
+    ///
+    /// Uses the same body-size cap and broadcast-topic policy as the main pool
+    /// so dedicated proposer publish/produce honor operator DoS and broadcast
+    /// settings (not `BnManagerConfig` defaults alone).
     pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
         if self.config.proposer_nodes.is_empty() {
             return Ok(None);
         }
         let endpoints = self.config.proposer_nodes.clone();
-        let config = BnManagerConfig::new(endpoints.clone());
+        let config = self.pool_bn_manager_config(endpoints.clone());
         let manager = BnManager::new(config)
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
@@ -146,71 +260,202 @@ impl ServiceBuilder {
             .with_operation_timeouts(bn_manager::OperationTimeouts::default());
         info!(
             endpoints = ?endpoints,
+            max_body_bytes = self.config.beacon_max_body_bytes,
             "Created proposer BnManager with {} proposer nodes",
             endpoints.len()
         );
         Ok(Some(Arc::new(manager)))
     }
 
-    pub fn build_doppelganger_service(
-        &self,
-        beacon: Arc<BeaconClient>,
-        slashing_db: Arc<SlashingDb>,
-    ) -> Result<DoppelgangerService, ConfigError> {
-        // M-7 (ISSUE-3.6 review): propagate the genesis_time error rather than
-        // silently defaulting to 0.  A genesis_time of 0 would compute
-        // current_epoch ≈ now_unix / 384 (meaninglessly large) and silently
-        // disable doppelganger monitoring for misconfigured custom networks.
-        let genesis_time = self.config.effective_genesis_time()?;
-        let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
-        let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
-        let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
-        info!(genesis_time, "Created doppelganger detection service");
-        Ok(service)
+    pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
+        self.build_key_manager_filtered(None)
     }
 
-    pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
+    /// Load keystore-dir keys, skipping any pubkey in `denylist` (SEC-1b).
+    ///
+    /// Returns an owned [`KeyManager`] so callers (notably bootstrap
+    /// `load_signing_keys`) can build a [`CompositeSigner`] without
+    /// `Arc::try_unwrap`.
+    pub fn build_key_manager_owned_filtered(
+        &self,
+        denylist: Option<&std::collections::HashSet<[u8; 48]>>,
+    ) -> Result<KeyManager, ConfigError> {
         let passwords = self.config.load_passwords()?;
 
         if !self.config.keystore_path.exists() {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
-        let key_manager = KeyManager::load_from_directory_with_threads(
+        let key_manager = KeyManager::load_from_directory_with_threads_filtered(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
+            denylist,
         )?;
         info!(
             key_count = key_manager.len(),
             path = ?self.config.keystore_path,
             "Loaded validator keys"
         );
-        Ok(Arc::new(key_manager))
+        Ok(key_manager)
+    }
+
+    /// Load keystore-dir keys, skipping any pubkey in `denylist` (SEC-1b).
+    pub fn build_key_manager_filtered(
+        &self,
+        denylist: Option<&std::collections::HashSet<[u8; 48]>>,
+    ) -> Result<Arc<KeyManager>, ConfigError> {
+        Ok(Arc::new(self.build_key_manager_owned_filtered(denylist)?))
     }
 
     pub fn build_slashing_db(&self) -> Result<Arc<SlashingDb>, ConfigError> {
-        if let Some(parent) = self.config.slashing_db_path.parent() {
+        // SEC-10: surface keystore / slashing-DB volume divergence early.
+        self.warn_keystore_slashing_path_divergence();
+
+        let path = &self.config.slashing_db_path;
+
+        if let Some(parent) = path.parent() {
             if !parent.exists() && parent != std::path::Path::new("") {
-                return Err(ConfigError::SlashingDbPathInvalid(
-                    self.config.slashing_db_path.clone(),
-                ));
+                return Err(ConfigError::SlashingDbPathInvalid(path.clone()));
             }
         }
 
-        let db = SlashingDb::open(&self.config.slashing_db_path)?;
-        info!(path = ?self.config.slashing_db_path, "Opened slashing protection database");
+        // SEC-3: fail closed on missing / 0-byte / corrupt-header DB.
+        //
+        // - Missing → require explicit opt-in (`allow_fresh_db` / `--init-slashing-db`).
+        // - Present-and-0-byte or bad SQLite header → hard error always (corruption).
+        // - Present-and-valid → normal open. Opt-in never wipes a non-empty DB.
+        if path.exists() {
+            let meta = std::fs::metadata(path).map_err(ConfigError::ReadError)?;
+            if meta.len() == 0 {
+                return Err(ConfigError::SlashingDbCorrupt(path.clone()));
+            }
+        } else if !self.config.allow_fresh_db {
+            return Err(ConfigError::SlashingDbMissing(path.clone()));
+        } else {
+            error!(
+                path = %path.display(),
+                "CREATING A NEW EMPTY SLASHING PROTECTION DATABASE. \
+                 This DB has ZERO signing history. If this validator was \
+                 previously active (or this path previously held a slashing \
+                 DB), signing with a fresh DB can DOUBLE-SIGN and get the \
+                 validator SLASHED. Only proceed for a genuine first-time \
+                 deployment. Opt-in was granted via allow_fresh_db / \
+                 --init-slashing-db."
+            );
+        }
+
+        let (db, created_fresh) = SlashingDb::open_with_create_info(path).map_err(|e| {
+            // Surface corrupt/empty as the dedicated config error for clearer
+            // operator guidance; other slashing errors pass through unchanged.
+            match e {
+                slashing::SlashingError::CorruptOrEmpty { .. } => {
+                    ConfigError::SlashingDbCorrupt(path.clone())
+                }
+                other => ConfigError::SlashingDbError(other),
+            }
+        })?;
+
+        // SEC-3 TOCTOU close: pre-open `path.exists()` can race with a disappearing
+        // volume / concurrent delete. `open_with_create_info` reports whether it
+        // actually created a fresh zero-history DB — refuse that outcome without
+        // opt-in so we never sign with accidental empty history.
+        if let Err(e) =
+            reject_accidental_fresh_create(path, created_fresh, self.config.allow_fresh_db)
+        {
+            // Drop the connection so the accidental file can be unlinked.
+            drop(db);
+            remove_accidental_fresh_db(path);
+            return Err(e);
+        }
+
+        if created_fresh {
+            error!(
+                path = %path.display(),
+                "Opened freshly created slashing protection database (zero history)"
+            );
+        } else {
+            info!(path = ?path, "Opened slashing protection database");
+        }
         Ok(Arc::new(db))
     }
 
+    /// Build the production [`SignerService`] with the given signing enablement.
+    ///
+    /// Callers must supply the enablement produced by
+    /// [`Self::build_signing_enablement`] (or an equivalent). The enablement is
+    /// the doppelganger gate consulted on every duty-signing path (SEC-2a/2b).
     pub fn build_signer(
         &self,
         composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
+        enablement: Arc<dyn SigningEnablement>,
     ) -> Arc<SignerService> {
-        let signer = SignerService::new(composite_signer, slashing_db);
-        info!("Created signer service");
+        let signer = SignerService::new(composite_signer, slashing_db).with_enablement(enablement);
+        info!("Created signer service with signing enablement (SEC-2b)");
         Arc::new(signer)
+    }
+
+    /// Construct the production [`SigningEnablement`] (SEC-2b).
+    ///
+    /// - When doppelganger detection is **enabled** (default): builds a
+    ///   [`ForwardWindowMachine`], registers every loaded key at
+    ///   `current_epoch`, and returns it as the enablement. Keys remain
+    ///   closed until the monitoring window elapses with complete liveness
+    ///   observations (driven by SEC-2c). Epoch-0 registration is immediately
+    ///   `Safe` (pre-genesis bypass). Cost: ~[`DEFAULT_MONITORING_EPOCHS`]
+    ///   epochs (~12.8 min on mainnet).
+    /// - When **disabled** (`--no-doppelganger-detection`): returns
+    ///   [`DoppelgangerDisabledByOperator`], which enables every key.
+    ///
+    /// The optional machine handle is returned so keymanager import /
+    /// secret-provider refresh can `register_for_import` against the same
+    /// instance (import-strict: no restart Safe-skip).
+    ///
+    /// # Restart-aware safe-skip (boot only)
+    ///
+    /// Boot `register` may mark a key `Safe` if local slashing history shows a
+    /// recent attestation under this GVR (same-host restart). **Do not copy a
+    /// live slashing DB to a second VC** — that would dual-open signing without
+    /// network liveness. API import uses `register_for_import` and never skips.
+    pub fn build_signing_enablement(
+        &self,
+        slashing_db: Arc<SlashingDb>,
+        gvr: Root,
+        current_epoch: Epoch,
+        pubkey_map: &PubkeyMap,
+    ) -> (Arc<dyn SigningEnablement>, Option<Arc<ForwardWindowMachine>>) {
+        if !self.config.doppelganger_detection {
+            tracing::warn!(
+                "Doppelganger detection disabled by operator (--no-doppelganger-detection). \
+                 Forward-window protection is off; a duplicate live instance can double-sign. \
+                 Default on costs ~{DEFAULT_MONITORING_EPOCHS} epochs of withheld signing \
+                 (~12.8 min on mainnet)."
+            );
+            return (Arc::new(DoppelgangerDisabledByOperator), None);
+        }
+
+        let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
+        let machine = Arc::new(ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr));
+
+        let mut registered = 0usize;
+        for pubkey in pubkey_map.read().values() {
+            machine.register(pubkey, current_epoch);
+            registered += 1;
+        }
+
+        info!(
+            monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
+            current_epoch,
+            registered,
+            "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
+             {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
+             (~12.8 min on mainnet). The per-slot liveness loop (SEC-2c) feeds \
+             observe_liveness via bn-manager failover; epoch-0 bypass and \
+             restart-aware safe-skip still apply on boot register only."
+        );
+
+        (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
     }
 
     pub fn build_propagator<S: AttestationSubmitter>(
@@ -251,8 +496,8 @@ impl ServiceBuilder {
     pub fn build_pubkey_map(&self, key_manager: &KeyManager) -> PubkeyMap {
         let mut map = HashMap::new();
         for pubkey in key_manager.list_public_keys() {
-            let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
-            map.insert(pubkey_hex, pubkey);
+            // Key by compressed BLS bytes — no hex normalization on hot paths.
+            map.insert(pubkey.to_bytes(), pubkey);
         }
         info!(count = map.len(), "Built public key map");
         Arc::new(parking_lot::RwLock::new(map))
@@ -370,7 +615,15 @@ impl ServiceBuilder {
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
     ) -> Arc<BuilderService> {
-        let service = BuilderService::new(signer, beacon, validator_store, genesis_fork_version);
+        // Bridge full trait objects onto the narrow builder seams
+        // (`RegistrationSigner` / `BuilderBeaconClient`).
+        let signer: Arc<dyn ValidatorSigner> = signer;
+        let service = BuilderService::new(
+            Arc::new(signer),
+            Arc::new(beacon),
+            validator_store,
+            genesis_fork_version,
+        );
         info!("Created builder service");
         Arc::new(service)
     }
@@ -442,126 +695,15 @@ impl ServiceBuilder {
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
     }
-
-    /// Builds all services and returns them along with the orchestrator handle.
-    ///
-    /// The `validator_indices` parameter should contain numeric validator indices
-    /// resolved from the beacon node. Callers should use `BeaconClient::get_validators`
-    /// to resolve public keys to indices before calling this method.
-    ///
-    /// The `fork_schedule` must be fetched from the beacon node before calling
-    /// this method via `build_fork_schedule()`.
-    pub fn build_all(
-        self,
-        validator_indices: Vec<String>,
-        fork_schedule: Arc<ForkSchedule>,
-    ) -> Result<
-        (
-            BuiltServices<SystemSlotClock, BeaconClient>,
-            impl FnOnce(
-                BuiltServices<SystemSlotClock, BeaconClient>,
-            ) -> (
-                DutyOrchestrator<SystemSlotClock, BeaconClient, BeaconBlockAdapter>,
-                OrchestratorHandle,
-            ),
-        ),
-        ConfigError,
-    > {
-        self.log_effective_config();
-
-        let beacon_client = self.build_beacon()?;
-        let key_manager = self.build_key_manager()?;
-        let slashing_db = self.build_slashing_db()?;
-        let pubkey_map = self.build_pubkey_map(&key_manager);
-        let key_manager_owned = Arc::try_unwrap(key_manager).map_err(|_| {
-            ConfigError::MissingField(
-                "cannot take ownership of key_manager: outstanding Arc references".to_string(),
-            )
-        })?;
-        let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
-        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
-        let propagator = self.build_propagator(beacon_client.clone());
-        let slot_clock = self.build_slot_clock()?;
-        let validator_store =
-            self.build_validator_store(self.config.validators_config.as_deref())?;
-
-        // D-3 (Issue 2.11): with the fail-closed `is_signing_enabled` default,
-        // register every keystore-loaded validator in the store so the
-        // per-validator signing gate permits the keys the VC actually loaded.
-        self.register_loaded_validators(&validator_store, &pubkey_map);
-
-        let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
-        let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
-
-        let doppelganger_service = if self.config.doppelganger_detection {
-            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?)
-        } else {
-            None
-        };
-
-        let genesis_validators_root = self.parse_genesis_validators_root()?;
-        info!(
-            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
-            "Parsed genesis validators root"
-        );
-
-        let genesis_fork_version = fork_schedule.genesis_fork_version;
-        let builder_service = Some(self.build_builder_service(
-            signer.clone(),
-            beacon.clone(),
-            validator_store.clone(),
-            genesis_fork_version,
-        ));
-
-        let services = BuiltServices {
-            beacon,
-            beacon_client,
-            composite_signer,
-            slashing_db,
-            signer,
-            propagator,
-            duty_tracker,
-            slot_clock,
-            validator_store,
-            pubkey_map,
-            genesis_validators_root,
-            fork_schedule,
-            doppelganger_service,
-            builder_service,
-        };
-
-        let orchestrator_factory = move |services: BuiltServices<SystemSlotClock, BeaconClient>| {
-            let config = OrchestratorConfig::new(
-                services.genesis_validators_root,
-                services.fork_schedule.clone(),
-            )
-            .with_shutdown_timeout(Duration::from_secs(30));
-
-            let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon_client.clone()));
-
-            DutyOrchestrator::new(
-                services.slot_clock,
-                services.duty_tracker,
-                services.signer,
-                services.propagator,
-                services.beacon,
-                block_beacon,
-                services.builder_service,
-                services.validator_store,
-                config,
-                services.pubkey_map,
-            )
-        };
-
-        Ok((services, orchestrator_factory))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::Signer as _;
+    use crypto::{LocalSigner, Signer as _};
+    use eth_types::NetworkPreset;
     use tempfile::TempDir;
+    use timing::SlotClock;
 
     fn create_minimal_config() -> Config {
         Config {
@@ -591,6 +733,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("slashing.db");
 
+        // Pre-create a valid DB so open does not require the fresh-init opt-in.
+        SlashingDb::open(&db_path).unwrap();
+
         let config = Config { slashing_db_path: db_path.clone(), ..create_minimal_config() };
 
         let builder = ServiceBuilder::new(config);
@@ -611,6 +756,162 @@ mod tests {
         let result = builder.build_slashing_db();
 
         assert!(matches!(result, Err(ConfigError::SlashingDbPathInvalid(_))));
+    }
+
+    // ── SEC-3: slashing DB fails closed on missing / 0-byte file ───────────
+
+    /// Missing DB without opt-in must abort (never silently create).
+    #[test]
+    fn test_missing_db_without_optin_aborts_startup() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("missing.db");
+        assert!(!db_path.exists());
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: false,
+            ..create_minimal_config()
+        };
+        let result = ServiceBuilder::new(config).build_slashing_db();
+
+        match result {
+            Err(ConfigError::SlashingDbMissing(_)) => {}
+            Ok(_) => panic!("expected SlashingDbMissing, got Ok"),
+            Err(e) => panic!("expected SlashingDbMissing, got: {e}"),
+        }
+        assert!(!db_path.exists(), "must not create the DB without opt-in");
+    }
+
+    /// Missing DB with opt-in creates the file and succeeds.
+    #[test]
+    fn test_missing_db_with_optin_creates_and_warns() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("fresh.db");
+        assert!(!db_path.exists());
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: true,
+            ..create_minimal_config()
+        };
+        let result = ServiceBuilder::new(config).build_slashing_db();
+
+        if let Err(e) = result {
+            panic!("opt-in fresh create must succeed: {e}");
+        }
+        assert!(db_path.exists(), "opt-in must create the DB file");
+        // Fresh DB must be a real non-empty SQLite file (not left 0-byte).
+        assert!(std::fs::metadata(&db_path).unwrap().len() > 0);
+    }
+
+    /// 0-byte DB always aborts, with and without opt-in.
+    #[test]
+    fn test_zero_byte_db_always_aborts() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("zero.db");
+        std::fs::write(&db_path, b"").unwrap();
+
+        for allow_fresh_db in [false, true] {
+            let config = Config {
+                slashing_db_path: db_path.clone(),
+                allow_fresh_db,
+                ..create_minimal_config()
+            };
+            let result = ServiceBuilder::new(config).build_slashing_db();
+            match result {
+                Err(ConfigError::SlashingDbCorrupt(_)) => {}
+                Ok(_) => panic!("0-byte DB must abort (allow_fresh_db={allow_fresh_db}), got Ok"),
+                Err(e) => {
+                    panic!("0-byte DB must abort (allow_fresh_db={allow_fresh_db}), got: {e}")
+                }
+            }
+        }
+        // Must not have wiped/replaced the 0-byte file with a fresh DB.
+        assert_eq!(std::fs::metadata(&db_path).unwrap().len(), 0);
+    }
+
+    /// SEC-3 TOCTOU: post-open `created_fresh && !allow_fresh_db` must refuse.
+    #[test]
+    fn test_created_fresh_without_optin_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("race.db");
+
+        // Simulate the library outcome of a disappear-between-check race:
+        // open reports created_fresh without the builder opt-in flag.
+        let (db, created_fresh) = SlashingDb::open_with_create_info(&db_path).unwrap();
+        assert!(created_fresh);
+        drop(db);
+
+        assert!(
+            reject_accidental_fresh_create(&db_path, true, false).is_err(),
+            "created_fresh without opt-in must error"
+        );
+        assert!(
+            reject_accidental_fresh_create(&db_path, true, true).is_ok(),
+            "created_fresh with opt-in must be allowed"
+        );
+        assert!(
+            reject_accidental_fresh_create(&db_path, false, false).is_ok(),
+            "existing open without create is always ok"
+        );
+
+        // Cleanup path used after the gate fails.
+        remove_accidental_fresh_db(&db_path);
+        assert!(!db_path.exists(), "accidental fresh DB must be removed");
+    }
+
+    /// Builder maps corrupt-header open failures to `SlashingDbCorrupt`.
+    #[test]
+    fn test_corrupt_header_db_always_aborts() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("garbage.db");
+        std::fs::write(&db_path, b"not a sqlite database!!!!").unwrap();
+
+        for allow_fresh_db in [false, true] {
+            let config = Config {
+                slashing_db_path: db_path.clone(),
+                allow_fresh_db,
+                ..create_minimal_config()
+            };
+            let result = ServiceBuilder::new(config).build_slashing_db();
+            match result {
+                Err(ConfigError::SlashingDbCorrupt(_)) => {}
+                Ok(_) => panic!("corrupt header must abort (allow_fresh_db={allow_fresh_db})"),
+                Err(e) => panic!(
+                    "corrupt header must map to SlashingDbCorrupt \
+                     (allow_fresh_db={allow_fresh_db}), got: {e}"
+                ),
+            }
+        }
+        // Must not wipe the non-empty garbage file.
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"not a sqlite database!!!!");
+    }
+
+    /// Opt-in must never wipe or overwrite a non-empty existing DB.
+    #[test]
+    fn test_optin_never_wipes_nonempty_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("existing.db");
+
+        // Seed a real DB with one attestation so we can assert history survives.
+        {
+            let db = SlashingDb::open(&db_path).unwrap();
+            let gvr = [0u8; 32];
+            db.seed_attestation("0xabcd", 1, 2, Some("0xdead".to_string()), &gvr).unwrap();
+        }
+        let size_before = std::fs::metadata(&db_path).unwrap().len();
+        assert!(size_before > 0);
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: true, // opt-in set, but DB already exists
+            ..create_minimal_config()
+        };
+        let db = ServiceBuilder::new(config).build_slashing_db().expect("open existing");
+
+        let records = db.get_attestations("0xabcd").expect("read history");
+        assert_eq!(records.len(), 1, "opt-in must not wipe existing history");
+        assert_eq!(records[0].target_epoch, 2);
     }
 
     #[test]
@@ -640,9 +941,7 @@ mod tests {
     #[test]
     fn test_parse_genesis_validators_root() {
         let config = Config {
-            genesis_validators_root: Some(
-                "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95".to_string(),
-            ),
+            genesis_validators_root: Some(NetworkPreset::MAINNET.genesis_validators_root_hex()),
             ..create_minimal_config()
         };
 
@@ -651,7 +950,7 @@ mod tests {
 
         assert!(result.is_ok());
         let root = result.unwrap();
-        assert_eq!(root[0], 0x4b);
+        assert_eq!(root, NetworkPreset::MAINNET.genesis_validators_root);
     }
 
     #[test]
@@ -661,6 +960,36 @@ mod tests {
         let result = builder.parse_genesis_validators_root();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_builder_default_gvr_is_mainnet_preset() {
+        // Default config uses Network::Mainnet; GVR must match the shared preset.
+        let config = create_minimal_config();
+        assert_eq!(config.network, crate::config::Network::Mainnet);
+        assert_eq!(
+            config.effective_genesis_validators_root().unwrap(),
+            NetworkPreset::MAINNET.genesis_validators_root_hex()
+        );
+        let root = ServiceBuilder::new(config).parse_genesis_validators_root().unwrap();
+        assert_eq!(root, NetworkPreset::MAINNET.genesis_validators_root);
+    }
+
+    /// RF6-31: ingestion keys by compressed BLS bytes (no hex string keys).
+    #[test]
+    fn test_build_pubkey_map_keys_are_compressed_bytes() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 2);
+        let listed: Vec<_> = key_manager.list_public_keys();
+        let map = pubkey_map.read();
+        assert_eq!(map.len(), listed.len());
+        for pk in &listed {
+            assert!(
+                map.contains_key(&pk.to_bytes()),
+                "build_pubkey_map must key by PublicKey::to_bytes()"
+            );
+        }
     }
 
     #[test]
@@ -680,7 +1009,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(composite, slashing_db);
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let signer = builder.build_signer(composite, slashing_db, enablement);
 
         assert!(signer.signer().public_keys().is_empty());
     }
@@ -742,13 +1072,132 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// H-12: main + proposer pool construction must forward `beacon_max_body_bytes`
+    /// (not leave `BnManagerConfig` at the 32 MiB default).
     #[test]
-    fn test_build_doppelganger_service() {
-        let config = create_minimal_config();
+    fn test_pool_bn_manager_config_forwards_body_cap() {
+        let cap = 64 * 1024;
+        let config = Config { beacon_max_body_bytes: cap, ..create_minimal_config() };
         let builder = ServiceBuilder::new(config);
-        let beacon = builder.build_beacon().unwrap();
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let _service = builder.build_doppelganger_service(beacon, slashing_db).unwrap();
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.max_body_bytes, cap);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.max_body_bytes, cap);
+    }
+
+    /// Proposer pool must honor the same global broadcast-topic policy as main.
+    #[test]
+    fn test_pool_bn_manager_config_forwards_broadcast_topics() {
+        let config = Config {
+            broadcast: vec![crate::config::BroadcastTopic::None],
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let expected = bn_manager::BroadcastTopics {
+            attestations: false,
+            blocks: false,
+            sync_committee: false,
+            subscriptions: false,
+        };
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.broadcast_topics, expected);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.broadcast_topics, expected);
+    }
+
+    /// End-to-end: `build_bn_manager` applies the operator body cap to clients.
+    #[tokio::test]
+    async fn test_build_bn_manager_applies_beacon_max_body_bytes() {
+        use beacon::BeaconError;
+        use bn_manager::NodeStatusApi;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let body = vec![b'x'; 100 * 1024];
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let chunk_header = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk_header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+
+        let config = Config {
+            beacon_url: format!("http://127.0.0.1:{port}"),
+            beacon_max_body_bytes: 32 * 1024,
+            ..create_minimal_config()
+        };
+        let manager = ServiceBuilder::new(config).build_bn_manager().expect("main BnManager");
+        let result = manager.get_genesis().await;
+        server.abort();
+
+        assert!(
+            matches!(result, Err(BeaconError::BodyTooLarge { .. })),
+            "main pool must apply beacon_max_body_bytes; got {result:?}"
+        );
+    }
+
+    /// End-to-end: `build_proposer_bn_manager` applies the same body cap.
+    #[tokio::test]
+    async fn test_build_proposer_bn_manager_applies_beacon_max_body_bytes() {
+        use beacon::BeaconError;
+        use bn_manager::NodeStatusApi;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let body = vec![b'x'; 100 * 1024];
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let chunk_header = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk_header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+
+        let config = Config {
+            proposer_nodes: vec![format!("http://127.0.0.1:{port}")],
+            beacon_max_body_bytes: 32 * 1024,
+            ..create_minimal_config()
+        };
+        let manager = ServiceBuilder::new(config)
+            .build_proposer_bn_manager()
+            .expect("proposer BnManager ok")
+            .expect("proposer pool Some");
+        let result = manager.get_genesis().await;
+        server.abort();
+
+        assert!(
+            matches!(result, Err(BeaconError::BodyTooLarge { .. })),
+            "proposer pool must apply beacon_max_body_bytes; got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -805,7 +1254,8 @@ mod tests {
         let beacon = builder.build_beacon().unwrap();
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(composite, slashing_db);
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let signer = builder.build_signer(composite, slashing_db, enablement);
 
         // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
         let temp_dir = TempDir::new().unwrap();
@@ -824,6 +1274,52 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
         builder.log_effective_config();
+    }
+
+    /// SEC-10: paths under the same temp dir share a filesystem → not divergent.
+    #[test]
+    fn test_warn_when_keystore_and_slashing_paths_same_fs() {
+        let temp_dir = TempDir::new().unwrap();
+        let keystore = temp_dir.path().join("keystores");
+        let slashing = temp_dir.path().join("slashing.db");
+        std::fs::create_dir_all(&keystore).unwrap();
+        // slashing path need not exist; filesystem_id walks to the parent.
+        assert_eq!(
+            paths_on_different_filesystems(&keystore, &slashing),
+            Some(false),
+            "sibling paths on the same volume must not report divergence"
+        );
+
+        let config = Config {
+            keystore_path: keystore,
+            slashing_db_path: slashing,
+            ..create_minimal_config()
+        };
+        // Must not panic; no warning expected for same-FS paths.
+        ServiceBuilder::new(config).warn_keystore_slashing_path_divergence();
+    }
+
+    /// SEC-10: when both sides can be resolved, different device IDs report divergence.
+    ///
+    /// We cannot create two real mount points in unit tests, so pin the pure
+    /// helper against the same-device case and the "cannot determine" path.
+    #[test]
+    fn test_warn_when_keystore_and_slashing_paths_differ_fs() {
+        let temp_dir = TempDir::new().unwrap();
+        let keystore = temp_dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        // Non-existent absolute path with no existing ancestor on a typical
+        // layout still resolves via `/` → comparable, same device as temp.
+        // On Unix, an empty path cannot be resolved → None.
+        assert_eq!(paths_on_different_filesystems(Path::new(""), Path::new("")), None);
+
+        // Same existing directory compared to itself is never divergent.
+        assert_eq!(paths_on_different_filesystems(&keystore, &keystore), Some(false));
+
+        // Distinct subpaths under one temp dir share st_dev.
+        let slashing = temp_dir.path().join("nested").join("slash.db");
+        assert_eq!(paths_on_different_filesystems(&keystore, &slashing), Some(false));
     }
 
     // --- ISSUE-2.1: H-1 fee recipient + gas-limit defaults ---
@@ -966,5 +1462,177 @@ mod tests {
             !store.is_signing_enabled(&pk),
             "registration must not re-enable a validator already tracked as disabled"
         );
+    }
+
+    // ── SEC-2b: ForwardWindowMachine construction + wiring ─────────────────
+
+    /// Startup wiring: with doppelganger on, `build_signing_enablement` returns
+    /// a live `ForwardWindowMachine` (not the opt-out / fail-closed default).
+    #[test]
+    fn test_bin_rvc_constructs_forward_window_machine() {
+        let config = create_minimal_config(); // doppelganger_detection defaults true
+        assert!(config.doppelganger_detection);
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x11u8; 32];
+        let (_, pubkey_map) = loaded_key_manager(&builder, 1);
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map);
+
+        let machine = machine.expect("doppelganger on must construct ForwardWindowMachine");
+        // Same object is both the enablement and the machine handle.
+        let pk = pubkey_map.read().values().next().unwrap().clone();
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "registered key at epoch>0 must be gate-closed before liveness window"
+        );
+        assert!(
+            !machine.is_signing_enabled(&pk),
+            "machine handle must agree with enablement for the registered key"
+        );
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Pending,
+            "fresh registration at epoch 10 must be Pending"
+        );
+    }
+
+    /// A key registered at epoch E cannot sign before the window elapses when
+    /// no external liveness is observed (D-2 fail-closed; SEC-2c loop supplies observations).
+    #[test]
+    fn test_registered_key_gate_closed_until_window_elapses() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x22u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map);
+        let machine = machine.expect("machine present");
+
+        assert!(!enablement.is_signing_enabled(&pk));
+
+        // Tick well past the boundary WITHOUT observe_liveness → still closed.
+        let end_epoch = 50 + DEFAULT_MONITORING_EPOCHS;
+        machine.tick(end_epoch + 5, 0);
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "without complete liveness observation the gate must stay closed (D-2 fail-closed)"
+        );
+    }
+
+    /// Epoch-0 (pre-genesis) bypass: registered keys are immediately Safe.
+    #[test]
+    fn test_epoch0_bypass_preserved() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x33u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map);
+
+        assert!(machine.is_some());
+        assert!(
+            enablement.is_signing_enabled(&pk),
+            "epoch-0 register must immediately enable signing (pre-genesis bypass)"
+        );
+    }
+
+    /// Operator opt-out: no machine, every key enabled.
+    #[test]
+    fn test_doppelganger_opt_out_uses_disabled_by_operator() {
+        let config = Config { doppelganger_detection: false, ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x44u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map);
+
+        assert!(machine.is_none(), "opt-out must not construct ForwardWindowMachine");
+        assert!(
+            enablement.is_signing_enabled(&pk),
+            "DoppelgangerDisabledByOperator must enable all keys"
+        );
+        // Untracked pubkey also enabled (opt-out is total).
+        let other = crypto::SecretKey::generate().public_key();
+        assert!(enablement.is_signing_enabled(&other));
+    }
+
+    /// RF5-13: ServiceBuilder / config readers observe nested sub-struct knobs
+    /// (one representative field per nested group).
+    #[test]
+    fn test_builder_reads_nested_config_sections() {
+        use super::super::types::{
+            BuilderLimits, GrpcSignerConfig, KeymanagerConfig, LogfileConfig, MonitoringConfig,
+            ProposerConfigSource, TracingConfig, TracingExporter,
+        };
+
+        let config = Config {
+            keymanager: KeymanagerConfig {
+                enabled: true,
+                address: Some("127.0.0.1:5062".to_string()),
+                ..Default::default()
+            },
+            tracing: TracingConfig {
+                endpoint: Some("http://otel:4318".to_string()),
+                exporter: TracingExporter::Gcp,
+                sample_rate: Some(0.25),
+                ..Default::default()
+            },
+            logfile: LogfileConfig {
+                path: Some(std::path::PathBuf::from("/tmp/rvc.log")),
+                max_size: 50,
+                max_number: 3,
+                compress: true,
+                level: Some("debug".to_string()),
+            },
+            grpc_signer: GrpcSignerConfig {
+                url: Some("https://signer:50051".to_string()),
+                ..Default::default()
+            },
+            monitoring: MonitoringConfig {
+                endpoint: Some("https://mon.example/metrics".to_string()),
+                interval: 60,
+                endpoint_insecure: true,
+            },
+            proposer_config: ProposerConfigSource {
+                url: Some("https://cfg.example/p.json".to_string()),
+                refresh_interval: 120,
+                ..Default::default()
+            },
+            builder_limits: BuilderLimits {
+                circuit_breaker_consecutive_limit: 9,
+                circuit_breaker_epoch_limit: 11,
+            },
+            ..Default::default()
+        };
+
+        assert!(config.keymanager.enabled);
+        assert_eq!(config.keymanager.address.as_deref(), Some("127.0.0.1:5062"));
+        assert_eq!(config.tracing.endpoint.as_deref(), Some("http://otel:4318"));
+        assert_eq!(config.tracing.exporter, TracingExporter::Gcp);
+        assert_eq!(config.tracing.sample_rate, Some(0.25));
+        assert_eq!(config.logfile.max_size, 50);
+        assert_eq!(config.logfile.max_number, 3);
+        assert!(config.logfile.compress);
+        assert_eq!(config.grpc_signer.url.as_deref(), Some("https://signer:50051"));
+        assert_eq!(config.monitoring.interval, 60);
+        assert!(config.monitoring.endpoint_insecure);
+        assert_eq!(config.proposer_config.refresh_interval, 120);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 9);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 11);
+
+        // Builder constructs and reads nested keymanager.enabled for feature logging.
+        let builder = ServiceBuilder::new(config);
+        builder.log_effective_config();
     }
 }

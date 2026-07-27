@@ -5,14 +5,16 @@
 //! 2. Run integrity check
 //! 3. Validate genesis root against beacon node
 //! 4. Check beacon node reachability
-//! 5. Run doppelganger detection (if enabled)
+//! 5. Doppelganger / forward-window enablement is wired in `bin/rvc` via
+//!    [`ForwardWindowMachine`](doppelganger::ForwardWindowMachine) + the
+//!    SEC-2c liveness loop (not the legacy one-shot service).
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use bn_manager::BeaconNodeClient;
-use crypto::hex::{strip_prefix_strict, HexError};
 use fd_lock::RwLock;
+use observability::hex::{strip_prefix_strict, HexError};
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
 
@@ -21,7 +23,8 @@ use crate::config::ConfigError;
 /// Distinct exit codes for startup failures.
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
-pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
+// EXIT 12 reserved historically for one-shot doppelganger detection (retired with
+// run_doppelganger_detection; production uses ForwardWindowMachine + Detected gate).
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
 
@@ -34,9 +37,6 @@ pub enum StartupError {
     #[error("genesis validators root mismatch: local={local}, beacon={beacon}")]
     GenesisRootMismatch { local: String, beacon: String },
 
-    #[error("doppelganger detected for validators: {0:?}")]
-    DoppelgangerDetected(Vec<String>),
-
     #[error("unsupported consensus fork version {version}; upgrade rvc")]
     UnsupportedForkVersion { version: String },
 
@@ -48,9 +48,6 @@ pub enum StartupError {
 
     #[error("beacon error: {0}")]
     Beacon(#[from] beacon::BeaconError),
-
-    #[error("doppelganger error: {0}")]
-    Doppelganger(#[from] doppelganger::DoppelgangerError),
 
     #[error("keystore locked: {0}")]
     KeystoreLocked(String),
@@ -67,7 +64,6 @@ impl StartupError {
         match self {
             Self::IntegrityCheckFailed(_) => EXIT_INTEGRITY_CHECK_FAILED,
             Self::GenesisRootMismatch { .. } => EXIT_GENESIS_ROOT_MISMATCH,
-            Self::DoppelgangerDetected(_) => EXIT_DOPPELGANGER_DETECTED,
             Self::UnsupportedForkVersion { .. } => EXIT_UNSUPPORTED_FORK_VERSION,
             Self::KeystoreLocked(_) => EXIT_KEYSTORE_LOCKED,
             _ => 1,
@@ -112,8 +108,11 @@ pub async fn validate_genesis_root(
         });
     }
 
-    // Store normalized value (lowercase, no 0x prefix) for consistent comparisons
-    slashing_db.set_genesis_validators_root(&local_normalized)?;
+    // SlashingDb takes a typed Root, compares by bytes, and stores canonical
+    // `0x` + lowercase hex. Bare or mixed-case legacy metadata remains compatible.
+    let local_root = eth_types::canonical::gvr_hex::parse_gvr_hex(&local_normalized)
+        .map_err(|e| StartupError::InvalidHexInput(format!("genesis_validators_root: {e}")))?;
+    slashing_db.set_genesis_validators_root(&local_root)?;
 
     info!("Genesis validators root validated successfully");
     Ok(())
@@ -132,83 +131,6 @@ pub async fn check_beacon_reachability(beacon: &dyn BeaconNodeClient) {
             warn!(error = %e, "Beacon node may not be synced or reachable");
         }
     }
-}
-
-/// Run doppelganger detection for the given validators.
-pub async fn run_doppelganger_detection(
-    doppelganger: &doppelganger::DoppelgangerService,
-    pubkeys: &[String],
-    validator_indices: &std::collections::HashMap<String, String>,
-    current_epoch: u64,
-) -> Result<Vec<String>, StartupError> {
-    // S-3 (Issue 2.8): at epoch 0 (genesis / pre-genesis) no slots have occurred,
-    // so liveness-based detection is not meaningful and a pre-genesis beacon node
-    // may return Err from check_liveness, which would abort startup.  Return all
-    // validators as safe immediately, without issuing any beacon query.
-    //
-    // TODO(Issue 2.10): defend against clock-skew making current_epoch==0 mid-chain
-    // (cross-check wall clock vs genesis_time before bypassing).
-    if current_epoch == 0 {
-        info!(
-            count = pubkeys.len(),
-            "Doppelganger detection: pre-genesis (epoch 0) bypass — all validators marked Safe \
-             without a monitoring window (no beacon liveness query issued)"
-        );
-        return Ok(pubkeys.to_vec());
-    }
-
-    info!(validator_count = pubkeys.len(), "Starting doppelganger detection");
-
-    let check_results = doppelganger.check_validators(pubkeys, current_epoch)?;
-
-    let mut needs_monitoring: Vec<String> = Vec::new();
-    let mut safe: Vec<String> = Vec::new();
-
-    for (pubkey, status) in &check_results {
-        match status {
-            doppelganger::DoppelgangerStatus::Safe => {
-                safe.push(pubkey.clone());
-            }
-            doppelganger::DoppelgangerStatus::DetectionInProgress => {
-                needs_monitoring.push(pubkey.clone());
-            }
-            doppelganger::DoppelgangerStatus::DoppelgangerDetected => {
-                return Err(StartupError::DoppelgangerDetected(vec![pubkey.clone()]));
-            }
-        }
-    }
-
-    if safe.len() == pubkeys.len() {
-        info!(count = safe.len(), "All validators safe (restart-aware skip)");
-        return Ok(safe);
-    }
-
-    info!(
-        needs_monitoring = needs_monitoring.len(),
-        already_safe = safe.len(),
-        "Running doppelganger monitoring"
-    );
-
-    let result =
-        doppelganger.run_monitoring(&needs_monitoring, validator_indices, current_epoch).await?;
-
-    if !result.detected.is_empty() {
-        error!(
-            detected = ?result.detected,
-            "Doppelganger detected! Shutting down to prevent slashing"
-        );
-        return Err(StartupError::DoppelgangerDetected(result.detected));
-    }
-
-    let mut all_safe = safe;
-    all_safe.extend(result.safe_validators);
-
-    info!(
-        count = all_safe.len(),
-        "Doppelganger detection complete, all monitored validators are safe"
-    );
-
-    Ok(all_safe)
 }
 
 /// Log that the orchestrator has been started with validator and beacon node counts.
@@ -333,213 +255,44 @@ pub fn acquire_keystore_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootResponse, ConfigSpecResponse, DataResponse, GenesisData, GenesisResponse,
-        ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-        SignedContributionAndProof, StateForkResponse, StateResponse, SubmitAttestationResult,
-        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-        SyncingData, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
-        VersionedAttestation, VersionedSignedAggregateAndProof,
-    };
-    use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+    use beacon::{BeaconError, DataResponse, GenesisData, StateFork, StateResponse};
+    use bn_manager::MockBeaconNodeClient;
+    use eth_types::ForkSchedule;
 
-    // -- Mock BeaconNodeClient for testing --
+    // Shared mock helpers (RF4-24): error-by-default MockBeaconNodeClient with overrides.
 
-    struct MockBeacon {
-        genesis_root: String,
-        fork_version: String,
-        should_fail: bool,
-    }
-
-    impl MockBeacon {
-        fn with_root(root: &str) -> Self {
-            Self {
-                genesis_root: root.to_string(),
-                fork_version: "0x05000000".to_string(),
-                should_fail: false,
-            }
-        }
-
-        fn with_fork_version(version: &str) -> Self {
-            Self {
-                genesis_root: "0xdead".to_string(),
-                fork_version: version.to_string(),
-                should_fail: false,
-            }
-        }
-
-        fn failing() -> Self {
-            Self { genesis_root: String::new(), fork_version: String::new(), should_fail: true }
-        }
-    }
-
-    #[async_trait]
-    impl BeaconNodeClient for MockBeacon {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            if self.should_fail {
-                return Err(BeaconError::HttpError("mock failure".to_string()));
-            }
+    fn mock_with_root(root: &str) -> MockBeaconNodeClient {
+        let root = root.to_string();
+        MockBeaconNodeClient::new().with_get_genesis(move || {
             Ok(DataResponse {
                 data: GenesisData {
                     genesis_time: "1606824023".to_string(),
-                    genesis_validators_root: self.genesis_root.clone(),
+                    genesis_validators_root: root.clone(),
                     genesis_fork_version: "0x00000000".to_string(),
                 },
             })
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            if self.should_fail {
-                return Err(BeaconError::HttpError("mock failure".to_string()));
-            }
+        })
+    }
+
+    fn mock_with_fork_version(version: &str) -> MockBeaconNodeClient {
+        let version = version.to_string();
+        MockBeaconNodeClient::new().with_get_fork(move |_state_id| {
             Ok(StateResponse {
                 execution_optimistic: false,
                 finalized: true,
-                data: beacon::StateFork {
+                data: StateFork {
                     previous_version: "0x04000000".to_string(),
-                    current_version: self.fork_version.clone(),
+                    current_version: version.clone(),
                     epoch: "0".to_string(),
                 },
             })
-        }
-        async fn get_validators(
-            &self,
-            _pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(
-            &self,
-            _epoch: u64,
-        ) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _slot: u64,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(
-            &self,
-            _signed_block: &SignedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _signed_blinded_block: &SignedBlindedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _attestations: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _slot: u64,
-            _attestation_data_root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_sync_committee_messages(
-            &self,
-            _messages: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _slot: u64,
-            _subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _proofs: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[bn_manager::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Ok(DataResponse {
-                data: SyncingData {
-                    head_slot: "0".to_string(),
-                    sync_distance: "0".to_string(),
-                    is_syncing: false,
-                    is_optimistic: false,
-                    el_offline: false,
-                },
-            })
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Ok("MockBeacon/v0.0.0".to_string())
-        }
+        })
+    }
+
+    fn mock_failing() -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_get_genesis(|| Err(beacon::BeaconError::HttpError("mock failure".to_string())))
+            .with_get_fork(|_| Err(beacon::BeaconError::HttpError("mock failure".to_string())))
     }
 
     // -- Exit code tests --
@@ -557,12 +310,6 @@ mod tests {
             beacon: "0xdef".to_string(),
         };
         assert_eq!(err.exit_code(), EXIT_GENESIS_ROOT_MISMATCH);
-    }
-
-    #[test]
-    fn test_exit_code_doppelganger() {
-        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
-        assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
     }
 
     #[test]
@@ -599,11 +346,15 @@ mod tests {
         assert_eq!(normalize_hex("abcdef").unwrap(), "abcdef");
     }
 
+    // RF3-04: mainnet GVR hex literals below are test-side KAT anchors — an
+    // independent check that NetworkPreset delegation did not change the value.
+    // Production source of truth is eth_types::NetworkPreset::MAINNET.
+
     #[tokio::test]
     async fn test_validate_genesis_root_matching() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root);
+        let beacon = mock_with_root(root);
 
         let result = validate_genesis_root(&db, &beacon, root).await;
         assert!(result.is_ok());
@@ -614,7 +365,7 @@ mod tests {
         let root_lower = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let root_upper = "0x4B363DB94E286120D76EB905340FDD4E54BFE9F06BF33FF6CF5AD27F511BFE95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root_upper);
+        let beacon = mock_with_root(root_upper);
 
         let result = validate_genesis_root(&db, &beacon, root_lower).await;
         assert!(result.is_ok());
@@ -625,7 +376,7 @@ mod tests {
         let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let remote = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(remote);
+        let beacon = mock_with_root(remote);
 
         let result = validate_genesis_root(&db, &beacon, local).await;
         assert!(result.is_err());
@@ -639,7 +390,7 @@ mod tests {
     async fn test_validate_genesis_root_beacon_unreachable() {
         let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
 
         let result = validate_genesis_root(&db, &beacon, local).await;
         assert!(result.is_err());
@@ -650,16 +401,16 @@ mod tests {
     async fn test_validate_genesis_root_stores_normalized_in_slashing_db() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root);
+        let beacon = mock_with_root(root);
 
         validate_genesis_root(&db, &beacon, root).await.unwrap();
 
         let stored = db.genesis_validators_root().unwrap();
         assert!(stored.is_some());
-        // Stored value should be normalized: lowercase without 0x prefix
+        // RF3-17: stored value is canonical lowercase `0x`-prefixed hex
         assert_eq!(
             stored.unwrap(),
-            "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+            "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
         );
     }
 
@@ -667,14 +418,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_beacon_reachability_reachable() {
-        let beacon = MockBeacon::with_root("0xabc");
+        let beacon = mock_with_root("0xabc");
         // Should not panic, just log
         check_beacon_reachability(&beacon).await;
     }
 
     #[tokio::test]
     async fn test_check_beacon_reachability_unreachable() {
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
         // Should not panic, just warn
         check_beacon_reachability(&beacon).await;
     }
@@ -696,12 +447,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0xabc"));
         assert!(msg.contains("0xdef"));
-    }
-
-    #[test]
-    fn test_startup_error_display_doppelganger() {
-        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
-        assert!(err.to_string().contains("doppelganger detected"));
     }
 
     #[test]
@@ -738,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_known_version() {
-        let beacon = MockBeacon::with_fork_version("0x05000000");
+        let beacon = mock_with_fork_version("0x05000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -746,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_unknown_version() {
-        let beacon = MockBeacon::with_fork_version("0xdeadbeef");
+        let beacon = mock_with_fork_version("0xdeadbeef");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_err());
@@ -757,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_fulu_version() {
-        let beacon = MockBeacon::with_fork_version("0x06000000");
+        let beacon = mock_with_fork_version("0x06000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -765,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_genesis_version() {
-        let beacon = MockBeacon::with_fork_version("0x00000000");
+        let beacon = mock_with_fork_version("0x00000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -773,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_beacon_unreachable() {
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_err());
@@ -890,85 +635,5 @@ mod tests {
             "error variant must be InvalidHexInput"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
-    }
-
-    // -- S-3 (Issue 2.8): epoch-0 bypass in run_doppelganger_detection --
-
-    /// A `LivenessChecker` that panics if `check_liveness` is ever called.
-    ///
-    /// Used to prove that `run_doppelganger_detection` at epoch 0 returns
-    /// immediately without issuing any beacon node liveness query.
-    struct PanicsOnCheckLiveness;
-
-    #[async_trait]
-    impl doppelganger::LivenessChecker for PanicsOnCheckLiveness {
-        async fn check_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<Vec<doppelganger::ValidatorLivenessData>, doppelganger::DoppelgangerError>
-        {
-            panic!("check_liveness must NOT be called at epoch 0 (pre-genesis bypass)");
-        }
-    }
-
-    struct EmptySlashingDb;
-
-    impl doppelganger::LegacySlashingHistoryReader for EmptySlashingDb {
-        fn last_signed_attestation_epoch(
-            &self,
-            _pubkey: &str,
-        ) -> Result<Option<u64>, doppelganger::DoppelgangerError> {
-            Ok(None)
-        }
-    }
-
-    fn doppelganger_service_with_panicking_liveness() -> doppelganger::DoppelgangerService {
-        use std::sync::Arc;
-        let liveness: Arc<dyn doppelganger::LivenessChecker> = Arc::new(PanicsOnCheckLiveness);
-        let slashing: Arc<dyn doppelganger::LegacySlashingHistoryReader> =
-            Arc::new(EmptySlashingDb);
-        // genesis_time = 0 → current_epoch() would compute a very large number
-        // from SystemTime::now(), but we pass current_epoch explicitly so it
-        // does not matter for this test.
-        doppelganger::DoppelgangerService::new(liveness, slashing, 0)
-    }
-
-    /// S-3 (Issue 2.8): `run_doppelganger_detection` at epoch 0 must return all
-    /// pubkeys as Safe immediately without issuing any beacon liveness query.
-    ///
-    /// The `PanicsOnCheckLiveness` mock proves the BN is never contacted:
-    /// if the implementation falls through to `run_monitoring`, the panic fires.
-    #[tokio::test]
-    async fn test_run_doppelganger_detection_epoch_0_bypasses_bn_query() {
-        let service = doppelganger_service_with_panicking_liveness();
-        let pubkeys = vec!["0xpubkey_a".to_string(), "0xpubkey_b".to_string()];
-        let validator_indices = std::collections::HashMap::new();
-
-        let result = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 0).await;
-
-        assert!(result.is_ok(), "epoch-0 bypass must return Ok, got: {:?}", result.unwrap_err());
-        let safe = result.unwrap();
-        assert_eq!(safe, pubkeys, "epoch-0 bypass must return all pubkeys as Safe");
-        // If PanicsOnCheckLiveness::check_liveness had been called, the test
-        // would have panicked before reaching this assertion.
-    }
-
-    /// S-3: epoch > 0 still invokes the normal detection path (regression guard).
-    ///
-    /// At epoch 1, `check_validators` is called and returns `DetectionInProgress`
-    /// (no slashing DB entry), which causes `run_monitoring` to be invoked — and
-    /// `PanicsOnCheckLiveness::check_liveness` fires.  This confirms the bypass
-    /// is epoch-0-ONLY and that the normal path is not silently short-circuited.
-    #[tokio::test]
-    #[should_panic(expected = "check_liveness must NOT be called at epoch 0")]
-    async fn test_run_doppelganger_detection_epoch_1_calls_bn() {
-        let service = doppelganger_service_with_panicking_liveness();
-        let pubkeys = vec!["0xpubkey_a".to_string()];
-        let mut validator_indices = std::collections::HashMap::new();
-        validator_indices.insert("0xpubkey_a".to_string(), "1".to_string());
-
-        // At epoch 1 the service calls run_monitoring → check_liveness → panic.
-        let _ = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 1).await;
     }
 }

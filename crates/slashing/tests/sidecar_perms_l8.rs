@@ -7,6 +7,8 @@
 //! the 0o600 protection on the main file.
 
 #![cfg(unix)]
+// RF1-12: Tests temporarily change process umask via libc (Unix-only).
+#![allow(unsafe_code)]
 
 use std::os::unix::fs::PermissionsExt;
 

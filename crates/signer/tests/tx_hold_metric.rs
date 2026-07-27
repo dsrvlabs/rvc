@@ -3,12 +3,14 @@
 //! These tests assert that the tx-hold histogram is observed on every
 //! stage → commit (happy path) and stage → discard (signer failure) cycle.
 
+mod common;
+
 use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
 use metrics::definitions::{tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS};
-use rvc_signer::SignerService;
+use rvc_signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ async fn test_metric_recorded_on_stage_commit() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(signer, db);
+    let service = SignerService::new(signer, db).with_enablement(common::always_allowed());
 
     let fs = make_fork_schedule();
     let data = make_attestation_data(1, 2);
@@ -102,7 +104,7 @@ async fn test_metric_recorded_on_stage_discard() {
     // Empty signer — sign call will fail with KeyNotFound, triggering discard.
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(empty_signer, db);
+    let service = SignerService::new(empty_signer, db).with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -149,7 +151,7 @@ async fn test_metric_recorded_on_stage_slashing_rejected() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(signer, db);
+    let service = SignerService::new(signer, db).with_enablement(common::always_allowed());
 
     let fs = make_fork_schedule();
 

@@ -12,7 +12,7 @@
 //! # Schema-agnostic design
 //!
 //! All assertions are driven through the `SlashingProtection` trait interface
-//! (`pubkeys in → Result<String, String> out`).  The test does NOT inspect any
+//! (`pubkeys in → Result<String, SlashingProtectionError> out`).  The test does NOT inspect any
 //! on-disk SQLite layout, column names, or file paths.  This means it passes
 //! against both the current slashing-DB schema and any future schema revision
 //! (e.g., the v2 schema added by Issue 2.4).
@@ -25,7 +25,8 @@ use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{delete_keystores, AppState};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DoppelgangerMonitor, ImportKeystoreError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    RemoteKeyManager, SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
+    ValidatorManager,
 };
 use rvc_keymanager_api::types::{DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteStatus};
 
@@ -50,7 +51,11 @@ fn make_state(
         keystore_manager,
         slashing_protection,
         validator_manager: Arc::new(NoopValidatorManager),
-        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            std::time::Duration::ZERO,
+            Arc::new(NoopDoppelgangerMonitor),
+            Arc::new(NoopValidatorManager),
+        )),
         remote_key_manager: Arc::new(NoopRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -58,9 +63,6 @@ fn make_state(
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: std::time::Duration::ZERO,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     })
 }
 
@@ -71,12 +73,12 @@ fn make_state(
 struct FailingExport;
 
 impl SlashingProtection for FailingExport {
-    fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
+    fn import_interchange(&self, _interchange_json: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
 
-    fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, String> {
-        Err("boom: slashing DB unavailable".into())
+    fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+        Err(SlashingProtectionError::Backend("boom: slashing DB unavailable".into()))
     }
 }
 
@@ -88,11 +90,11 @@ impl SlashingProtection for FailingExport {
 struct RecordingExport;
 
 impl SlashingProtection for RecordingExport {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
 
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         let data: Vec<serde_json::Value> = pubkeys
             .iter()
             .map(|pk| {

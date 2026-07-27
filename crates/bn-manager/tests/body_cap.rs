@@ -39,7 +39,7 @@ fn test_bn_manager_config_with_max_body_bytes() {
 #[tokio::test]
 async fn test_bn_manager_applies_cap_to_clients() {
     use beacon::BeaconError;
-    use rvc_bn_manager::BeaconNodeClient;
+    use rvc_bn_manager::NodeStatusApi;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 

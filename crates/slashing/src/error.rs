@@ -10,9 +10,6 @@ pub enum SlashingError {
     #[error("database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
 
-    #[error("migration error: {0}")]
-    MigrationError(String),
-
     #[error("schema migration failed: {0}")]
     MigrationFailed(String),
 
@@ -44,26 +41,56 @@ pub enum SlashingError {
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
 
-    #[error("watermark can only be raised: attempted to lower {watermark_type} for {pubkey}")]
-    WatermarkLowered { pubkey: String, watermark_type: String },
+    #[error(
+        "watermark can only be raised: attempted to lower {watermark_type} for {pubkey} \
+         (current={current}, attempted={attempted})"
+    )]
+    WatermarkLowered { pubkey: String, watermark_type: String, current: u64, attempted: u64 },
 
-    #[error("no watermarks set: pruning without watermarks would delete all records")]
+    #[error(
+        "no watermarks set — import an EIP-3076 interchange (or set watermarks) before pruning; \
+         pruning without watermarks would delete all records"
+    )]
     NoWatermarksSet,
 
-    #[error("block at slot {slot} is below watermark slot {watermark_slot}")]
-    BelowBlockWatermark { slot: Slot, watermark_slot: Slot },
+    #[error(
+        "block at slot {slot} is at or below watermark slot {watermark_slot} for pubkey {pubkey}"
+    )]
+    BelowBlockWatermark { pubkey: String, slot: Slot, watermark_slot: Slot },
 
-    #[error("attestation with target epoch {target_epoch} is below watermark target epoch {watermark_target}")]
-    BelowAttestationWatermark { target_epoch: Epoch, watermark_target: Epoch },
+    #[error(
+        "attestation with target epoch {target_epoch} is at or below watermark target epoch \
+         {watermark_target} for pubkey {pubkey}"
+    )]
+    BelowAttestationWatermark { pubkey: String, target_epoch: Epoch, watermark_target: Epoch },
 
-    #[error("attestation with source epoch {source_epoch} is below watermark source epoch {watermark_source}")]
-    BelowAttestationSourceWatermark { source_epoch: Epoch, watermark_source: Epoch },
+    #[error(
+        "attestation with source epoch {source_epoch} is below watermark source epoch \
+         {watermark_source} for pubkey {pubkey}"
+    )]
+    BelowAttestationSourceWatermark { pubkey: String, source_epoch: Epoch, watermark_source: Epoch },
 
     #[error("unsafe file permissions on {path} (mode {mode}): group or world accessible")]
     UnsafePermissions { path: String, mode: String },
 
     #[error("Slashing DB refused to open with non-WAL journal mode: actual={actual}. {hint}")]
     JournalMode { actual: String, hint: String },
+
+    /// Empty (0-byte) or non-SQLite header at the configured path.
+    ///
+    /// SEC-3: a truncated/partial-write file is corruption, never a legitimate
+    /// fresh init. Operators must restore from backup; opt-in flags cannot
+    /// override this.
+    #[error(
+        "slashing protection database at {path} is empty or has a corrupt SQLite header \
+         (size={size} bytes). This is corruption, not a fresh init — restore from backup. \
+         Opt-in flags (--init-slashing-db / allow_fresh_db) cannot override this."
+    )]
+    CorruptOrEmpty { path: String, size: u64 },
+
+    /// File inspection failed before open (permissions, I/O).
+    #[error("failed to inspect slashing protection database at {path}: {message}")]
+    InspectFailed { path: String, message: String },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
