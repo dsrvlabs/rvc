@@ -487,13 +487,13 @@ produced by a `stage_block(` / `stage_attestation(` call. Report file, line and 
   must not be flagged.
 
 **Acceptance criteria.**
-- [ ] `crates/architecture-tests/tests/audit_log_scope.rs` exists; no existing gate file and no
+- [x] `crates/architecture-tests/tests/audit_log_scope.rs` exists; no existing gate file and no
       `architecture-tests/src/lib.rs` line is modified.
-- [ ] The gate names file **and** line for each violation.
-- [ ] Both non-vacuity assertions present.
-- [ ] Both synthetic fixtures (RED and GREEN) present.
-- [ ] `cargo nextest run -p rvc-architecture-tests` green in the `arch-gates` CI job (Phase 0's A-P1).
-- [ ] The pre-change RED output, naming both `:75` and `:106`, is pasted into the PR.
+- [x] The gate names file **and** line for each violation.
+- [x] Both non-vacuity assertions present.
+- [x] Both synthetic fixtures (RED and GREEN) present.
+- [x] `cargo nextest run -p rvc-architecture-tests` green in the `arch-gates` CI job (Phase 0's A-P1).
+- [x] The pre-change RED output, naming both `:75` and `:106`, is pasted into the PR.
 
 ---
 
