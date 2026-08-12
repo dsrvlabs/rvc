@@ -60,6 +60,8 @@ axum.workspace = true
 # test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
 bn-manager = { workspace = true, features = ["test-utils"] }
 crypto.workspace = true
+# ARCH-7b: valid Deneb body fixtures for proposal success path in M1 harness.
+eth-types = { workspace = true, features = ["test-fixtures"] }
 http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
 # for the RF1-02 fail-closed DB-error integration test.
@@ -73,6 +75,8 @@ tokio-stream.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tracing-test.workspace = true
+# ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 criterion.workspace = true
 
