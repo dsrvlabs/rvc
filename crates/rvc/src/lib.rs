@@ -7,6 +7,7 @@ pub mod config;
 pub mod deletion_denylist;
 pub mod doppelganger_adapter;
 pub mod grpc_health;
+pub mod key_admission;
 pub mod keymanager_adapters;
 pub mod liveness_loop;
 pub mod orchestrator;

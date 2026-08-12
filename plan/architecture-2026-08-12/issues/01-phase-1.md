@@ -637,17 +637,17 @@ teardown call of either kind, and must leave the keymanager adapters' existing D
   `admit` behind `impl Fn(SecretKey)` is the cheapest proof.
 
 **Acceptance criteria.**
-- [ ] `KeyAdmissionService`, `AdmissionSource`, `AdmissionOutcome`, `AdmissionError` exist as specified;
+- [x] `KeyAdmissionService`, `AdmissionSource`, `AdmissionOutcome`, `AdmissionError` exist as specified;
       errors use `thiserror`, not `anyhow` (CLAUDE.md, library seam).
-- [ ] `admit` is synchronous and callable from an `Fn(SecretKey)` closure; the doc comment records why.
-- [ ] All six store updates happen in the stated order, with the `key_gen_tx` bump last.
-- [ ] `RawSecret` admission performs **no** filesystem write (asserted).
-- [ ] Denylist skip returns `SkippedDenylisted`, not an error, and mutates nothing.
-- [ ] `KeyChangeNotifier` is retained unchanged and is an internal collaborator.
-- [ ] **No `withdraw`**, no `stop_monitoring`/`cancel_monitoring` call, no change to the DELETE path
+- [x] `admit` is synchronous and callable from an `Fn(SecretKey)` closure; the doc comment records why.
+- [x] All six store updates happen in the stated order, with the `key_gen_tx` bump last.
+- [x] `RawSecret` admission performs **no** filesystem write (asserted).
+- [x] Denylist skip returns `SkippedDenylisted`, not an error, and mutates nothing.
+- [x] `KeyChangeNotifier` is retained unchanged and is an internal collaborator.
+- [x] **No `withdraw`**, no `stop_monitoring`/`cancel_monitoring` call, no change to the DELETE path
       (A-1.4 / C5).
-- [ ] `///` docs on every public item (CLAUDE.md); no `.unwrap()` in the module.
-- [ ] No new channel (C9 anchor 6); no new signing surface (C9 anchor 5).
+- [x] `///` docs on every public item (CLAUDE.md); no `.unwrap()` in the module.
+- [x] No new channel (C9 anchor 6); no new signing surface (C9 anchor 5).
 
 ---
 
