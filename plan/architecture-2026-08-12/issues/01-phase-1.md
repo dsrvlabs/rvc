@@ -1098,9 +1098,13 @@ port and the date — is written into this phase's PR description **and** append
 than assumed. Do not edit any source file in this issue.
 
 **Acceptance criteria.**
-- [ ] The probe command and its literal output are recorded.
-- [ ] A verdict is stated: *defect reproduces* or *finding withdrawn (+ where the TOML is re-applied)*.
-- [ ] ARCH-6b is confirmed or cancelled on the basis of the verdict, in writing.
+- [x] The probe command and its literal output are recorded.
+- [x] A verdict is stated: *defect reproduces* or *finding withdrawn (+ where the TOML is re-applied)*.
+- [x] ARCH-6b is confirmed or cancelled on the basis of the verdict, in writing.
+
+**ARCH-6a result (2026-08-12):** defect reproduces (`metrics_port=8080` with TOML `9090`, no flag).
+Record: [`../measurements/arch-6a-adr009-precedence-probe.md`](../measurements/arch-6a-adr009-precedence-probe.md).
+**ARCH-6b confirmed** (proceeds as written). Security review findings 1–3 on the pre-existing clobber class: **wontfix** for this spike — tracked for ARCH-6b.
 
 ---
 
