@@ -642,12 +642,8 @@ async fn build_harness(
 
 // ── drive_orchestrator ───────────────────────────────────────────────────────
 
-/// Drive a `!Send` orchestrator on the current thread.
-///
-/// Isolation of `LocalSet` / `spawn_local` is intentional: **ADR-002** (Phase 2)
-/// removes `?Send` from `BeaconBlockClient` and makes the orchestrator `Send`.
-/// When that lands, replace this helper's scaffold with a bare `tokio::spawn` —
-/// a one-function change, not a rewrite of the M1 harness Phase 3 depends on.
+/// Drive the orchestrator via bare `tokio::spawn` (ADR-002 regression pin).
+/// Do not reintroduce a thread-local task scaffold (project-plan RP6).
 async fn drive_orchestrator<C, S, B, F, Fut>(
     mut orchestrator: DutyOrchestrator<C, S, B>,
     handle: OrchestratorHandle,
@@ -659,16 +655,11 @@ async fn drive_orchestrator<C, S, B, F, Fut>(
     F: FnOnce(OrchestratorHandle) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            let run_task = tokio::task::spawn_local(async move {
-                let _ = orchestrator.run().await;
-            });
-            scenario(handle).await;
-            let _ = run_task.await;
-        })
-        .await;
+    let run_task = tokio::spawn(async move {
+        let _ = orchestrator.run().await;
+    });
+    scenario(handle).await;
+    let _ = run_task.await;
 }
 
 fn histogram_count(cache: &str) -> u64 {

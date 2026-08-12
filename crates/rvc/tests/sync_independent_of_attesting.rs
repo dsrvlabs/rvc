@@ -245,9 +245,9 @@ async fn build_integration_orchestrator(
 ///   `if attesting_enabled` guard → `submitted_tx` never fires → timeout.
 /// GREEN (after fix): guard is split; `submitted_tx` fires promptly.
 ///
-/// Note: `DutyOrchestrator::run()` is `!Send` because `BeaconBlockClient` uses
-/// `#[async_trait(?Send)]`.  We use `tokio::task::LocalSet` to run the future
-/// on the current thread without requiring `Send`.
+/// ADR-002 regression pin: bare `tokio::spawn` of `orchestrator.run()` proves
+/// the future is `Send`. Do not reintroduce a thread-local task scaffold
+/// (project-plan RP6).
 #[tokio::test]
 async fn test_sync_runs_with_attesting_disabled() {
     let sk = SecretKey::generate();
@@ -266,27 +266,20 @@ async fn test_sync_runs_with_attesting_disabled() {
 
     // sync_enabled defaults to true — no explicit call needed, but shown for clarity.
 
-    let local = tokio::task::LocalSet::new();
-    let result = local
-        .run_until(async move {
-            // spawn_local runs on the current thread → no Send requirement.
-            let run_task = tokio::task::spawn_local(async move { orchestrator.run().await });
+    // ADR-002 regression pin: bare tokio::spawn; do not reintroduce thread-local scaffold.
+    let run_task = tokio::spawn(async move { orchestrator.run().await });
 
-            // Wait for the sync submission notification, or bail after 5 s.
-            // With the clock past 2/3 all phase waits are zero, so this fires
-            // almost immediately after the task starts.
-            let received = tokio::time::timeout(Duration::from_secs(5), submitted_rx).await;
+    // Wait for the sync submission notification, or bail after 5 s.
+    // With the clock past 2/3 all phase waits are zero, so this fires
+    // almost immediately after the task starts.
+    let received = tokio::time::timeout(Duration::from_secs(5), submitted_rx).await;
 
-            // Signal shutdown to interrupt the "wait for next slot" sleep.
-            handle.shutdown();
-            let _ = run_task.await;
-
-            received
-        })
-        .await;
+    // Signal shutdown to interrupt the "wait for next slot" sleep.
+    handle.shutdown();
+    let _ = run_task.await;
 
     assert!(
-        result.is_ok(),
+        received.is_ok(),
         "H-7: sync messages must be produced even when attesting is disabled \
          (sync_enabled defaults to true)"
     );
@@ -323,31 +316,23 @@ async fn test_sync_disabled_attesting_enabled() {
     // Explicitly disable sync (the flag being tested).
     orchestrator.set_sync_enabled(false);
 
-    let count_after_phases = Arc::new(AtomicUsize::new(0));
-    let cap = count_after_phases.clone();
+    // ADR-002 regression pin: bare tokio::spawn; do not reintroduce thread-local scaffold.
+    let run_task = tokio::spawn(async move { orchestrator.run().await });
 
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async move {
-            let run_task = tokio::task::spawn_local(async move { orchestrator.run().await });
+    // Give the orchestrator enough time to process the slot phases.
+    // All waits are zero because the clock is past 2/3 of slot 0, so
+    // 300 ms is more than sufficient for the synchronous mock calls.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-            // Give the orchestrator enough time to process the slot phases.
-            // All waits are zero because the clock is past 2/3 of slot 0, so
-            // 300 ms is more than sufficient for the synchronous mock calls.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+    // Snapshot the counter before shutdown to avoid a race.
+    let count_after_phases = submitted_count.load(Ordering::SeqCst);
 
-            // Snapshot the counter before shutdown to avoid a race.
-            cap.store(submitted_count.load(Ordering::SeqCst), Ordering::SeqCst);
-
-            // Shutdown interrupts the "wait for next slot" sleep.
-            handle.shutdown();
-            let _ = run_task.await;
-        })
-        .await;
+    // Shutdown interrupts the "wait for next slot" sleep.
+    handle.shutdown();
+    let _ = run_task.await;
 
     assert_eq!(
-        count_after_phases.load(Ordering::SeqCst),
-        0,
+        count_after_phases, 0,
         "H-7: sync messages must NOT be produced when sync_enabled = false"
     );
 }
