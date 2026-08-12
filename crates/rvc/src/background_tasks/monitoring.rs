@@ -25,7 +25,8 @@ pub struct MonitoringPayload {
 /// Collects current process metrics into a `MonitoringPayload`.
 ///
 /// `validator_total` and `validator_active` are provided by the caller
-/// (from the validator store). CPU and memory are read from the current process.
+/// (typically live `PubkeyMap` size and enabled `ValidatorStore` count).
+/// CPU and memory are read from the current process.
 pub fn collect_metrics(validator_total: u32, validator_active: u32) -> MonitoringPayload {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

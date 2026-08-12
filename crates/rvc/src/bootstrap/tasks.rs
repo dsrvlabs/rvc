@@ -5,15 +5,18 @@
 //! startup chain.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::{serve_metrics_with_health, SharedHealthStatus};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use validator_store::ValidatorStore;
 
 use super::BootstrapError;
 use crate::config::{redact_url, Config};
+use crate::orchestrator::PubkeyMap;
 
 /// Env var that opts in to non-loopback metrics binds (ISSUE-4.10 / L-10).
 pub const METRICS_ALLOW_NON_LOOPBACK_ENV: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
@@ -66,17 +69,38 @@ pub fn check_metrics_bind_gate(metrics_address: IpAddr) -> Result<(), BootstrapE
     Ok(())
 }
 
+/// Live validator counts for the monitoring push.
+///
+/// Returns `(total_loaded, active_enabled)`:
+/// - element 0 = keys currently loaded in [`PubkeyMap`]
+/// - element 1 = signing-enabled validators in [`ValidatorStore`]
+///
+/// Reads are sequential (map guard dropped before store access) so the two
+/// locks are never held nested. The pair is a **best-effort, non-atomic
+/// snapshot**: a monitoring tick can briefly observe `active > total` (e.g.
+/// DELETE removes the map entry before the store entry). Operational
+/// telemetry only — not a transactional inventory; accepted residual.
+fn live_monitoring_counts(pubkey_map: &PubkeyMap, validator_store: &ValidatorStore) -> (u32, u32) {
+    let total = pubkey_map.read().len() as u32;
+    let active = validator_store.list_enabled_pubkeys().len() as u32;
+    (total, active)
+}
+
 /// Spawn metrics server, optional monitoring push, and optional proposer-config
 /// refresh. Callers must hold [`BackgroundTasks`] until graceful shutdown.
 ///
 /// Tasks that take `shutdown` exit when the token is cancelled. The metrics
 /// server is aborted and awaited with [`METRICS_SHUTDOWN_TIMEOUT`] via
 /// [`BackgroundTasks::shutdown`].
+///
+/// `pubkey_map` and `validator_store` are captured by the monitoring push so
+/// each interval reports live totals (not a boot-time constant).
 pub fn spawn_background_tasks(
     config: &Config,
     health_status: SharedHealthStatus,
     shutdown: &CancellationToken,
-    validator_count: usize,
+    pubkey_map: PubkeyMap,
+    validator_store: Arc<ValidatorStore>,
 ) -> Result<BackgroundTasks, BootstrapError> {
     let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
@@ -100,10 +124,11 @@ pub fn spawn_background_tasks(
             interval_secs = config.monitoring.interval,
             "Starting monitoring push task"
         );
+        // Element 0 = total loaded; element 1 = active/enabled (see live_monitoring_counts).
         tokio::spawn(crate::background_tasks::monitoring::start_monitoring_push(
             monitoring_config,
             monitoring_shutdown,
-            move || (validator_count as u32, validator_count as u32),
+            move || live_monitoring_counts(&pubkey_map, &validator_store),
         ));
     }
 
@@ -156,8 +181,17 @@ impl BackgroundTasks {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+    use keymanager_api::traits::KeystoreManager;
+    use tempfile::TempDir;
+    use tokio::sync::watch;
+    use validator_store::ValidatorConfig;
+
+    use crate::keymanager_adapters::KeystoreManagerAdapter;
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -181,6 +215,25 @@ mod tests {
                 None => std::env::remove_var(METRICS_ALLOW_NON_LOOPBACK_ENV),
             }
         }
+    }
+
+    fn empty_pubkey_map() -> PubkeyMap {
+        Arc::new(parking_lot::RwLock::new(HashMap::new()))
+    }
+
+    fn empty_validator_store() -> Arc<ValidatorStore> {
+        Arc::new(ValidatorStore::new([0u8; 20], 30_000_000))
+    }
+
+    fn encrypt_test_keystore(sk: &SecretKey) -> String {
+        let keystore = crypto::Keystore::encrypt(
+            sk,
+            b"testpass",
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        serde_json::to_string(&keystore).expect("serialize keystore")
     }
 
     #[test]
@@ -223,8 +276,14 @@ mod tests {
         let health = metrics::new_health_status();
         let shutdown = CancellationToken::new();
 
-        let tasks =
-            spawn_background_tasks(&config, health, &shutdown, 0).expect("loopback metrics spawn");
+        let tasks = spawn_background_tasks(
+            &config,
+            health,
+            &shutdown,
+            empty_pubkey_map(),
+            empty_validator_store(),
+        )
+        .expect("loopback metrics spawn");
 
         // Give the server a moment to start, then shut down.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -242,7 +301,14 @@ mod tests {
         };
         let health = metrics::new_health_status();
         let shutdown = CancellationToken::new();
-        let tasks = spawn_background_tasks(&config, health, &shutdown, 0).expect("spawn");
+        let tasks = spawn_background_tasks(
+            &config,
+            health,
+            &shutdown,
+            empty_pubkey_map(),
+            empty_validator_store(),
+        )
+        .expect("spawn");
 
         let start = std::time::Instant::now();
         tasks.shutdown().await;
@@ -250,6 +316,83 @@ mod tests {
         assert!(
             start.elapsed() < METRICS_SHUTDOWN_TIMEOUT + Duration::from_millis(500),
             "metrics drain exceeded shutdown bound"
+        );
+    }
+
+    #[test]
+    fn monitoring_count_reflects_a_keymanager_import() {
+        let pubkey_map = empty_pubkey_map();
+        let validator_store = empty_validator_store();
+        let count = || live_monitoring_counts(&pubkey_map, &validator_store);
+
+        assert_eq!(count(), (0, 0));
+
+        let dir = TempDir::new().unwrap();
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let (tx, _rx) = watch::channel(0u64);
+        let adapter = KeystoreManagerAdapter::new(
+            dir.path().to_path_buf(),
+            composite,
+            pubkey_map.clone(),
+            tx,
+        );
+
+        let sk = SecretKey::generate();
+        let keystore_json = encrypt_test_keystore(&sk);
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+
+        let (total, _active) = count();
+        assert_eq!(total, 1, "keymanager import must bump live total loaded count");
+    }
+
+    #[test]
+    fn monitoring_count_reflects_a_delete() {
+        let pubkey_map = empty_pubkey_map();
+        let validator_store = empty_validator_store();
+        let count = || live_monitoring_counts(&pubkey_map, &validator_store);
+
+        let dir = TempDir::new().unwrap();
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let (tx, _rx) = watch::channel(0u64);
+        let adapter = KeystoreManagerAdapter::new(
+            dir.path().to_path_buf(),
+            composite,
+            pubkey_map.clone(),
+            tx,
+        );
+
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let keystore_json = encrypt_test_keystore(&sk);
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+        assert_eq!(count().0, 1);
+
+        assert!(adapter.delete_keystore(&pk_bytes).unwrap());
+        assert_eq!(count().0, 0, "keymanager delete must drop live total loaded count");
+    }
+
+    #[test]
+    fn total_and_active_are_distinct_when_a_validator_is_disabled() {
+        let pubkey_map = empty_pubkey_map();
+        let validator_store = empty_validator_store();
+
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let pk1 = sk1.public_key().to_bytes();
+        let pk2 = sk2.public_key().to_bytes();
+
+        pubkey_map.write().insert(pk1, sk1.public_key());
+        pubkey_map.write().insert(pk2, sk2.public_key());
+        validator_store.add_validator(ValidatorConfig::new(pk1));
+        validator_store.add_validator(ValidatorConfig::new(pk2));
+
+        assert_eq!(live_monitoring_counts(&pubkey_map, &validator_store), (2, 2));
+
+        validator_store.set_enabled(&pk1, false);
+        assert_eq!(
+            live_monitoring_counts(&pubkey_map, &validator_store),
+            (2, 1),
+            "disabled validator must reduce active without changing total loaded"
         );
     }
 }

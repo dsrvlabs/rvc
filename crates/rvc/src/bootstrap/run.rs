@@ -298,8 +298,13 @@ pub async fn run(
             }
         });
 
-    let background: BackgroundTasks =
-        spawn_background_tasks(&config, health_status, &shutdown_token, validator_count)?;
+    let background: BackgroundTasks = spawn_background_tasks(
+        &config,
+        health_status,
+        &shutdown_token,
+        pubkey_map.clone(),
+        validator_store.clone(),
+    )?;
 
     // Log broadcast topics if non-default (T3.4)
     {

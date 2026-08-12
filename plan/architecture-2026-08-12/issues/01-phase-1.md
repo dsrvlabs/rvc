@@ -766,13 +766,13 @@ background task is the same footgun with a longer fuse.
 - **Behaviour parity:** with no monitoring endpoint configured, no task is spawned (guard at `:91`).
 
 **Acceptance criteria.**
-- [ ] `spawn_background_tasks` no longer takes a `usize` count; the closure reads live state on each call.
-- [ ] The two tuple elements mean different things and the closure's doc comment says which is which.
-- [ ] Import, delete and disable each change the pushed values (three tests).
-- [ ] No nested `PubkeyMap` + `ValidatorStore` lock scope.
-- [ ] `run.rs:293`'s boot-time `log_orchestrator_started` count is unchanged (it is legitimately
+- [x] `spawn_background_tasks` no longer takes a `usize` count; the closure reads live state on each call.
+- [x] The two tuple elements mean different things and the closure's doc comment says which is which.
+- [x] Import, delete and disable each change the pushed values (three tests).
+- [x] No nested `PubkeyMap` + `ValidatorStore` lock scope.
+- [x] `run.rs:293`'s boot-time `log_orchestrator_started` count is unchanged (it is legitimately
       boot-time).
-- [ ] No new channel; no new task.
+- [x] No new channel; no new task.
 
 ---
 
