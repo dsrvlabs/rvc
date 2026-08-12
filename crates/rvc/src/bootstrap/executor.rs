@@ -4,8 +4,8 @@
 //! A per-task monitor joins the work handle so a panic surfaces immediately as
 //! [`ShutdownReason::Failure`] rather than as a silent leak.
 //!
-//! Tiered drain budgets and process metrics land in follow-on issues (ARCH-2e / 2f).
-//! This module is the core: `register` / `spawn` / `register_opt` and the monitor.
+//! Shutdown drains tiers in order (Ingress → Orchestrator → Background → Telemetry)
+//! under per-tier budgets ([`TierBudget`]). Process metrics land in ARCH-2f.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 /// Drain order. Lower tiers drain first; each tier is fully drained (or its
 /// budget expires) before the next begins.
@@ -53,7 +54,9 @@ impl ShutdownReason {
 /// Per-tier wall-clock budgets. Defaults sum to A-7's 5 s total process budget:
 /// Ingress 2.0 / Orchestrator 2.0 / Background 0.5 / Telemetry 0.5.
 ///
-/// Consumed by [`TaskExecutor::shutdown`]; full tier-ordered drain is ARCH-2e.
+/// Consumed by [`TaskExecutor::shutdown`]. RA-5: Telemetry stays 0.5 s (abort-drain)
+/// until the metrics server is converted to cooperative shutdown (ARCH-2g); that
+/// conversion would raise Telemetry to 2.0 s and the process total to 6.5 s.
 #[derive(Copy, Clone, Debug)]
 pub struct TierBudget([Duration; 4]);
 
@@ -69,6 +72,12 @@ impl Default for TierBudget {
 }
 
 impl TierBudget {
+    /// Build a budget from explicit per-tier durations
+    /// (`[Ingress, Orchestrator, Background, Telemetry]`).
+    pub const fn new(budgets: [Duration; 4]) -> Self {
+        Self(budgets)
+    }
+
     /// Budget for a single tier, indexed by [`ShutdownTier`] discriminant order.
     pub fn for_tier(&self, tier: ShutdownTier) -> Duration {
         self.0[tier as usize]
@@ -90,8 +99,7 @@ pub struct ShutdownOutcome {
 
 struct Registered {
     name: &'static str,
-    /// Drain order key; read by ARCH-2e tiered drain (unused until then).
-    #[allow(dead_code)]
+    /// Drain order key (Ingress → … → Telemetry).
     tier: ShutdownTier,
     /// Aborts the work task when its tier budget expires.
     work: AbortHandle,
@@ -211,12 +219,17 @@ impl TaskExecutor {
         }
     }
 
-    /// Cancel the token and join every registered monitor.
+    /// Cancel the process token once, then drain registered tasks tier by tier.
     ///
-    /// Consumes `self` so a double drain cannot compile. Full tier-ordered budget
-    /// drain lands in ARCH-2e; this core path cancels once, aborts unfinished work,
-    /// and joins monitors so no task is left orphaned.
-    pub async fn shutdown(self, _budget: TierBudget) -> ShutdownOutcome {
+    /// Drain order is [`ShutdownTier`] ascending: Ingress → Orchestrator →
+    /// Background → Telemetry. Each tier is given `budget.for_tier(tier)` wall
+    /// time to join cooperatively; stragglers are `work.abort()`ed, logged at
+    /// `warn` with their static name, and recorded in
+    /// [`ShutdownOutcome::aborted`].
+    ///
+    /// Consumes `self` so a double drain cannot compile.
+    pub async fn shutdown(self, budget: TierBudget) -> ShutdownOutcome {
+        // Exactly once — cooperative tasks across all tiers observe the same cancel.
         self.token.cancel();
 
         let registered = {
@@ -224,18 +237,113 @@ impl TaskExecutor {
             std::mem::take(&mut *guard)
         };
 
-        let mut joined = Vec::with_capacity(registered.len());
-        let aborted = Vec::new();
-
+        let mut by_tier: [Vec<Registered>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         for r in registered {
-            if !r.work.is_finished() {
-                r.work.abort();
+            by_tier[r.tier as usize].push(r);
+        }
+
+        let mut joined = Vec::new();
+        let mut aborted = Vec::new();
+
+        const TIERS: [ShutdownTier; 4] = [
+            ShutdownTier::Ingress,
+            ShutdownTier::Orchestrator,
+            ShutdownTier::Background,
+            ShutdownTier::Telemetry,
+        ];
+
+        for tier in TIERS {
+            let tasks = std::mem::take(&mut by_tier[tier as usize]);
+            if tasks.is_empty() {
+                continue;
             }
-            let _ = r.monitor.await;
-            joined.push(r.name);
+            Self::drain_tier(tasks, budget.for_tier(tier), &mut joined, &mut aborted).await;
         }
 
         ShutdownOutcome { joined, aborted }
+    }
+
+    /// Join every monitor in `tasks` within `tier_budget`. On expiry, abort
+    /// unfinished work (warn + name) and finish joining monitors.
+    async fn drain_tier(
+        tasks: Vec<Registered>,
+        tier_budget: Duration,
+        joined: &mut Vec<&'static str>,
+        aborted: &mut Vec<&'static str>,
+    ) {
+        // JoinSet owns the monitors so a tier timeout never drops a JoinHandle
+        // (dropping would detach and make stragglers unjoinable).
+        let mut join_set = tokio::task::JoinSet::new();
+        let mut work_handles = Vec::with_capacity(tasks.len());
+        let mut names = Vec::with_capacity(tasks.len());
+
+        for (idx, r) in tasks.into_iter().enumerate() {
+            names.push(r.name);
+            work_handles.push(r.work);
+            let monitor = r.monitor;
+            join_set.spawn(async move {
+                let _ = monitor.await;
+                idx
+            });
+        }
+
+        let n = names.len();
+        let mut finished = vec![false; n];
+        let mut was_aborted = vec![false; n];
+        let deadline = tokio::time::Instant::now() + tier_budget;
+        let mut timed_out = false;
+
+        while finished.iter().any(|&f| !f) {
+            if !timed_out {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    timed_out = true;
+                    for (idx, work) in work_handles.iter().enumerate() {
+                        if finished[idx] {
+                            continue;
+                        }
+                        if !work.is_finished() {
+                            work.abort();
+                            warn!(
+                                task = names[idx],
+                                "tier budget expired; aborting straggler task"
+                            );
+                            was_aborted[idx] = true;
+                            aborted.push(names[idx]);
+                        }
+                    }
+                }
+            }
+
+            if timed_out {
+                match join_set.join_next().await {
+                    Some(Ok(idx)) => {
+                        finished[idx] = true;
+                        if !was_aborted[idx] {
+                            joined.push(names[idx]);
+                        }
+                    }
+                    Some(Err(_)) => {
+                        // Wrapper JoinSet task failed; treat remaining as done.
+                        break;
+                    }
+                    None => break,
+                }
+            } else {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(remaining, join_set.join_next()).await {
+                    Ok(Some(Ok(idx))) => {
+                        finished[idx] = true;
+                        joined.push(names[idx]);
+                    }
+                    Ok(Some(Err(_))) => break,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Budget exhausted; next loop iteration aborts stragglers.
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -414,5 +522,151 @@ mod tests {
         assert!(ShutdownTier::Ingress < ShutdownTier::Orchestrator);
         assert!(ShutdownTier::Orchestrator < ShutdownTier::Background);
         assert!(ShutdownTier::Background < ShutdownTier::Telemetry);
+    }
+
+    /// Drop-guard records task name when the work future is dropped (abort or exit).
+    struct ExitOrder {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for ExitOrder {
+        fn drop(&mut self) {
+            self.order.lock().push(self.name);
+        }
+    }
+
+    /// RED-first against a flat `join_all`/abort-everything drain: register in reverse
+    /// tier order so registration order ≠ drain order; abort-on-drop records sequence.
+    #[tokio::test]
+    async fn test_drain_order_is_ingress_before_orchestrator_before_telemetry() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        // Registration order deliberately reversed vs drain order.
+        for (name, tier) in [
+            ("telemetry", ShutdownTier::Telemetry),
+            ("background", ShutdownTier::Background),
+            ("orchestrator", ShutdownTier::Orchestrator),
+            ("ingress", ShutdownTier::Ingress),
+        ] {
+            let order = Arc::clone(&order);
+            exec.spawn(name, tier, async move {
+                let _guard = ExitOrder { name, order };
+                std::future::pending::<()>().await;
+            });
+        }
+
+        // Short equal budgets so each tier aborts promptly; order is abort order.
+        let budget = TierBudget::new([
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+            Duration::from_millis(40),
+        ]);
+        let outcome = exec.shutdown(budget).await;
+
+        assert_eq!(
+            *order.lock(),
+            vec!["ingress", "orchestrator", "background", "telemetry"],
+            "work futures must drop in tier drain order, not registration order"
+        );
+        assert_eq!(outcome.aborted, vec!["ingress", "orchestrator", "background", "telemetry"]);
+        assert!(outcome.joined.is_empty());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_tier_budget_expiry_aborts_and_names_the_task() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        exec.spawn("stuck_forever", ShutdownTier::Background, async {
+            std::future::pending::<()>().await;
+        });
+
+        let budget = TierBudget::new([
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+        ]);
+        let outcome = exec.shutdown(budget).await;
+
+        assert_eq!(outcome.aborted, vec!["stuck_forever"]);
+        assert!(outcome.joined.is_empty());
+        assert!(logs_contain("stuck_forever"), "warn must name the aborted task");
+        assert!(
+            logs_contain("tier budget expired") || logs_contain("aborting straggler"),
+            "warn must explain the abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_total_budget_is_the_sum_not_the_max() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+
+        for (name, tier) in [
+            ("s_ingress", ShutdownTier::Ingress),
+            ("s_orchestrator", ShutdownTier::Orchestrator),
+            ("s_background", ShutdownTier::Background),
+            ("s_telemetry", ShutdownTier::Telemetry),
+        ] {
+            exec.spawn(name, tier, async {
+                std::future::pending::<()>().await;
+            });
+        }
+
+        let per = Duration::from_millis(80);
+        let budget = TierBudget::new([per, per, per, per]);
+        let expected_sum = budget.total();
+        assert_eq!(expected_sum, per * 4);
+
+        let start = std::time::Instant::now();
+        let outcome = exec.shutdown(budget).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.aborted.len(), 4);
+        assert!(outcome.joined.is_empty());
+
+        // Sum, not max: four sequential tier budgets. Allow slack for scheduling.
+        assert!(
+            elapsed >= expected_sum.saturating_sub(Duration::from_millis(30)),
+            "drain wall-clock {elapsed:?} should be ≈ sum {expected_sum:?}, not max {per:?}"
+        );
+        assert!(
+            elapsed < expected_sum + Duration::from_millis(200),
+            "drain wall-clock {elapsed:?} exceeded sum {expected_sum:?} + slack"
+        );
+        // Strictly longer than a single tier (rules out max-of-tiers drain).
+        assert!(
+            elapsed > per + Duration::from_millis(40),
+            "elapsed {elapsed:?} looks like max-tier drain ({per:?}), not sum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cooperative_task_joins_well_inside_budget() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        let token = exec.token();
+        exec.spawn("cooperative", ShutdownTier::Orchestrator, async move {
+            token.cancelled().await;
+        });
+
+        let budget = TierBudget::new([
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        ]);
+        let start = std::time::Instant::now();
+        let outcome = exec.shutdown(budget).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.joined, vec!["cooperative"]);
+        assert!(outcome.aborted.is_empty());
+        // Join is not proxied by sleep; cooperative cancel should finish quickly.
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "cooperative join took {elapsed:?}, expected well inside budget"
+        );
     }
 }
