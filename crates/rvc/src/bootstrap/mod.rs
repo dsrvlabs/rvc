@@ -10,6 +10,7 @@
 
 mod beacon;
 mod enablement;
+pub mod executor;
 mod keys;
 mod run;
 mod services;
