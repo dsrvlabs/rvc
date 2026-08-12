@@ -68,7 +68,6 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-duty-tracker", Layer::Domain, "duty-tracker", "duty cache"),
     ("rvc-signer", Layer::Domain, "signer", "safe signing"),
     ("rvc-signer-server", Layer::Domain, "signer-server", "remote signing lib"),
-    ("rvc-sync-service", Layer::Domain, "sync-service", "sync committees"),
     ("rvc-timing", Layer::Domain, "timing", "slot clock"),
     // Foundation
     ("beacon", Layer::Foundation, "beacon", "HTTP client"),
@@ -379,7 +378,6 @@ pub const DOMAIN_PACKAGES: &[&str] = &[
     "rvc-duty-tracker",
     "rvc-signer",
     "rvc-signer-server",
-    "rvc-sync-service",
     "rvc-timing",
 ];
 

@@ -4593,13 +4593,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rvc-sync-service"
-version = "0.7.0"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "rvc-telemetry"
 version = "0.7.0"
 dependencies = [

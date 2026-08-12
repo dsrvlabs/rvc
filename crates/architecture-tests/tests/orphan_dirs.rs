@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use rvc_architecture_tests::{load_cargo_metadata, load_workspace_graph, workspace_root};
 
 /// Absolute G-1 pin. Landed as 29 after ARCH-1b; ARCH-3 lowers to 28.
-const EXPECTED_MEMBER_COUNT: usize = 29;
+const EXPECTED_MEMBER_COUNT: usize = 28;
 
 // ---------------------------------------------------------------------------
 // Enumeration

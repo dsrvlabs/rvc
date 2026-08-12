@@ -1,7 +1,7 @@
 # Architecture
 
 <!-- BEGIN GENERATED -->
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 28 crates (3 binaries + 25 libraries).
 
 > **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
 > ```
@@ -35,7 +35,6 @@ graph TD
     RVC_SIGNER_REGISTRY["signer-registry<br/><i>sign type table</i>"]
     RVC_SIGNER_SERVER["signer-server<br/><i>remote signing lib</i>"]
     RVC_SLASHING["slashing<br/><i>EIP-3076</i>"]
-    RVC_SYNC_SERVICE["sync-service<br/><i>sync committees</i>"]
     RVC_TELEMETRY["telemetry<br/><i>OTel tracing</i>"]
     RVC_TEST_SUPPORT["test-support<br/><i>PKI + mTLS harness</i>"]
     RVC_TIMING["timing<br/><i>slot clock</i>"]
@@ -65,19 +64,13 @@ graph TD
     RVC_BIN --> BEACON
     RVC_BIN --> RVC
     RVC_BIN --> RVC_BN_MANAGER
-    RVC_BIN --> RVC_BUILDER
     RVC_BIN --> RVC_CRYPTO
-    RVC_BIN --> RVC_DOPPELGANGER
     RVC_BIN --> RVC_ETH_TYPES
-    RVC_BIN --> RVC_GRPC_SIGNER
     RVC_BIN --> RVC_KEYMANAGER_API
     RVC_BIN --> RVC_METRICS
-    RVC_BIN --> RVC_OBSERVABILITY
-    RVC_BIN --> RVC_SECRET_PROVIDER
     RVC_BIN --> RVC_SIGNER
     RVC_BIN --> RVC_SLASHING
     RVC_BIN --> RVC_TELEMETRY
-    RVC_BIN --> RVC_TIMING
     RVC_BLOCK_SERVICE --> BEACON
     RVC_BLOCK_SERVICE --> RVC_CRYPTO
     RVC_BLOCK_SERVICE --> RVC_ETH_TYPES
@@ -164,7 +157,6 @@ graph TD
     style RVC_SIGNER_REGISTRY fill:#51cf66,color:#fff
     style RVC_SIGNER_SERVER fill:#ffd43b,color:#333
     style RVC_SLASHING fill:#51cf66,color:#fff
-    style RVC_SYNC_SERVICE fill:#ffd43b,color:#333
     style RVC_TELEMETRY fill:#51cf66,color:#fff
     style RVC_TEST_SUPPORT fill:#adb5bd,color:#333
     style RVC_TIMING fill:#ffd43b,color:#333
@@ -252,7 +244,6 @@ block-beta
         DUTY["duty-tracker"]
         TIMING["timing"]
         BLOCK["block-service"]
-        SYNC["sync-service"]
         BUILD["builder"]
         DOPP["doppelganger"]
     end
@@ -528,17 +519,6 @@ Orchestrates the block proposal lifecycle: RANDAO reveal → block production �
 - **`BlockService<S, B>`** — Generic over `Signer` trait and `BeaconBlockClient`.
 - **`BeaconBlockClient` trait** — `produce_block`, `publish_block`, `publish_blinded_block`.
 - Handles both full and blinded (MEV) blocks via `Eth-Execution-Payload-Blinded` header.
-
-### `crates/sync-service` — Sync Committee Helpers
-
-Shared sync-committee constants and aggregator selection. Production message and contribution
-lifecycle is owned by the orchestrator's **`SyncCommitteeService`**
-(`crates/rvc/src/orchestrator/sync_committee.rs`), which signs via `SignerService` and submits
-via `BeaconNodeClient` (with timeouts and the D-3 doppelganger gate).
-
-- **`is_sync_committee_aggregator`** — Selection-proof check against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
-- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`,
-  `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE = 16`.
 
 ### `crates/builder` — MEV & Builder Integration
 
