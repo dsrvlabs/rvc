@@ -14,7 +14,10 @@ use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root, Slot};
-use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use metrics::definitions::{
+    attestation_status, slot_phase_cache, RVC_ATTESTATIONS_TOTAL,
+    RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
+};
 use signer::{CircuitBreakerState, SignerService};
 use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};
 
@@ -232,6 +235,9 @@ where
     /// D-3: per-validator doppelganger gate for block proposals.
     /// Shared reference to the ValidatorStore for `is_signing_enabled` checks.
     pub(crate) validator_store: Arc<validator_store::ValidatorStore>,
+    /// Next slot's phase-0 offset is labelled `cache=cold` when true (post-boot
+    /// or post-key_gen invalidation). Cleared after the offset is recorded.
+    phase_block_cache_cold: bool,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -334,6 +340,7 @@ where
             attesting_enabled,
             sync_enabled,
             validator_store,
+            phase_block_cache_cold: true,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -401,6 +408,9 @@ where
             // to avoid TOCTOU races (H-5). Uses slot-qualified query, not "head" (L-5).
             let ctx = SlotContext::capture(&*self.beacon, current_slot, current_epoch).await;
             {
+                // M2: offset from slot start to entry of maybe_propose_block.
+                // Recorded after duty fetches / epoch-boundary work (not a reorder).
+                self.record_phase_block_start_offset(current_slot);
                 let phase_span = info_span!(parent: &slot_span, "slot.phase.block");
                 self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
@@ -608,7 +618,26 @@ where
             self.key_gen_rx.mark_unchanged();
             info!("Key set changed, clearing duty cache to trigger refetch");
             self.duty_tracker.clear_cache().await;
+            // Cold-cache phase-0 offset on the slot that sees the invalidation.
+            self.phase_block_cache_cold = true;
         }
+    }
+
+    /// Records `rvc_slot_phase_block_start_offset_ms` immediately before
+    /// `maybe_propose_block` (M2 instrument). Uses the slot clock for both
+    /// `now` and nominal slot start; labels `cache=cold` for post-boot and
+    /// post-key_gen slots, then clears the cold flag for subsequent slots.
+    fn record_phase_block_start_offset(&mut self, slot: Slot) {
+        let slot_start_ms = self.clock.slot_start_time(slot).saturating_mul(1000);
+        let now_ms = self.clock.current_time_secs().saturating_mul(1000);
+        let offset_ms = now_ms.saturating_sub(slot_start_ms) as f64;
+        let cache = if self.phase_block_cache_cold {
+            slot_phase_cache::COLD
+        } else {
+            slot_phase_cache::WARM
+        };
+        RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).observe(offset_ms);
+        self.phase_block_cache_cold = false;
     }
 
     fn check_shutdown(&self) -> bool {

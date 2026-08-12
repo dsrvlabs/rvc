@@ -324,6 +324,31 @@ lazy_static! {
         histogram
     };
 
+    /// Histogram for slot phase-0 start offset in milliseconds (M2).
+    ///
+    /// Measures the slot-clock offset from nominal slot start to entry of
+    /// `maybe_propose_block` (after duty fetches and epoch-boundary work).
+    /// This is an offset observation, not a success/failure signal — large
+    /// values indicate pre-proposal work ran long, not a protocol error.
+    ///
+    /// Labels: `cache` — `"warm"` (steady state) or `"cold"` (first slot after
+    /// boot, or the slot after a key_gen duty-cache invalidation).
+    /// Buckets: 5 ms … 60 s so a full 12 s slot (and stall beyond) is visible.
+    pub static ref RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_slot_phase_block_start_offset_ms",
+            "Offset (ms) from slot start to entry of maybe_propose_block"
+        ).buckets(vec![
+            5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0,
+            8000.0, 12000.0, 20000.0, 30000.0, 60000.0,
+        ]);
+        let histogram = HistogramVec::new(opts, &["cache"])
+            .expect("Failed to create rvc_slot_phase_block_start_offset_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_slot_phase_block_start_offset_ms metric");
+        histogram
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -353,6 +378,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
     lazy_static::initialize(&RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS);
+    lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
 }
 
 /// Attestation status label values.
@@ -385,6 +411,12 @@ pub mod prune_type {
 pub mod tx_hold_kind {
     pub const ATTESTATION: &str = "attestation";
     pub const BLOCK: &str = "block";
+}
+
+/// `cache` label values for `rvc_slot_phase_block_start_offset_ms`.
+pub mod slot_phase_cache {
+    pub const WARM: &str = "warm";
+    pub const COLD: &str = "cold";
 }
 
 #[cfg(test)]

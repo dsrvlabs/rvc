@@ -405,6 +405,7 @@ mod circuit_breaker;
 mod core;
 mod duty_management;
 mod fork_transition;
+mod phase_block_offset;
 mod proposal;
 mod slashing_protection;
 mod spans;
