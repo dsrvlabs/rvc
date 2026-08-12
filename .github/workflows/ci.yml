@@ -56,6 +56,16 @@ jobs:
       - name: Run cargo audit
         run: cargo audit
 
+      # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
+      # it needs nightly; CI pins dtolnay/rust-toolchain@stable (A-E3).
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Run cargo machete
+        run: cargo machete
+
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest

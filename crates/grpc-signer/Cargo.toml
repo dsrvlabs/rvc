@@ -15,7 +15,6 @@ crypto.workspace = true
 observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-prost.workspace = true
 signer-proto = { workspace = true, features = ["server", "client"] }
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true

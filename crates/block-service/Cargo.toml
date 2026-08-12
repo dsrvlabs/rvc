@@ -16,7 +16,6 @@ crypto.workspace = true
 observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 signer.workspace = true
 thiserror.workspace = true

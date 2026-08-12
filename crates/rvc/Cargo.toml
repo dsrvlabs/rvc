@@ -31,6 +31,7 @@ hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
+# Used by tonic_build-generated duty_tracker stubs (OUT_DIR); machete cannot see it.
 prost.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
@@ -80,3 +81,7 @@ criterion.workspace = true
 [[bench]]
 name = "per_slot"
 harness = false
+
+[package.metadata.cargo-machete]
+# prost is required by tonic_build-generated duty_tracker code in OUT_DIR.
+ignored = ["prost"]
