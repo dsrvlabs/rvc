@@ -822,14 +822,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // Logging guards drop after run returns (flush last).
             let _ = &logging_guards;
 
-            match run_result {
-                Err(e) if e.is_keystore_locked() => {
-                    // Defensive: run() already process::exits on lock, but keep parity.
-                    std::process::exit(e.exit_code());
-                }
-                Err(e) => return Err(e.into()),
-                Ok(()) => {}
-            }
+            // Keystore-lock → EXIT_KEYSTORE_LOCKED is mapped in synchronous main
+            // after the runtime drops (ARCH-2i); never hard-exit mid-async here.
+            run_result?;
         }
         Commands::VoluntaryExit {
             pubkey,

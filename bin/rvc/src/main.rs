@@ -2,6 +2,10 @@
 //!
 //! Main entry point for the validator client binary: CLI parse, logging init,
 //! and one call into [`rvc::bootstrap::run`].
+//!
+//! This `main` is intentionally **synchronous** so named startup exit codes
+//! (NFR-3) can use `process::exit` only after the Tokio runtime has been
+//! dropped — never mid-async (ARCH-2i).
 
 mod cli;
 mod commands;
@@ -9,9 +13,24 @@ mod logging;
 
 use clap::Parser;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    cli::dispatch(cli::Cli::parse()).await
+fn main() -> anyhow::Result<()> {
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(cli::dispatch(cli::Cli::parse()));
+
+    // Runtime dropped. Keystore-lock contention keeps EXIT_KEYSTORE_LOCKED (14);
+    // process::exit here is the only legitimate site on the binary path (ARCH-2i).
+    if let Err(ref e) = result {
+        if let Some(be) = e.downcast_ref::<rvc::bootstrap::BootstrapError>() {
+            if be.is_keystore_locked() {
+                std::process::exit(be.exit_code());
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]

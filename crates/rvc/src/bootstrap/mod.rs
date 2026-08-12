@@ -118,3 +118,46 @@ impl BootstrapError {
         matches!(self, Self::Startup(StartupError::KeystoreLocked(_)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::startup::{
+        StartupError, EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED,
+        EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+    };
+
+    /// ARCH-2i / NFR-3: BootstrapError maps each named startup failure to EXIT_*.
+    #[test]
+    fn test_bootstrap_error_exit_codes_map_startup_gates() {
+        let cases: &[(BootstrapError, i32)] = &[
+            (
+                BootstrapError::Startup(StartupError::IntegrityCheckFailed("x".into())),
+                EXIT_INTEGRITY_CHECK_FAILED,
+            ),
+            (
+                BootstrapError::Startup(StartupError::GenesisRootMismatch {
+                    local: "a".into(),
+                    beacon: "b".into(),
+                }),
+                EXIT_GENESIS_ROOT_MISMATCH,
+            ),
+            (
+                BootstrapError::Startup(StartupError::UnsupportedForkVersion {
+                    version: "0xdead".into(),
+                }),
+                EXIT_UNSUPPORTED_FORK_VERSION,
+            ),
+            (
+                BootstrapError::Startup(StartupError::KeystoreLocked("held".into())),
+                EXIT_KEYSTORE_LOCKED,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.exit_code(), *want, "exit_code for {err}");
+        }
+        let locked = BootstrapError::Startup(StartupError::KeystoreLocked("held".into()));
+        assert!(locked.is_keystore_locked());
+        assert!(!BootstrapError::InvalidConfig("x".into()).is_keystore_locked());
+    }
+}

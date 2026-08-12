@@ -48,8 +48,9 @@ pub struct RunOptions {
 /// # Errors
 ///
 /// Returns [`BootstrapError`] for phase failures. Keystore-lock contention
-/// sets [`BootstrapError::is_keystore_locked`]; the binary maps that to
-/// `process::exit` with the startup exit code.
+/// sets [`BootstrapError::is_keystore_locked`]; the synchronous binary `main`
+/// maps that flag to exit code [`crate::startup::EXIT_KEYSTORE_LOCKED`] (14)
+/// after the Tokio runtime is dropped (ARCH-2i / NFR-3).
 pub async fn run(
     config: Config,
     options: RunOptions,
@@ -85,8 +86,10 @@ pub async fn run(
             handles
         }
         Err(e) if e.is_keystore_locked() => {
-            // Match prior binary: hard-exit on lock contention with the startup code.
-            std::process::exit(e.exit_code());
+            // No drain is required: this is steps 1–2d, before any task is spawned.
+            // Synchronous main maps is_keystore_locked() → EXIT_KEYSTORE_LOCKED (14)
+            // after the runtime is dropped (ARCH-2i / NFR-3).
+            return Err(e);
         }
         Err(e) => {
             if matches!(e, BootstrapError::Config(_)) {
@@ -475,8 +478,78 @@ mod tests {
     use super::*;
     use crate::proto::duty_tracker::duty_tracker_client::DutyTrackerClient;
     use crate::proto::duty_tracker::HealthzRequest;
+    use crate::startup::{
+        acquire_keystore_lock, EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED,
+        EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+    };
+    use ::slashing::SlashingDb;
     use tokio::net::TcpListener;
     use tracing_test::traced_test;
+
+    /// ARCH-2i / NFR-3: pin EXIT_* numeric values so a silent renumber fails CI.
+    #[test]
+    fn test_exit_codes_are_unchanged() {
+        assert_eq!(EXIT_INTEGRITY_CHECK_FAILED, 10);
+        assert_eq!(EXIT_GENESIS_ROOT_MISMATCH, 11);
+        assert_eq!(EXIT_UNSUPPORTED_FORK_VERSION, 13);
+        assert_eq!(EXIT_KEYSTORE_LOCKED, 14);
+        // Reserved historically (one-shot doppelganger); must not be reused.
+        assert_ne!(EXIT_KEYSTORE_LOCKED, 12);
+    }
+
+    /// ARCH-2i: keystore-lock contention returns `Err` with EXIT_KEYSTORE_LOCKED
+    /// rather than hard-exiting mid-async (which would kill the test binary).
+    /// No tasks are spawned yet, so no drain is required.
+    #[tokio::test]
+    async fn test_keystore_lock_contention_returns_exit_code_not_process_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keystore = dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).expect("keystore dir");
+        let db_path = dir.path().join("slashing.db");
+        try_seed_slashing_db(&db_path);
+
+        let _held = acquire_keystore_lock(&keystore).expect("hold keystore lock");
+
+        let config = Config {
+            beacon_url: "http://127.0.0.1:1".to_string(),
+            keystore_path: keystore,
+            slashing_db_path: db_path,
+            allow_fresh_db: false,
+            disable_keystore_locking: false,
+            ..Default::default()
+        };
+        let options = RunOptions {
+            strict_permissions: false,
+            strict_slashing_semantics: false,
+            timeouts: OperationTimeouts::default(),
+        };
+
+        let err = run(config, options, CancellationToken::new())
+            .await
+            .expect_err("lock contention must return Err, not hard-exit the process");
+        assert!(err.is_keystore_locked(), "expected keystore-locked BootstrapError, got: {err}");
+        assert_eq!(
+            err.exit_code(),
+            EXIT_KEYSTORE_LOCKED,
+            "operator tooling still sees exit code 14 (NFR-3)"
+        );
+    }
+
+    fn try_seed_slashing_db(path: &std::path::Path) {
+        SlashingDb::open(path).expect("seed slashing db");
+    }
+
+    /// ARCH-2i: production body of run.rs must not hard-exit the process.
+    #[test]
+    fn test_run_rs_has_no_process_exit_call() {
+        let src = include_str!("run.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body before tests");
+        // Match the call form only; prose may mention the historical bug.
+        assert!(
+            !body.contains("std::process::exit") && !body.contains("::exit("),
+            "bootstrap/run.rs production body must not hard-exit the process (ARCH-2i)"
+        );
+    }
 
     #[test]
     #[traced_test]

@@ -773,13 +773,13 @@ the next reader will ask.
   test, so a future refactor cannot renumber them silently (NFR-3).
 
 **Acceptance criteria.**
-- [ ] `rg 'process::exit' crates/rvc/src` returns no hit inside an `async fn`.
-- [ ] The only remaining `process::exit` in the binary path is in the synchronous `main`.
-- [ ] Exit codes 10/11/13/14 are preserved and asserted; the keystore-lock path still exits with the
+- [x] `rg 'process::exit' crates/rvc/src` returns no hit inside an `async fn`.
+- [x] The only remaining `process::exit` in the binary path is in the synchronous `main`.
+- [x] Exit codes 10/11/13/14 are preserved and asserted; the keystore-lock path still exits with the
       same code an operator's tooling sees today (NFR-3).
-- [ ] The fail-closed startup gates (SEC-9 fork gate, GVR chain-swap gate, keystore fd-lock) behave
+- [x] The fail-closed startup gates (SEC-9 fork gate, GVR chain-swap gate, keystore fd-lock) behave
       identically — no gate becomes a warning.
-- [ ] A comment at the new `return Err(...)` states why no drain is needed at that point.
+- [x] A comment at the new `return Err(...)` states why no drain is needed at that point.
 
 ---
 
