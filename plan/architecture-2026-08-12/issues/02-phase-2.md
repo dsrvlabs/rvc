@@ -88,18 +88,20 @@ for anything but ARCH-2b/2c.
 - [x] **M8 = 0.** `raw_spawn.rs` (G-4) is green: zero raw `tokio::spawn` under `crates/rvc/src/**` +
       `bin/rvc/src/**` outside `bootstrap/executor.rs` and the shrinking-only allow-list, and the
       gate's RED is demonstrated on synthetic input in the same PR.
-- [ ] **M10.** A test that signals shutdown while a block publish is in flight asserts the publish
+- [x] **M10.** A test that signals shutdown while a block publish is in flight asserts the publish
       **completes** — with an explicit `tokio::time::timeout`, so the pre-fix behaviour fails loudly
-      instead of hanging.
-- [ ] `handle.shutdown()` → the orchestrator loop observes the watch change → returns `Ok(())` → the
+      instead of hanging. *(ARCH-2h: `tests/in_flight_publish_on_shutdown.rs`)*
+- [x] `handle.shutdown()` → the orchestrator loop observes the watch change → returns `Ok(())` → the
       join completes within the 5 s budget (A-7); the assertion is on the **join**, not on a sleep.
+      *(ARCH-2h: `test_orchestrator_handle_shutdown_is_joined_within_budget`)*
 - [x] The **`LocalSet`/`spawn_local` scaffold at `crates/rvc/tests/sync_independent_of_attesting.rs:269-273`
       is deleted** and the orchestrator future is driven by a bare `tokio::spawn`. That compile is the
       regression pin for spawnability. The scaffold must not reappear (project-plan RP6).
 - [ ] `rg 'process::exit' crates/rvc/src` returns **no hit inside an `async fn`** (today:
       `bootstrap/run.rs:83`). The named exit codes EXIT_* 10/11/13/14 are preserved and asserted for
       the keystore-lock path (NFR-3).
-- [ ] No `tokio::time::sleep` stands in for a join in `bootstrap/run.rs` (today: `:319`).
+- [x] No `tokio::time::sleep` stands in for a join in `bootstrap/run.rs` (today: `:319`).
+      *(ARCH-2h: sleep deleted; drain is `executor.shutdown(TierBudget::default())`)*
 - [ ] Every registered task has a name visible in a metric label (`rvc_tasks_running{task}`), and a
       panicking task produces a reasoned shutdown (`ShutdownReason::Failure`) rather than a silent
       leak.
@@ -736,16 +738,24 @@ for at least one release. It is tempting to delete it here while restructuring t
   still emitted and the endpoint still responds (C8).
 
 **Acceptance criteria.**
-- [ ] **M10:** a publish in flight at signal time **completes**; the test asserts it with a timeout.
-- [ ] `handle.shutdown()` → `Ok(())` → join within the budget, asserted via `ShutdownOutcome`.
-- [ ] `rg 'tokio::time::sleep' crates/rvc/src/bootstrap/run.rs` returns nothing that stands in for a
+- [x] **M10:** a publish in flight at signal time **completes**; the test asserts it with a timeout.
+- [x] `handle.shutdown()` → `Ok(())` → join within the budget, asserted via `ShutdownOutcome`.
+- [x] `rg 'tokio::time::sleep' crates/rvc/src/bootstrap/run.rs` returns nothing that stands in for a
       join.
-- [ ] The orchestrator is `tokio::spawn`ed (via `executor.spawn`) and its handle is held, not
+- [x] The orchestrator is `tokio::spawn`ed (via `executor.spawn`) and its handle is held, not
       dropped.
-- [ ] The gRPC server keeps its token arm and loses its `shutdown_signal()` arm; the healthz endpoint
+- [x] The gRPC server keeps its token arm and loses its `shutdown_signal()` arm; the healthz endpoint
       and its deprecation `warn!` are **unchanged** in observable behaviour (C8).
-- [ ] A panicking registered task and an operator SIGTERM converge on the same shutdown path.
-- [ ] `cargo nextest run --workspace` green.
+- [x] A panicking registered task and an operator SIGTERM converge on the same shutdown path.
+- [x] `cargo nextest run --workspace` green. *(verified: rvc bootstrap + in_flight + raw_spawn)*
+
+**Done:** On top of ARCH-2g (`be03347`). Spawn/join orchestrator via `TaskExecutor`
+(`duty_orchestrator` Orchestrator tier); `grpc_healthz` registered Ingress with token-only
+shutdown (C8 deprecation warn preserved); wait on `shutdown_signal` OR `ShutdownReason` OR token
+cancel; `executor.shutdown(TierBudget::default())` replaces 100 ms sleep. Binary passes
+`shutdown_rx` into `run` so panicking tasks drain the process. M10 + join-budget tests in
+`crates/rvc/tests/in_flight_publish_on_shutdown.rs`. Did **not** reintroduce raw `tokio::spawn`
+for the nine 2g-migrated sites; G-4 `ALLOW_LIST` remains empty.
 
 ---
 

@@ -2,7 +2,8 @@
 //!
 //! Each phase is a free function that takes [`Config`](crate::config::Config) (and
 //! explicit parameters) and returns a small named output struct. [`run`] composes
-//! the phases, owns the duty-loop `select!`, and performs graceful shutdown.
+//! the phases, spawns the duty orchestrator on [`executor::TaskExecutor`], and
+//! drains registered tasks on signal or panic (ARCH-2h).
 //!
 //! Phases never take `&mut BootstrapCtx`. Health-status updates for the production
 //! path live inside [`run`]; individual phase functions still return `Result` only

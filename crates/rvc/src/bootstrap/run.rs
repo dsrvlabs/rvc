@@ -1,20 +1,20 @@
 //! Full validator-client bootstrap composition.
 //!
 //! [`run`] is the library entry point for the production Start path: it chains
-//! every bootstrap phase, owns the duty-loop `select!`, and performs graceful
-//! shutdown (cancel token → orchestrator → metrics drain).
+//! every bootstrap phase, spawns the duty orchestrator on [`TaskExecutor`], and
+//! drains registered tasks tier-by-tier on SIGTERM or task panic (ARCH-2h).
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
+use tokio::sync::mpsc;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
-use super::executor::{ShutdownTier, TaskExecutor, TierBudget};
+use super::executor::{ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 use super::tasks::spawn_background_tasks;
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
@@ -42,8 +42,11 @@ pub struct RunOptions {
 ///
 /// `executor` is the process [`TaskExecutor`] (shared with the binary for the
 /// SIGHUP log-reload task). Cancel propagates via `executor.token()` to every
-/// cooperative background task. Logging guards stay owned by `main` and drop
-/// after this future resolves, flushing pending records last.
+/// cooperative background task. `shutdown_rx` is the single `ShutdownReason`
+/// receiver from [`TaskExecutor::new`]; a panicking registered task and an
+/// operator SIGTERM/SIGINT enter the same drain path (ARCH-2h).
+/// Logging guards stay owned by `main` and drop after this future resolves,
+/// flushing pending records last.
 ///
 /// # Errors
 ///
@@ -55,6 +58,7 @@ pub async fn run(
     config: Config,
     options: RunOptions,
     executor: TaskExecutor,
+    mut shutdown_rx: mpsc::Receiver<ShutdownReason>,
 ) -> Result<(), BootstrapError> {
     let startup_time = std::time::Instant::now();
     let shutdown_token = executor.token();
@@ -297,17 +301,22 @@ pub async fn run(
 
     info!(addr = %grpc_addr, "Starting gRPC server");
     log_grpc_healthz_deprecation();
+    // Ingress: token-only shutdown (C8). Redundant shutdown_signal arm removed so a
+    // second SIGINT during drain cannot bypass tier order (ARCH-2h).
     let grpc_server = Server::builder()
         .add_service(DutyTrackerServer::new(duty_tracker_service))
         .serve_with_shutdown(grpc_addr, {
             let token = shutdown_token.clone();
             async move {
-                tokio::select! {
-                    _ = shutdown_signal() => {}
-                    _ = token.cancelled() => {}
-                }
+                token.cancelled().await;
             }
         });
+    executor.spawn("grpc_healthz", ShutdownTier::Ingress, async move {
+        match grpc_server.await {
+            Ok(()) => info!("gRPC server shut down gracefully"),
+            Err(e) => error!("gRPC server error: {}", e),
+        }
+    });
 
     // P1-2/P1-3/P1-4: metrics + monitoring + proposer-config on executor.
     spawn_background_tasks(
@@ -333,39 +342,52 @@ pub async fn run(
     startup::log_orchestrator_started(validator_count, bn_count);
     info!("Starting duty orchestrator");
 
-    // Arm order preserved: gRPC, orchestrator, process signal.
-    // ARCH-2h will spawn/join the orchestrator via the executor; until then the
-    // inline select remains and registered background tasks drain via executor.
+    // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
+    executor.spawn("duty_orchestrator", ShutdownTier::Orchestrator, async move {
+        match orchestrator.run().await {
+            Ok(()) => info!("Orchestrator completed"),
+            Err(e) => error!("Orchestrator error: {}", e),
+        }
+    });
+
+    // Operator signal, panicking registered tasks, and internal token cancel
+    // (e.g. slashing-monitor ShutdownRequested) converge on one drain path.
     tokio::select! {
-        result = grpc_server => {
-            match result {
-                Ok(()) => info!("gRPC server shut down gracefully"),
-                Err(e) => error!("gRPC server error: {}", e),
-            }
-        }
-        result = orchestrator.run() => {
-            match result {
-                Ok(()) => info!("Orchestrator completed"),
-                Err(e) => error!("Orchestrator error: {}", e),
-            }
-        }
         _ = shutdown_signal() => {
             info!("Shutdown signal received");
+            startup::log_shutdown_initiated("signal received");
+        }
+        reason = shutdown_rx.recv() => {
+            match reason {
+                Some(ShutdownReason::Failure(task)) => {
+                    error!(task, "Registered task panicked; initiating process drain");
+                    startup::log_shutdown_initiated("task failure");
+                }
+                Some(ShutdownReason::Success(msg)) => {
+                    info!(reason = msg, "Shutdown reason received");
+                    startup::log_shutdown_initiated(msg);
+                }
+                None => {
+                    warn!("Shutdown reason channel closed");
+                    startup::log_shutdown_initiated("shutdown channel closed");
+                }
+            }
+        }
+        _ = shutdown_token.cancelled() => {
+            info!("Process cancellation token cancelled");
+            startup::log_shutdown_initiated("token cancelled");
         }
     }
 
-    startup::log_shutdown_initiated("signal received");
+    // Cooperative stop for the duty loop (watch channel, not the cancel token).
     orchestrator_handle.shutdown();
-
-    // Brief yield so the orchestrator can observe its watch shutdown (ARCH-2h
-    // replaces this with a real join). Registered tasks drain via TaskExecutor.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
+    // Cancels the process token once, then joins each tier under TierBudget.
+    // No sleep-as-join: duty_orchestrator is in the registry and is joined here.
     let outcome = executor.shutdown(TierBudget::default()).await;
     info!(
         joined = ?outcome.joined,
         aborted = ?outcome.aborted,
-        "Background task drain complete"
+        "TaskExecutor drain complete"
     );
 
     info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
@@ -494,6 +516,7 @@ mod tests {
         EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
     };
     use ::slashing::SlashingDb;
+    use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
     use tracing_test::traced_test;
@@ -536,8 +559,8 @@ mod tests {
             timeouts: OperationTimeouts::default(),
         };
 
-        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
-        let err = run(config, options, executor)
+        let (executor, rx) = TaskExecutor::new(CancellationToken::new());
+        let err = run(config, options, executor, rx)
             .await
             .expect_err("lock contention must return Err, not hard-exit the process");
         assert!(err.is_keystore_locked(), "expected keystore-locked BootstrapError, got: {err}");
@@ -572,6 +595,51 @@ mod tests {
         assert!(logs_contain("deprecated"), "expected WARN naming deprecation of gRPC healthz");
         assert!(logs_contain("/livez"), "deprecation WARN must name /livez");
         assert!(logs_contain("/readyz"), "deprecation WARN must name /readyz");
+    }
+
+    /// ARCH-2h: no `sleep` may stand in for a join in the production body.
+    #[test]
+    fn test_run_rs_has_no_sleep_as_join_substitute() {
+        let src = include_str!("run.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body before tests");
+        assert!(
+            !body.contains("tokio::time::sleep"),
+            "bootstrap/run.rs must not use sleep as a join substitute (ARCH-2h / M10)"
+        );
+        assert!(
+            body.contains("executor.shutdown"),
+            "production shutdown must drain via TaskExecutor::shutdown"
+        );
+        assert!(
+            body.contains("duty_orchestrator"),
+            "orchestrator must be registered as duty_orchestrator"
+        );
+        assert!(
+            body.contains("grpc_healthz"),
+            "gRPC healthz must be registered as Ingress grpc_healthz (C8)"
+        );
+    }
+
+    /// ARCH-2h: gRPC serve_with_shutdown must be token-only (no redundant signal arm).
+    #[test]
+    fn test_grpc_shutdown_is_token_only_not_signal() {
+        let src = include_str!("run.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body");
+        let grpc_block = body
+            .split("serve_with_shutdown")
+            .nth(1)
+            .expect("serve_with_shutdown present")
+            .split("executor.spawn(\"grpc_healthz\"")
+            .next()
+            .expect("spawn grpc_healthz after serve_with_shutdown");
+        assert!(
+            grpc_block.contains("token.cancelled()"),
+            "gRPC must still observe the cancellation token"
+        );
+        assert!(
+            !grpc_block.contains("shutdown_signal()"),
+            "gRPC must not select on shutdown_signal (would bypass tier order on second SIGINT)"
+        );
     }
 
     /// Guard: deprecation must not disable the endpoint it deprecates (C8).
