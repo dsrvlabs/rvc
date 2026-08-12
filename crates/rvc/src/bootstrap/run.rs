@@ -10,7 +10,7 @@ use bn_manager::OperationTimeouts;
 use metrics::{new_health_status, SharedHealthStatus};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::tasks::{spawn_background_tasks, BackgroundTasks};
 use super::{
@@ -263,6 +263,7 @@ pub async fn run(
     let duty_tracker_service = DutyTrackerService::new();
 
     info!(addr = %grpc_addr, "Starting gRPC server");
+    log_grpc_healthz_deprecation();
     let grpc_server = Server::builder()
         .add_service(DutyTrackerServer::new(duty_tracker_service))
         .serve_with_shutdown(grpc_addr, {
@@ -381,4 +382,75 @@ async fn finalize_health_status(health_status: &SharedHealthStatus) {
     let mut status = health_status.write().await;
     status.update_healthy();
     info!(healthy = status.healthy, "Health status finalized");
+}
+
+/// Startup deprecation notice for the gRPC healthz-only server (C8 / ARCH-8).
+///
+/// Operators should migrate liveness probes to `/livez` and readiness probes to
+/// `/readyz` on the metrics HTTP server. Removal is Phase 7 (≥1 release later).
+fn log_grpc_healthz_deprecation() {
+    warn!(
+        "gRPC healthz endpoint is deprecated and will be removed in a future release; \
+         migrate liveness probes to /livez and readiness probes to /readyz on the metrics \
+         HTTP server (metrics_address / metrics_port)"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::duty_tracker::duty_tracker_client::DutyTrackerClient;
+    use crate::proto::duty_tracker::HealthzRequest;
+    use tokio::net::TcpListener;
+    use tracing_test::traced_test;
+
+    #[test]
+    #[traced_test]
+    fn test_startup_warns_that_grpc_healthz_is_deprecated() {
+        log_grpc_healthz_deprecation();
+
+        assert!(logs_contain("deprecated"), "expected WARN naming deprecation of gRPC healthz");
+        assert!(logs_contain("/livez"), "deprecation WARN must name /livez");
+        assert!(logs_contain("/readyz"), "deprecation WARN must name /readyz");
+    }
+
+    /// Guard: deprecation must not disable the endpoint it deprecates (C8).
+    #[tokio::test]
+    async fn test_grpc_healthz_still_serves_after_deprecation_warning() {
+        log_grpc_healthz_deprecation();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DutyTrackerServer::new(DutyTrackerService::new()))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .expect("gRPC server");
+        });
+
+        let endpoint = format!("http://{addr}");
+        let mut client = None;
+        for _ in 0..50 {
+            match tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .expect("endpoint")
+                .connect()
+                .await
+            {
+                Ok(channel) => {
+                    client = Some(DutyTrackerClient::new(channel));
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let mut client = client.expect("connect to gRPC healthz server");
+
+        let response =
+            client.healthz(tonic::Request::new(HealthzRequest {})).await.expect("healthz RPC");
+        assert!(response.get_ref().status, "healthz must still report healthy");
+
+        server.abort();
+    }
 }
