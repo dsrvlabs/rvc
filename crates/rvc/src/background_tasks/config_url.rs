@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use validator_store::DefaultUpdate;
+use validator_store::{DefaultUpdate, ValidatorStore};
 
 /// Literal pubkey key used for `default_config` entries (Prysm/Teku convention).
 pub const DEFAULT_PUBKEY: &str = "default";
@@ -264,6 +264,39 @@ fn entry_to_update(
         builder_enabled,
         gas_limit,
     })
+}
+
+/// Write URL-fetched proposer config into [`ValidatorStore`].
+///
+/// Malformed entries are skipped at `warn` and leave previous store values
+/// intact (never a partial write of a bad entry, never a panic). Successful
+/// defaults go through [`ValidatorStore::apply_default_update`]; per-validator
+/// entries through [`ValidatorStore::update_config`].
+pub fn apply_proposer_config_updates(
+    store: &ValidatorStore,
+    updates: Vec<ValidatorConfigUpdate>,
+    default_update: Option<ValidatorConfigUpdate>,
+) {
+    if let Some(d) = default_update {
+        match d.to_default_update() {
+            Ok(u) => store.apply_default_update(u),
+            Err(e) => {
+                warn!(error = %e, "proposer config default entry ignored");
+            }
+        }
+    }
+    for update in updates {
+        match update.to_store_update() {
+            Ok((pk, u)) => store.update_config(&pk, u),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    pubkey = %update.pubkey,
+                    "proposer config entry ignored"
+                );
+            }
+        }
+    }
 }
 
 /// Starts the background proposer config refresh task.
@@ -781,5 +814,64 @@ mod tests {
         let result = fetch_proposer_config(&mock_server.uri(), None, true).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("gas_limit"));
+    }
+
+    #[test]
+    fn apply_proposer_config_updates_writes_per_validator_and_defaults() {
+        use validator_store::ValidatorConfig;
+
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        store.add_validator(ValidatorConfig::new(pk));
+
+        let fr = valid_fee_recipient_hex();
+        let default_fr = format!("0x{}", hex::encode([0xbbu8; 20]));
+        apply_proposer_config_updates(
+            &store,
+            vec![ValidatorConfigUpdate {
+                pubkey: valid_pubkey_hex(),
+                fee_recipient: Some(fr),
+                builder_enabled: Some(true),
+                gas_limit: Some(36_000_000),
+            }],
+            Some(ValidatorConfigUpdate {
+                pubkey: DEFAULT_PUBKEY.to_string(),
+                fee_recipient: Some(default_fr),
+                builder_enabled: None,
+                gas_limit: Some(40_000_000),
+            }),
+        );
+
+        assert_eq!(store.effective_fee_recipient(&pk), [0xaau8; 20]);
+        assert!(store.is_builder_enabled(&pk));
+        assert_eq!(store.effective_gas_limit(&pk), 36_000_000);
+        assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn apply_proposer_config_updates_skips_malformed_and_warns() {
+        use validator_store::ValidatorConfig;
+
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some([0xaau8; 20]);
+        store.add_validator(cfg);
+
+        apply_proposer_config_updates(
+            &store,
+            vec![ValidatorConfigUpdate {
+                pubkey: valid_pubkey_hex(),
+                fee_recipient: Some("not-hex".to_string()),
+                builder_enabled: Some(true),
+                gas_limit: None,
+            }],
+            None,
+        );
+
+        assert_eq!(store.effective_fee_recipient(&pk), [0xaau8; 20]);
+        assert!(logs_contain("proposer config entry ignored"));
     }
 }

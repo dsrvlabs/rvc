@@ -119,6 +119,8 @@ pub fn spawn_background_tasks(
             insecure: config.monitoring.endpoint_insecure,
         };
         let monitoring_shutdown = shutdown.clone();
+        // Clone so the proposer-config apply path can still own `validator_store`.
+        let store_for_monitoring = Arc::clone(&validator_store);
         info!(
             endpoint = %redact_url(monitoring_endpoint),
             interval_secs = config.monitoring.interval,
@@ -128,7 +130,7 @@ pub fn spawn_background_tasks(
         tokio::spawn(crate::background_tasks::monitoring::start_monitoring_push(
             monitoring_config,
             monitoring_shutdown,
-            move || live_monitoring_counts(&pubkey_map, &validator_store),
+            move || live_monitoring_counts(&pubkey_map, &store_for_monitoring),
         ));
     }
 
@@ -146,18 +148,16 @@ pub fn spawn_background_tasks(
             refresh_interval_secs = config.proposer_config.refresh_interval,
             "Starting proposer config URL refresh task"
         );
+        // ARCH-4b: map URL entries into ValidatorStore (ARCH-4a); malformed → warn + leave previous.
         tokio::spawn(crate::background_tasks::config_url::start_proposer_config_refresh(
             settings,
             config_refresh_shutdown,
-            move |updates, _default| {
-                for update in &updates {
-                    info!(
-                        pubkey = %update.pubkey,
-                        fee_recipient = ?update.fee_recipient,
-                        builder_enabled = ?update.builder_enabled,
-                        "Proposer config update from URL"
-                    );
-                }
+            move |updates, default_update| {
+                crate::background_tasks::config_url::apply_proposer_config_updates(
+                    &validator_store,
+                    updates,
+                    default_update,
+                );
             },
         ));
     }

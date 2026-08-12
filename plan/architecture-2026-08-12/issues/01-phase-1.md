@@ -919,16 +919,16 @@ was considered and why it lost.
   unmodified.
 
 **Acceptance criteria.**
-- [ ] The apply callback writes to `ValidatorStore`; `rg '_default' crates/rvc/src/bootstrap/tasks.rs`
+- [x] The apply callback writes to `ValidatorStore`; `rg '_default' crates/rvc/src/bootstrap/tasks.rs`
       returns nothing.
-- [ ] A rotated fee recipient is observable through `effective_fee_recipient` and reaches the next
+- [x] A rotated fee recipient is observable through `effective_fee_recipient` and reaches the next
       proposal.
-- [ ] The `default_config` entry updates the store's defaults.
-- [ ] A malformed entry warns and leaves the previous value intact (positively asserted, not just
+- [x] The `default_config` entry updates the store's defaults.
+- [x] A malformed entry warns and leaves the previous value intact (positively asserted, not just
       "no panic").
-- [ ] A failed fetch changes nothing and increments the existing failure metric.
-- [ ] No new channel, no new task; the existing refresh task's shape is unchanged.
-- [ ] **M7 accounting:** with ARCH-2c, ARCH-3 and this issue landed, three of the four verified inert
+- [x] A failed fetch changes nothing and increments the existing failure metric.
+- [x] No new channel, no new task; the existing refresh task's shape is unchanged.
+- [x] **M7 accounting:** with ARCH-2c, ARCH-3 and this issue landed, three of the four verified inert
       surfaces are closed; the fourth (healthz `grpc_address`/`grpc_port`) is Phase 0's deprecation note
       plus Phase 7's removal, giving **M7 → 1**.
 
