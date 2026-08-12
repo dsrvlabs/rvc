@@ -4,6 +4,6 @@ mod error;
 mod store;
 
 pub use block_selection::BlockSelectionMode;
-pub use config::{ValidatorConfig, ValidatorConfigUpdate};
+pub use config::{DefaultUpdate, ValidatorConfig, ValidatorConfigUpdate};
 pub use error::ValidatorStoreError;
 pub use store::{ValidatorDefaults, ValidatorStore};

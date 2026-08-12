@@ -36,3 +36,15 @@ pub struct ValidatorConfigUpdate {
     pub builder_boost_factor: Option<u64>,
     pub block_selection_mode: Option<Option<BlockSelectionMode>>,
 }
+
+/// Partial update for store-wide defaults ([`crate::ValidatorDefaults`]).
+///
+/// `None` leaves the current value unchanged. For `graffiti`, the outer
+/// `Option` selects whether to touch the field and the inner value sets or
+/// clears it (`Some(None)` clears), matching [`ValidatorConfigUpdate`].
+#[derive(Debug, Default, Clone)]
+pub struct DefaultUpdate {
+    pub fee_recipient: Option<[u8; 20]>,
+    pub gas_limit: Option<u64>,
+    pub graffiti: Option<Option<[u8; 32]>>,
+}

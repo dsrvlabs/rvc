@@ -839,14 +839,14 @@ Parsing rules to decide **explicitly** (they are the whole risk surface):
 - **Regression:** `crates/validator-store`'s existing test suite green, unmodified.
 
 **Acceptance criteria.**
-- [ ] `ValidatorStore::apply_default_update` exists, is `///`-documented, and applies under one write
+- [x] `ValidatorStore::apply_default_update` exists, is `///`-documented, and applies under one write
       guard.
-- [ ] A total mapping exists from `config_url::ValidatorConfigUpdate` to
+- [x] A total mapping exists from `config_url::ValidatorConfigUpdate` to
       `([u8;48], validator_store::ValidatorConfigUpdate)`, with parse failures surfaced as `Err`.
-- [ ] Absent fields map to the outer `None`; the clearing semantics are tested.
-- [ ] Neither existing `ValidatorConfigUpdate` type is renamed (the M9 collision is deferred, not fixed).
-- [ ] No `.unwrap()`; `thiserror` for the new error type (library crate).
-- [ ] No new workspace dependency edge, so no `ARCHITECTURE.md` regeneration is due.
+- [x] Absent fields map to the outer `None`; the clearing semantics are tested.
+- [x] Neither existing `ValidatorConfigUpdate` type is renamed (the M9 collision is deferred, not fixed).
+- [x] No `.unwrap()`; `thiserror` for the new error type (library crate).
+- [x] No new workspace dependency edge, so no `ARCHITECTURE.md` regeneration is due.
 
 ---
 

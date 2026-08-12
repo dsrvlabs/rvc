@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace, warn};
 
 use crate::block_selection::BlockSelectionMode;
-use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
+use crate::config::{DefaultUpdate, ValidatorConfig, ValidatorConfigUpdate};
 use crate::error::ValidatorStoreError;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -329,6 +329,39 @@ impl ValidatorStore {
                 changed_fields = changed_fields.join(","),
                 "validator config updated"
             );
+        }
+    }
+
+    /// Apply a partial update to the store-wide defaults under one write guard.
+    ///
+    /// Only fields set to `Some(...)` change; `None` leaves the current value.
+    /// Concurrent readers observe either the pre-update or post-update defaults
+    /// as a unit (never a mix of new fee recipient with old gas limit).
+    pub fn apply_default_update(&self, update: DefaultUpdate) {
+        let mut changed_fields = Vec::new();
+        if update.fee_recipient.is_some() {
+            changed_fields.push("fee_recipient");
+        }
+        if update.gas_limit.is_some() {
+            changed_fields.push("gas_limit");
+        }
+        if update.graffiti.is_some() {
+            changed_fields.push("graffiti");
+        }
+
+        let mut state = self.state.write();
+        if let Some(fr) = update.fee_recipient {
+            state.defaults.fee_recipient = fr;
+        }
+        if let Some(gl) = update.gas_limit {
+            state.defaults.gas_limit = gl;
+        }
+        if let Some(g) = update.graffiti {
+            state.defaults.graffiti = g;
+        }
+
+        if !changed_fields.is_empty() {
+            info!(changed_fields = changed_fields.join(","), "validator defaults updated");
         }
     }
 
@@ -769,6 +802,108 @@ mod tests {
     fn test_update_config_unknown_validator_is_noop() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         store.update_config(&test_pubkey(99), ValidatorConfigUpdate::default());
+    }
+
+    #[test]
+    fn apply_default_update_changes_the_store_defaults() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let new_fr = test_fee_recipient(9);
+
+        store.apply_default_update(DefaultUpdate {
+            fee_recipient: Some(new_fr),
+            gas_limit: Some(40_000_000),
+            graffiti: Some(Some([0xab; 32])),
+        });
+
+        assert_eq!(store.default_fee_recipient(), new_fr);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some([0xab; 32]));
+    }
+
+    #[test]
+    fn apply_default_update_absent_fields_leave_defaults_unchanged() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.state.write().defaults.graffiti = Some([0x11; 32]);
+
+        store.apply_default_update(DefaultUpdate {
+            fee_recipient: Some(test_fee_recipient(2)),
+            gas_limit: None,
+            graffiti: None,
+        });
+
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(2));
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some([0x11; 32]));
+    }
+
+    #[test]
+    fn apply_default_update_can_clear_graffiti() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.state.write().defaults.graffiti = Some([0x11; 32]);
+
+        store.apply_default_update(DefaultUpdate {
+            fee_recipient: None,
+            gas_limit: None,
+            graffiti: Some(None),
+        });
+
+        assert!(store.state.read().defaults.graffiti.is_none());
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(1));
+    }
+
+    #[test]
+    fn apply_default_update_is_a_single_write_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let store = Arc::new(ValidatorStore::new(test_fee_recipient(1), 30_000_000));
+        let stop = Arc::new(AtomicBool::new(false));
+        let old_fr = test_fee_recipient(1);
+        let new_fr = test_fee_recipient(2);
+        let old_gl = 30_000_000u64;
+        let new_gl = 40_000_000u64;
+
+        // Readers sample both fields under one lock via effective_config (unknown
+        // pubkey falls back to store defaults). Separate default_* accessors each
+        // take their own lock and are not a single-guard observation.
+        let sample_pk = [0u8; 48];
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let d = store.effective_config(&sample_pk);
+                        let old = d.fee_recipient == old_fr && d.gas_limit == old_gl;
+                        let new = d.fee_recipient == new_fr && d.gas_limit == new_gl;
+                        assert!(
+                            old || new,
+                            "observed mixed defaults: fee_recipient={:?} gas_limit={}",
+                            d.fee_recipient,
+                            d.gas_limit
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for _ in 0..200 {
+            store.apply_default_update(DefaultUpdate {
+                fee_recipient: Some(new_fr),
+                gas_limit: Some(new_gl),
+                graffiti: None,
+            });
+            store.apply_default_update(DefaultUpdate {
+                fee_recipient: Some(old_fr),
+                gas_limit: Some(old_gl),
+                graffiti: None,
+            });
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for t in readers {
+            t.join().expect("reader thread panicked");
+        }
     }
 
     #[tracing_test::traced_test]
