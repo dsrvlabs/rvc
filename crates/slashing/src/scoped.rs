@@ -16,6 +16,35 @@ use crate::error::SlashingError;
 use crate::stage::{StagedAttestation, StagedBlock};
 use crate::SlashingDb;
 
+/// Captured audit outcome whose emission is deferred until the staged guard is gone.
+///
+/// `#[must_use]` is the enforcement: a caller that forgets to emit gets a warning,
+/// and `-D warnings` in CI turns that into a failure.
+///
+/// # Ordering guarantee (ADR-006)
+///
+/// - `"rejected"` is emitted synchronously on the `Err` path of
+///   [`PubkeyScopedDb::stage_block`] / [`PubkeyScopedDb::stage_attestation`]
+///   (no guard exists at that point).
+/// - `"staged"` is returned here and must be emitted by the caller **after**
+///   `commit()` / `discard()` releases the connection mutex. A `"staged"` event
+///   therefore correlates with commit/discard rather than preceding it — an
+///   accepted consequence of ADR-006, not a defect.
+#[must_use = "the slashing audit record must be emitted after the staged guard is released"]
+#[derive(Debug)]
+pub struct PendingAudit {
+    client_cn: String,
+    pubkey_hex: String,
+    outcome: &'static str,
+}
+
+impl PendingAudit {
+    /// Emit the record. Call ONLY after `commit()` / `discard()` has released the mutex.
+    pub fn emit(self) {
+        audit_log(&self.client_cn, &self.pubkey_hex, self.outcome);
+    }
+}
+
 /// A pubkey-scoped view over the shared `SlashingDb` bound to a specific
 /// `genesis_validators_root`.
 ///
@@ -52,8 +81,16 @@ impl PubkeyScopedDb {
 
     /// Begin an immediate transaction and run the EIP-3076 block-proposal check.
     ///
-    /// Delegates to [`SlashingDb::stage_block`].  On success or failure, emits
-    /// an [`audit_log`] event with `self.client_cn` for per-CN operator visibility.
+    /// Delegates to [`SlashingDb::stage_block`].
+    ///
+    /// # Audit ordering (ADR-006)
+    ///
+    /// - On `Err`: emits `"rejected"` immediately (no staged guard exists).
+    /// - On `Ok`: returns [`PendingAudit`] with outcome `"staged"`. The caller
+    ///   **must** call [`PendingAudit::emit`] only after `commit()` / `discard()`
+    ///   releases the connection mutex. A `"staged"` event therefore correlates
+    ///   with commit/discard rather than preceding it — accepted ADR-006
+    ///   consequence, not a defect.
     ///
     /// # Errors
     ///
@@ -64,22 +101,33 @@ impl PubkeyScopedDb {
         pubkey_hex: &str,
         slot: Slot,
         signing_root_hex: Option<String>,
-    ) -> Result<StagedBlock<'db>, SlashingError> {
-        let result = self.db.stage_block(pubkey_hex, slot, signing_root_hex, &self.gvr);
-        let outcome = if result.is_ok() { "staged" } else { "rejected" };
-        // NOTE: audit_log fires at STAGE time (before commit), while the returned
-        // StagedBlock still holds the parking_lot::MutexGuard on the DB connection.
-        // A tracing subscriber that attempts to read the DB would deadlock because
-        // parking_lot mutexes are non-reentrant.  A "staged" event may therefore
-        // precede a rolled-back sign if the caller subsequently discards the guard.
-        audit_log(&self.client_cn, pubkey_hex, outcome);
-        result
+    ) -> Result<(StagedBlock<'db>, PendingAudit), SlashingError> {
+        match self.db.stage_block(pubkey_hex, slot, signing_root_hex, &self.gvr) {
+            Ok(staged) => {
+                let audit = PendingAudit {
+                    client_cn: self.client_cn.clone(),
+                    pubkey_hex: pubkey_hex.to_string(),
+                    outcome: "staged",
+                };
+                Ok((staged, audit))
+            }
+            Err(e) => {
+                // No guard was ever created — safe to emit under no lock.
+                audit_log(&self.client_cn, pubkey_hex, "rejected");
+                Err(e)
+            }
+        }
     }
 
     /// Begin an immediate transaction and run the EIP-3076 attestation check.
     ///
-    /// Delegates to [`SlashingDb::stage_attestation`].  On success or failure,
-    /// emits an [`audit_log`] event with `self.client_cn` for per-CN operator visibility.
+    /// Delegates to [`SlashingDb::stage_attestation`].
+    ///
+    /// # Audit ordering (ADR-006)
+    ///
+    /// Same contract as [`Self::stage_block`]: `"rejected"` is emitted
+    /// synchronously; `"staged"` is handed off via [`PendingAudit`] and must be
+    /// emitted after the caller releases the guard.
     ///
     /// # Errors
     ///
@@ -91,20 +139,27 @@ impl PubkeyScopedDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
         signing_root_hex: Option<String>,
-    ) -> Result<StagedAttestation<'db>, SlashingError> {
-        let result = self.db.stage_attestation(
+    ) -> Result<(StagedAttestation<'db>, PendingAudit), SlashingError> {
+        match self.db.stage_attestation(
             pubkey_hex,
             source_epoch,
             target_epoch,
             signing_root_hex,
             &self.gvr,
-        );
-        let outcome = if result.is_ok() { "staged" } else { "rejected" };
-        // NOTE: same timing caveat as stage_block — fires at STAGE time while the
-        // StagedAttestation guard holds the DB mutex.  A "staged" event may precede
-        // a rolled-back sign.  Do not install a tracing subscriber that reads the DB.
-        audit_log(&self.client_cn, pubkey_hex, outcome);
-        result
+        ) {
+            Ok(staged) => {
+                let audit = PendingAudit {
+                    client_cn: self.client_cn.clone(),
+                    pubkey_hex: pubkey_hex.to_string(),
+                    outcome: "staged",
+                };
+                Ok((staged, audit))
+            }
+            Err(e) => {
+                audit_log(&self.client_cn, pubkey_hex, "rejected");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -126,22 +181,21 @@ mod tests {
     #[test]
     fn test_stage_block_commit_succeeds() {
         let (_db, scoped) = open_scoped();
-        scoped
+        let (staged, audit) = scoped
             .stage_block(PUBKEY, 100, Some("0xroot_ok".into()))
-            .expect("stage_block must succeed")
-            .commit()
-            .expect("commit must succeed");
+            .expect("stage_block must succeed");
+        staged.commit().expect("commit must succeed");
+        audit.emit();
     }
 
     #[test]
     fn test_stage_block_double_proposal_rejected() {
         let (_db, scoped) = open_scoped();
 
-        scoped
-            .stage_block(PUBKEY, 200, Some("0xroot_1".into()))
-            .expect("first stage")
-            .commit()
-            .expect("first commit");
+        let (staged, audit) =
+            scoped.stage_block(PUBKEY, 200, Some("0xroot_1".into())).expect("first stage");
+        staged.commit().expect("first commit");
+        audit.emit();
 
         let err = scoped
             .stage_block(PUBKEY, 200, Some("0xroot_2".into()))
@@ -161,29 +215,31 @@ mod tests {
     #[test]
     fn test_stage_block_discard_leaves_no_row() {
         let (db, scoped) = open_scoped();
-        scoped.stage_block(PUBKEY, 300, Some("0xroot".into())).expect("stage").discard();
+        let (staged, audit) =
+            scoped.stage_block(PUBKEY, 300, Some("0xroot".into())).expect("stage");
+        staged.discard();
+        audit.emit();
         assert!(db.get_blocks(PUBKEY).expect("get_blocks").is_empty());
     }
 
     #[test]
     fn test_stage_attestation_commit_succeeds() {
         let (_db, scoped) = open_scoped();
-        scoped
+        let (staged, audit) = scoped
             .stage_attestation(PUBKEY, 5, 10, Some("0xatt_root".into()))
-            .expect("stage_attestation must succeed")
-            .commit()
-            .expect("commit must succeed");
+            .expect("stage_attestation must succeed");
+        staged.commit().expect("commit must succeed");
+        audit.emit();
     }
 
     #[test]
     fn test_stage_attestation_double_vote_rejected() {
         let (_db, scoped) = open_scoped();
 
-        scoped
-            .stage_attestation(PUBKEY, 1, 5, Some("0xatt_1".into()))
-            .expect("first stage")
-            .commit()
-            .expect("first commit");
+        let (staged, audit) =
+            scoped.stage_attestation(PUBKEY, 1, 5, Some("0xatt_1".into())).expect("first stage");
+        staged.commit().expect("first commit");
+        audit.emit();
 
         let err = scoped
             .stage_attestation(PUBKEY, 1, 5, Some("0xatt_2".into()))
@@ -203,10 +259,10 @@ mod tests {
     #[test]
     fn test_stage_attestation_discard_leaves_no_row() {
         let (db, scoped) = open_scoped();
-        scoped
-            .stage_attestation(PUBKEY, 10, 20, Some("0xatt_root".into()))
-            .expect("stage")
-            .discard();
+        let (staged, audit) =
+            scoped.stage_attestation(PUBKEY, 10, 20, Some("0xatt_root".into())).expect("stage");
+        staged.discard();
+        audit.emit();
         assert!(db.get_attestations(PUBKEY).expect("get_attestations").is_empty());
     }
 
@@ -221,11 +277,10 @@ mod tests {
         let db = Arc::new(SlashingDb::open(&path).expect("open file db"));
         let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), GVR);
 
-        scoped
-            .stage_block(PUBKEY, 400, Some("0xaudit_root".into()))
-            .expect("stage")
-            .commit()
-            .expect("commit");
+        let (staged, audit) =
+            scoped.stage_block(PUBKEY, 400, Some("0xaudit_root".into())).expect("stage");
+        staged.commit().expect("commit");
+        audit.emit();
 
         drop(scoped);
         drop(db);
@@ -254,12 +309,12 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
         let scoped = PubkeyScopedDb::new(Arc::clone(&db), "peer-dvt-1".to_string(), GVR);
 
-        // Happy-path stage: audit_log must fire with outcome "staged" (no panic).
-        scoped
+        // Happy-path stage: PendingAudit must be emitted after commit (no panic).
+        let (staged, audit) = scoped
             .stage_block(PUBKEY, 500, Some("0xaudit_fire_root".into()))
-            .expect("stage must succeed")
-            .commit()
-            .expect("commit must succeed");
+            .expect("stage must succeed");
+        staged.commit().expect("commit must succeed");
+        audit.emit();
 
         // Rejection path: audit_log must fire with outcome "rejected" (no panic).
         let _err = scoped
@@ -276,16 +331,47 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
         let scoped = PubkeyScopedDb::new(Arc::clone(&db), "peer-dvt-2".to_string(), GVR);
 
-        // Happy-path: audit_log fires with "staged".
-        scoped
+        // Happy-path: emit "staged" after commit.
+        let (staged, audit) = scoped
             .stage_attestation(PUBKEY, 3, 8, Some("0xatt_fire".into()))
-            .expect("stage must succeed")
-            .commit()
-            .expect("commit must succeed");
+            .expect("stage must succeed");
+        staged.commit().expect("commit must succeed");
+        audit.emit();
 
         // Rejection path: audit_log fires with "rejected".
         let _err = scoped
             .stage_attestation(PUBKEY, 3, 8, Some("0xatt_conflict".into()))
             .expect_err("double vote must be rejected");
+    }
+
+    /// GREEN: double proposal rejects and `"rejected"` is emitted with no guard held.
+    ///
+    /// Mirrors `audit_log_truncates_pubkey` (`audit.rs`) for capture style. Proves
+    /// the Err path is fixed in-file: no staged guard exists when `audit_log` runs.
+    #[tracing_test::traced_test]
+    #[test]
+    fn stage_block_rejection_emits_audit_without_holding_the_guard() {
+        let (_db, scoped) = open_scoped();
+
+        let (staged, audit) =
+            scoped.stage_block(PUBKEY, 600, Some("0xfirst".into())).expect("first stage");
+        staged.commit().expect("first commit");
+        audit.emit();
+
+        let err = scoped
+            .stage_block(PUBKEY, 600, Some("0xsecond".into()))
+            .expect_err("double proposal must be rejected");
+        assert!(
+            matches!(
+                err,
+                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                    slot: 600
+                })
+            ),
+            "expected DoubleBlockProposal, got {err:?}"
+        );
+
+        assert!(logs_contain("slashing audit"), "rejected audit event did not fire");
+        assert!(logs_contain("rejected"), "outcome must be rejected");
     }
 }

@@ -52,7 +52,7 @@ use metrics::definitions::{
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
 use observability::logging::TruncatedPubkey;
-use slashing::{SlashingError, StagedAttestation, StagedBlock};
+use slashing::{PendingAudit, SlashingError, StagedAttestation, StagedBlock};
 use tracing::{error, warn};
 
 use crate::error::SigningGateError;
@@ -146,6 +146,21 @@ impl StagedRow for StagedAttestation<'_> {
     }
     fn discard_row(self) {
         self.discard();
+    }
+}
+
+/// ARCH-1a compile bridge: `PubkeyScopedDb::stage_*` returns `(staged, PendingAudit)`.
+/// Emit the deferred audit only after commit/discard releases the connection mutex
+/// so a DB-reading tracing subscriber cannot deadlock (ADR-006 / C2).
+impl<S: StagedRow> StagedRow for (S, PendingAudit) {
+    fn commit_row(self) -> Result<(), SlashingError> {
+        let result = self.0.commit_row();
+        self.1.emit();
+        result
+    }
+    fn discard_row(self) {
+        self.0.discard_row();
+        self.1.emit();
     }
 }
 

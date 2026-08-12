@@ -365,16 +365,16 @@ a defect — say so in the doc comment.
   not grow.
 
 **Acceptance criteria.**
-- [ ] `PendingAudit` exists, is `#[must_use]`, and is the only way a `"staged"` event is emitted.
-- [ ] `scoped.rs` contains **no** `audit_log` call on the `Ok` path of either method.
-- [ ] The `Err` path of both methods emits `"rejected"` and no guard exists at that point.
-- [ ] The `:70-74` and `:103-105` `NOTE` blocks are **replaced** by the new ordering guarantee, which
+- [x] `PendingAudit` exists, is `#[must_use]`, and is the only way a `"staged"` event is emitted.
+- [x] `scoped.rs` contains **no** `audit_log` call on the `Ok` path of either method.
+- [x] The `Err` path of both methods emits `"rejected"` and no guard exists at that point.
+- [x] The `:70-74` and `:103-105` `NOTE` blocks are **replaced** by the new ordering guarantee, which
       states explicitly that `"staged"` now correlates with commit/discard.
-- [ ] The RED test exists, is thread-bounded, and its failing output against the pre-change tree is
+- [x] The RED test exists, is thread-bounded, and its failing output against the pre-change tree is
       pasted into the PR.
-- [ ] `git diff <base> -- crates/slashing/src/stage.rs` is **empty**.
-- [ ] No new channel of any kind in `crates/slashing`.
-- [ ] `EXEMPTIONS` in `kat_policy.rs` has not grown.
+- [x] `git diff <base> -- crates/slashing/src/stage.rs` is **empty**.
+- [x] No new channel of any kind in `crates/slashing`.
+- [x] `EXEMPTIONS` in `kat_policy.rs` has not grown.
 
 ---
 

@@ -229,7 +229,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         // spawn_blocking is required because StagedBlock holds a !Send MutexGuard.
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
-            let staged = scoped
+            let (staged, audit) = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
 
@@ -237,13 +237,17 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
             match sign_result {
                 Ok(sig) => {
-                    staged
+                    // Emit after commit attempt regardless of success (matches StagedRow bridge).
+                    let commit_result = staged
                         .commit()
-                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
                     Ok(sig)
                 }
                 Err(e) => {
                     staged.discard();
+                    audit.emit();
                     Err(e)
                 }
             }
@@ -321,7 +325,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         // spawn_blocking is required because StagedAttestation holds a !Send MutexGuard.
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
-            let staged = scoped
+            let (staged, audit) = scoped
                 .stage_attestation(&pubkey_hex_str, source_epoch, target_epoch, signing_root_hex)
                 .map_err(slashing_err)?;
 
@@ -329,13 +333,17 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
             match sign_result {
                 Ok(sig) => {
-                    staged
+                    // Emit after commit attempt regardless of success (matches StagedRow bridge).
+                    let commit_result = staged
                         .commit()
-                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
                     Ok(sig)
                 }
                 Err(e) => {
                     staged.discard();
+                    audit.emit();
                     Err(e)
                 }
             }

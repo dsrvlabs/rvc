@@ -1211,11 +1211,11 @@ mod edge_case_tests {
             use std::sync::Arc;
             let db_arc = Arc::new(SlashingDb::open(&path).expect("open for scoped"));
             let scoped = PubkeyScopedDb::new(Arc::clone(&db_arc), "peer-dvt-x".to_string(), GVR);
-            scoped
+            let (staged, audit) = scoped
                 .stage_block(PUBKEY_BLOCK, 501, Some("0xscopedroot".to_string()))
-                .expect("scoped stage_block must succeed")
-                .commit()
-                .expect("commit");
+                .expect("scoped stage_block must succeed");
+            staged.commit().expect("commit");
+            audit.emit();
         }
 
         drop(db);

@@ -18,7 +18,7 @@ pub use db::watermarks::{raise_watermark, read_watermark, WatermarkKind};
 pub use db::SlashingDb;
 pub use error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 pub use reader::{SlashingDbReader, TargetEpoch};
-pub use scoped::PubkeyScopedDb;
+pub use scoped::{PendingAudit, PubkeyScopedDb};
 pub use stage::{StagedAttestation, StagedBlock};
 pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
