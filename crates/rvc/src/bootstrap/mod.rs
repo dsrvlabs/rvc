@@ -19,14 +19,12 @@ mod tasks;
 
 pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
+pub use executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 pub use keys::{load_signing_keys, LoadedKeys};
 pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
-pub use tasks::{
-    check_metrics_bind_gate, spawn_background_tasks, BackgroundTasks,
-    METRICS_ALLOW_NON_LOOPBACK_ENV, METRICS_SHUTDOWN_TIMEOUT,
-};
+pub use tasks::{check_metrics_bind_gate, spawn_background_tasks, METRICS_ALLOW_NON_LOOPBACK_ENV};
 
 use std::sync::Arc;
 

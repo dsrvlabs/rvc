@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use bn_manager::BeaconNodeClient;
 use metrics::definitions::RVC_VALIDATORS_SLASHED_TOTAL;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use validator_store::ValidatorStore;
+
+use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 
 /// Re-export config-typed enum so callers keep a single definition.
 pub use crate::config::SlashedAction;
@@ -96,34 +96,39 @@ pub async fn check_slashed_validators(
     SlashedOutcome::NoAction
 }
 
-/// Spawn the background epoch-tick slashing monitor.
+/// Register the background epoch-tick slashing monitor on the process executor.
 ///
-/// When a check returns [`SlashedOutcome::ShutdownRequested`], cancels
-/// `shutdown_token` so the main runtime `select!` can exit cleanly.
+/// When a check returns [`SlashedOutcome::ShutdownRequested`], cancels the
+/// executor token so the composition root can exit cleanly.
 ///
-/// Does nothing (returns a finished handle) when `action` is
-/// [`SlashedAction::None`].
+/// When `action` is [`SlashedAction::None`], uses [`TaskExecutor::register_opt`]
+/// with `None` so no `rvc_tasks_running{task="slashing_monitor"}` series is
+/// created (P1-8).
 pub fn spawn(
     beacon: Arc<dyn BeaconNodeClient>,
     store: Arc<ValidatorStore>,
     action: SlashedAction,
-    shutdown_token: CancellationToken,
-) -> JoinHandle<()> {
-    spawn_with_interval(beacon, store, action, shutdown_token, epoch_check_interval())
+    executor: &TaskExecutor,
+) {
+    spawn_with_interval(beacon, store, action, executor, epoch_check_interval());
 }
 
 fn spawn_with_interval(
     beacon: Arc<dyn BeaconNodeClient>,
     store: Arc<ValidatorStore>,
     action: SlashedAction,
-    shutdown_token: CancellationToken,
+    executor: &TaskExecutor,
     interval: Duration,
-) -> JoinHandle<()> {
+) {
+    // P1-8: disabled feature contributes zero registry entries / metric series.
     if action == SlashedAction::None {
-        return tokio::spawn(async {});
+        executor.register_opt::<()>("slashing_monitor", ShutdownTier::Background, None);
+        return;
     }
 
-    tokio::spawn(async move {
+    let shutdown_token = executor.token();
+    // P1-9: Background tier; cooperative cancel via process token.
+    executor.spawn("slashing_monitor", ShutdownTier::Background, async move {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -141,7 +146,7 @@ fn spawn_with_interval(
                 break;
             }
         }
-    })
+    });
 }
 
 #[cfg(test)]
@@ -277,17 +282,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_cancels_shutdown_token_on_shutdown_requested() {
+        use tokio_util::sync::CancellationToken;
+
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
         let token = CancellationToken::new();
-        let handle = spawn_with_interval(
+        let (exec, _rx) = TaskExecutor::new(token.clone());
+        spawn_with_interval(
             Arc::new(beacon),
             Arc::new(store),
             SlashedAction::Shutdown,
-            token.clone(),
+            &exec,
             Duration::from_millis(5),
         );
 
@@ -298,29 +306,81 @@ mod tests {
         }
 
         assert!(token.is_cancelled(), "spawn must cancel shutdown token on ShutdownRequested");
-        handle.await.expect("slashing monitor task should complete");
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
     }
 
     #[tokio::test]
     async fn test_spawn_exits_when_shutdown_token_cancelled_externally() {
+        use tokio_util::sync::CancellationToken;
+
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator_data(&pk, "active_ongoing")]);
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
         let token = CancellationToken::new();
-        let handle = spawn_with_interval(
+        let (exec, _rx) = TaskExecutor::new(token.clone());
+        spawn_with_interval(
             Arc::new(beacon),
             Arc::new(store),
             SlashedAction::DisableOnly,
-            token.clone(),
+            &exec,
             Duration::from_secs(3600),
         );
 
         token.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("slashing monitor task should exit promptly on token cancel")
-            .expect("slashing monitor task should complete");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            exec.shutdown(crate::bootstrap::executor::TierBudget::default()),
+        )
+        .await
+        .expect("slashing monitor task should exit promptly on token cancel");
+        assert!(
+            outcome.joined.contains(&"slashing_monitor")
+                || outcome.aborted.contains(&"slashing_monitor"),
+            "slashing_monitor must finish after external cancel"
+        );
+    }
+
+    /// ARCH-2g P1-8: disabled slashing monitor registers no task and creates no series.
+    #[tokio::test]
+    async fn test_disabled_slashing_monitor_registers_no_task() {
+        use metrics::definitions::RVC_TASKS_RUNNING;
+        use tokio_util::sync::CancellationToken;
+
+        const NAME: &str = "slashing_monitor";
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        let before = RVC_TASKS_RUNNING.with_label_values(&[NAME]).get();
+
+        spawn(
+            Arc::new(mock_failing()),
+            Arc::new(ValidatorStore::new([0u8; 20], 100)),
+            SlashedAction::None,
+            &exec,
+        );
+
+        assert!(exec.registered_names().is_empty(), "SlashedAction::None must register no task");
+        assert_eq!(
+            RVC_TASKS_RUNNING.with_label_values(&[NAME]).get(),
+            before,
+            "disabled slashing must not touch rvc_tasks_running{{task={NAME}}}"
+        );
+    }
+
+    /// ARCH-2g P1-9: enabled monitor is registered by name.
+    #[tokio::test]
+    async fn test_enabled_slashing_monitor_is_registered_by_name() {
+        use tokio_util::sync::CancellationToken;
+
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_with_interval(
+            Arc::new(mock_failing()),
+            Arc::new(ValidatorStore::new([0u8; 20], 100)),
+            SlashedAction::DisableOnly,
+            &exec,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(exec.registered_names(), vec!["slashing_monitor"]);
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
     }
 }

@@ -13,11 +13,10 @@ use keymanager_api::traits::{DoppelgangerMonitor, VoluntaryExitManager};
 use signer::SignerService;
 use slashing::SlashingDb;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use validator_store::ValidatorStore;
 
+use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::config::Config;
 use crate::deletion_denylist::DeletionDenylist;
 use crate::key_admission::KeyAdmissionService;
@@ -234,19 +233,19 @@ pub fn build_keymanager_api(
 
 /// Bootstrap phase: optionally assemble and spawn the Keymanager API server.
 ///
-/// When `config.keymanager.enabled` is false, returns `Ok(None)` without
+/// When `config.keymanager.enabled` is false, returns `Ok(false)` without
 /// constructing adapters or touching the token file.
 ///
-/// When enabled, returns a [`JoinHandle`] for the server task (Ingress tier).
-/// ARCH-2g registers this handle on the executor; cancellation is driven by
-/// `shutdown` via [`keymanager_api::KeymanagerServer::run_with_shutdown`].
+/// When enabled, registers the server on `executor` at Ingress tier (ARCH-2g
+/// P1-6). Cancellation is driven by the executor token via
+/// [`keymanager_api::KeymanagerServer::run_with_shutdown`].
 pub fn spawn_keymanager_api(
     config: &Config,
     deps: KeymanagerApiDeps,
-    shutdown: &CancellationToken,
-) -> Result<Option<JoinHandle<()>>, SpawnKeymanagerApiError> {
+    executor: &TaskExecutor,
+) -> Result<bool, SpawnKeymanagerApiError> {
     let Some(built) = build_keymanager_api(config, deps)? else {
-        return Ok(None);
+        return Ok(false);
     };
 
     info!(
@@ -255,12 +254,12 @@ pub fn spawn_keymanager_api(
         "Keymanager API enabled"
     );
 
-    let token = shutdown.clone();
-    let handle = tokio::spawn(async move {
+    let token = executor.token();
+    executor.spawn("keymanager_api", ShutdownTier::Ingress, async move {
         if let Err(e) = built.server.run_with_shutdown(token).await {
             error!("Keymanager API server error: {}", e);
         }
     });
 
-    Ok(Some(handle))
+    Ok(true)
 }

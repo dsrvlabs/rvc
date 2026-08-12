@@ -351,6 +351,11 @@ impl TaskExecutor {
         }
     }
 
+    /// Static names of currently registered tasks (ARCH-2g / diagnostics).
+    pub fn registered_names(&self) -> Vec<&'static str> {
+        self.registry.lock().iter().map(|r| r.name).collect()
+    }
+
     #[cfg(test)]
     fn registry_len(&self) -> usize {
         self.registry.lock().len()
@@ -361,6 +366,7 @@ impl TaskExecutor {
         self.registry.lock().iter().map(|r| (r.name, r.tier)).collect()
     }
 
+    #[cfg(test)]
     async fn wait_exits(&self, n: usize) {
         loop {
             if self.exits.lock().len() >= n {
@@ -407,7 +413,6 @@ mod tests {
             .flat_map(|mf| mf.get_metric())
             .any(|m| m.get_label().iter().any(|l| l.name() == "task" && l.value() == task))
     }
-
 
     #[tokio::test]
     async fn test_panicking_task_reports_failure_reason() {
@@ -831,5 +836,4 @@ mod tests {
 
         let _ = exec.shutdown(TierBudget::default()).await;
     }
-
 }

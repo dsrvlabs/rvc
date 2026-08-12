@@ -45,31 +45,17 @@ use std::path::{Path, PathBuf};
 const BAN_LIST: &[&str] = &["tokio::spawn"];
 
 // ---------------------------------------------------------------------------
-// Shrinking-only allow-list (path, 1-based line) — pending ARCH-2g
+// Shrinking-only allow-list (path, 1-based line) — empty after ARCH-2g (M8 = 0)
 // ---------------------------------------------------------------------------
 
-/// Workspace-relative `/`-separated paths + 1-based line numbers of the nine live production
-/// `tokio::spawn` sites still pending ARCH-2g migration onto `TaskExecutor`.
+/// Workspace-relative `/`-separated paths + 1-based line numbers of raw production
+/// `tokio::spawn` sites still permitted outside [`EXECUTOR_PATH`].
 ///
-/// **Shrinking-only:** entries may be **removed**, never **added**. After ARCH-2g each row is
-/// deleted as its call site moves to the executor; the list must end empty (M8 = 0).
-///
-/// Line numbers are pinned against HEAD at ARCH-2k land. A line shift without a migration is a
-/// real signal (accidental edit or reformat of a spawn site) and fails the gate until the row is
-/// updated deliberately — prefer removing the row via ARCH-2g over rebasing the number.
+/// **Shrinking-only:** entries may be **removed**, never **added**. ARCH-2g migrated all nine
+/// in-scope production sites onto `TaskExecutor`, so this list is empty (M8 = 0).
 ///
 /// Infra sites are **not** listed here (VD-2f): they are outside the scan path; see module docs.
-const ALLOW_LIST: &[(&str, u32)] = &[
-    ("bin/rvc/src/logging.rs", 217),          // pending ARCH-2g migration
-    ("crates/rvc/src/bootstrap/run.rs", 458), // pending ARCH-2g migration
-    ("crates/rvc/src/bootstrap/tasks.rs", 112), // pending ARCH-2g migration
-    ("crates/rvc/src/bootstrap/tasks.rs", 130), // pending ARCH-2g migration
-    ("crates/rvc/src/bootstrap/tasks.rs", 152), // pending ARCH-2g migration
-    ("crates/rvc/src/keymanager_adapters/spawn.rs", 251), // pending ARCH-2g migration
-    ("crates/rvc/src/liveness_loop.rs", 355), // pending ARCH-2g migration
-    ("crates/rvc/src/slashing_monitor.rs", 123), // pending ARCH-2g migration
-    ("crates/rvc/src/slashing_monitor.rs", 126), // pending ARCH-2g migration
-];
+const ALLOW_LIST: &[(&str, u32)] = &[];
 
 /// Sole production path permitted to call `tokio::spawn` without an allow-list entry
 /// (the executor's own `register` / `spawn` implementation).
@@ -313,26 +299,29 @@ fn no_raw_spawns_outside_executor_and_allowlist() {
         }
     }
 
-    // Non-vacuity: pre-ARCH-2g we still expect the nine allow-listed sites (or executor hits later).
-    // After ARCH-2g the list empties and production_hits may be 0; still require the walk saw files.
+    // Non-vacuity: after ARCH-2g, production hits remain only in the executor (ALLOW_LIST empty).
+    // Require the walk still sees files and at least the executor's own spawns.
     assert!(
         production_hits >= ALLOW_LIST.len(),
         "found only {production_hits} production raw-spawn hit(s); matcher or walk likely broke \
          (ALLOW_LIST has {})",
         ALLOW_LIST.len()
     );
+    assert!(
+        production_hits > 0,
+        "expected production hits inside {EXECUTOR_PATH}; matcher or walk likely broke"
+    );
 
     violations.sort();
     assert!(
         violations.is_empty(),
         "G-4 raw-spawn gate (ARCH-2k / M8): raw `tokio::spawn` under crates/rvc/src/** + \
-         bin/rvc/src/** must live only in {EXECUTOR_PATH} or on the shrinking-only ALLOW_LIST in \
-         crates/architecture-tests/tests/raw_spawn.rs (pending ARCH-2g migration).\n\
+         bin/rvc/src/** must live only in {EXECUTOR_PATH} (ALLOW_LIST empty after ARCH-2g).\n\
          Offenders:\n  {}",
         violations.join("\n  ")
     );
 
-    // Stale allow-list rows (site migrated or line moved) fail so ARCH-2g removes them deliberately.
+    // Stale allow-list rows (site migrated or line moved) fail deliberately.
     let mut stale: Vec<String> = Vec::new();
     for &(path, line) in ALLOW_LIST {
         if !used_allow.contains(&(path.to_string(), line)) {
@@ -348,11 +337,11 @@ fn no_raw_spawns_outside_executor_and_allowlist() {
 
 #[test]
 fn allow_list_is_sorted_unique_and_documented_size() {
-    // Pins the nine pre-2g sites; after ARCH-2g this assertion shrinks with ALLOW_LIST (to 0).
+    // ARCH-2g emptied the list (M8 = 0). Shrinking-only: never grow again.
     assert_eq!(
         ALLOW_LIST.len(),
-        9,
-        "pre-ARCH-2g ALLOW_LIST must list exactly the 9 live production sites; after 2g shrink to 0"
+        0,
+        "post-ARCH-2g ALLOW_LIST must be empty (M8 = 0); do not re-seed without a plan amendment"
     );
     let mut seen = HashSet::new();
     let mut prev: Option<(&str, u32)> = None;

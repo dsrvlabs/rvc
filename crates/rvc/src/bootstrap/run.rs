@@ -11,12 +11,11 @@ use std::time::Duration;
 use bn_manager::OperationTimeouts;
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
-use super::tasks::{spawn_background_tasks, BackgroundTasks};
+use super::executor::{ShutdownTier, TaskExecutor, TierBudget};
+use super::tasks::spawn_background_tasks;
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
@@ -41,9 +40,10 @@ pub struct RunOptions {
 
 /// Compose all bootstrap phases and run until shutdown.
 ///
-/// `shutdown_token` is shared with the binary (e.g. log-reload SIGHUP task) so
-/// cancel propagates to every background task. Logging guards stay owned by
-/// `main` and drop after this future resolves, flushing pending records last.
+/// `executor` is the process [`TaskExecutor`] (shared with the binary for the
+/// SIGHUP log-reload task). Cancel propagates via `executor.token()` to every
+/// cooperative background task. Logging guards stay owned by `main` and drop
+/// after this future resolves, flushing pending records last.
 ///
 /// # Errors
 ///
@@ -54,9 +54,10 @@ pub struct RunOptions {
 pub async fn run(
     config: Config,
     options: RunOptions,
-    shutdown_token: CancellationToken,
+    executor: TaskExecutor,
 ) -> Result<(), BootstrapError> {
     let startup_time = std::time::Instant::now();
+    let shutdown_token = executor.token();
 
     let redacted_nodes: Vec<String> =
         config.effective_beacon_nodes().iter().map(|u| redact_url(u)).collect();
@@ -132,13 +133,13 @@ pub async fn run(
         }
     };
 
-    // Step 6: SEC-2b/2c enablement + liveness loop.
+    // Step 6: SEC-2b/2c enablement + liveness loop (P1-7 registered on executor).
     let enablement = wire_signing_enablement(
         &config,
         &loaded_keys,
         &beacon_handles,
         Arc::clone(&slashing_db),
-        &shutdown_token,
+        &executor,
     )
     .await?;
 
@@ -175,7 +176,7 @@ pub async fn run(
         forward_window_machine,
         epoch_clock,
         pubkey_map: _,
-        liveness_task: _liveness_loop_handle,
+        liveness_task: _,
         pubkey_index,
     } = enablement;
 
@@ -210,17 +211,18 @@ pub async fn run(
 
     // ARCH-2a / VD-E1: refresh after key_gen_tx + validator_store are in scope
     // (RefreshService sleeps `interval` before first fetch — no startup timing change).
-    let _secret_provider_refresh = spawn_secret_provider_refresh(
+    // P1-5: secret-provider refresh on executor (Background).
+    spawn_secret_provider_refresh(
         &config,
         secret_providers,
         local_pubkeys,
         Arc::clone(&deletion_denylist),
         Arc::clone(&admissions),
-        &shutdown_token,
+        &executor,
     );
 
-    // Step 7c: optionally start Keymanager API (Ingress; ARCH-2g registers the handle).
-    let _keymanager_api_handle = spawn_keymanager_api(
+    // Step 7c: optionally start Keymanager API (Ingress; ARCH-2g P1-6).
+    let _keymanager_started = spawn_keymanager_api(
         &config,
         KeymanagerApiDeps {
             composite_signer: composite_signer.clone(),
@@ -238,7 +240,7 @@ pub async fn run(
             key_gen_tx,
             admissions,
         },
-        &shutdown_token,
+        &executor,
     )?;
 
     // Step 8: duty orchestrator.
@@ -272,17 +274,16 @@ pub async fn run(
             attesting_enabled: attesting_enabled.clone(),
         });
 
-    // Step 8b: slashing monitor (config already typed — RF5-11).
+    // Step 8b: slashing monitor (P1-8/P1-9 via register_opt / spawn).
     {
         let slashed_action = config.slashed_validators_action;
-
+        crate::slashing_monitor::spawn(
+            beacon.clone(),
+            validator_store.clone(),
+            slashed_action,
+            &executor,
+        );
         if slashed_action != crate::slashing_monitor::SlashedAction::None {
-            crate::slashing_monitor::spawn(
-                beacon.clone(),
-                validator_store.clone(),
-                slashed_action,
-                shutdown_token.clone(),
-            );
             info!(action = %slashed_action, "Slashing monitor started");
         }
     }
@@ -308,10 +309,11 @@ pub async fn run(
             }
         });
 
-    let background: BackgroundTasks = spawn_background_tasks(
+    // P1-2/P1-3/P1-4: metrics + monitoring + proposer-config on executor.
+    spawn_background_tasks(
         &config,
         health_status,
-        &shutdown_token,
+        &executor,
         pubkey_map.clone(),
         validator_store.clone(),
     )?;
@@ -332,6 +334,8 @@ pub async fn run(
     info!("Starting duty orchestrator");
 
     // Arm order preserved: gRPC, orchestrator, process signal.
+    // ARCH-2h will spawn/join the orchestrator via the executor; until then the
+    // inline select remains and registered background tasks drain via executor.
     tokio::select! {
         result = grpc_server => {
             match result {
@@ -351,14 +355,18 @@ pub async fn run(
     }
 
     startup::log_shutdown_initiated("signal received");
-    shutdown_token.cancel();
     orchestrator_handle.shutdown();
 
+    // Brief yield so the orchestrator can observe its watch shutdown (ARCH-2h
+    // replaces this with a real join). Registered tasks drain via TaskExecutor.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Metrics server drained before returning so logging guards (owned by main)
-    // drop last and flush after HTTP work is gone.
-    background.shutdown().await;
+    let outcome = executor.shutdown(TierBudget::default()).await;
+    info!(
+        joined = ?outcome.joined,
+        aborted = ?outcome.aborted,
+        "Background task drain complete"
+    );
 
     info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
     Ok(())
@@ -439,14 +447,16 @@ fn log_grpc_healthz_deprecation() {
 /// are in scope (ARCH-2a / VD-E1). ARCH-2c: callback is a single
 /// [`KeyAdmissionService::admit`] with [`AdmissionSource::RawSecret`].
 /// Denylist re-check lives inside `admit` (not duplicated here).
+///
+/// Returns whether a task was registered (ARCH-2g P1-5).
 fn spawn_secret_provider_refresh(
     config: &Config,
     secret_providers: Vec<Arc<dyn SecretProvider>>,
     local_pubkeys: HashSet<[u8; 48]>,
     denylist: Arc<DeletionDenylist>,
     admissions: Arc<KeyAdmissionService>,
-    shutdown: &CancellationToken,
-) -> Option<JoinHandle<()>> {
+    executor: &TaskExecutor,
+) -> bool {
     let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
     if refresh_interval > 0 && !secret_providers.is_empty() {
         let denylist_for_refresh = Arc::clone(&denylist);
@@ -457,9 +467,9 @@ fn spawn_secret_provider_refresh(
             local_pubkeys,
             Some(is_denied),
             std::time::Duration::from_secs(refresh_interval),
-            shutdown.clone(),
+            executor.token(),
         );
-        let handle = tokio::spawn(async move {
+        executor.spawn("secret_provider_refresh", ShutdownTier::Background, async move {
             refresh_service
                 .run(move |sk| {
                     // Denylist DELETE-races-refresh guard is inside admit.
@@ -468,9 +478,9 @@ fn spawn_secret_provider_refresh(
                 .await;
         });
         info!(interval_secs = refresh_interval, "Secret provider refresh task started");
-        Some(handle)
+        true
     } else {
-        None
+        false
     }
 }
 
@@ -485,6 +495,7 @@ mod tests {
     };
     use ::slashing::SlashingDb;
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
     use tracing_test::traced_test;
 
     /// ARCH-2i / NFR-3: pin EXIT_* numeric values so a silent renumber fails CI.
@@ -525,7 +536,8 @@ mod tests {
             timeouts: OperationTimeouts::default(),
         };
 
-        let err = run(config, options, CancellationToken::new())
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let err = run(config, options, executor)
             .await
             .expect_err("lock contention must return Err, not hard-exit the process");
         assert!(err.is_keystore_locked(), "expected keystore-locked BootstrapError, got: {err}");
@@ -633,7 +645,7 @@ mod tests {
     /// (VD-E1 ordering — validator_store + key_gen must be constructible at the call site).
     #[tokio::test]
     async fn secret_provider_refresh_is_spawned_after_key_gen_channel_exists() {
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
                 refresh_interval: Some(60),
@@ -645,26 +657,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (admissions, denylist, _) = test_admissions(&dir);
 
-        let handle = spawn_secret_provider_refresh(
+        let started = spawn_secret_provider_refresh(
             &config,
             vec![provider],
             HashSet::new(),
             denylist,
             admissions,
-            &shutdown,
+            &executor,
         );
-        assert!(handle.is_some(), "refresh must spawn when interval > 0 and providers present");
-        shutdown.cancel();
-        if let Some(h) = handle {
-            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-        }
+        assert!(started, "refresh must spawn when interval > 0 and providers present");
+        assert!(executor.registered_names().contains(&"secret_provider_refresh"));
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), executor.shutdown(TierBudget::default()))
+                .await;
         // Keep TempDir alive for full test body (F1).
         drop(dir);
     }
 
     #[tokio::test]
     async fn secret_provider_refresh_not_spawned_when_interval_is_zero() {
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
                 refresh_interval: Some(0),
@@ -675,21 +687,22 @@ mod tests {
         let provider: Arc<dyn SecretProvider> = Arc::new(DummySecretProvider);
         let dir = tempfile::tempdir().unwrap();
         let (admissions, denylist, _) = test_admissions(&dir);
-        let handle = spawn_secret_provider_refresh(
+        let started = spawn_secret_provider_refresh(
             &config,
             vec![provider],
             HashSet::new(),
             denylist,
             admissions,
-            &shutdown,
+            &executor,
         );
-        assert!(handle.is_none(), "refresh_interval = 0 must not spawn");
+        assert!(!started, "refresh_interval = 0 must not spawn");
+        assert!(executor.registered_names().is_empty());
         drop(dir);
     }
 
     #[tokio::test]
     async fn secret_provider_refresh_not_spawned_when_no_providers() {
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
                 refresh_interval: Some(60),
@@ -699,15 +712,16 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let (admissions, denylist, _) = test_admissions(&dir);
-        let handle = spawn_secret_provider_refresh(
+        let started = spawn_secret_provider_refresh(
             &config,
             vec![],
             HashSet::new(),
             denylist,
             admissions,
-            &shutdown,
+            &executor,
         );
-        assert!(handle.is_none(), "empty providers must not spawn");
+        assert!(!started, "empty providers must not spawn");
+        assert!(executor.registered_names().is_empty());
         drop(dir);
     }
 

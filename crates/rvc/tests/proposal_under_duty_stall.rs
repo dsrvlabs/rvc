@@ -93,7 +93,7 @@ fn proposal_slots_sample(n: usize) -> Vec<Slot> {
     let mut slots = Vec::with_capacity(n);
     let mut slot = MATRIX_START_SLOT;
     while slots.len() < n {
-        if slot % SLOTS_PER_EPOCH != 0 {
+        if !slot.is_multiple_of(SLOTS_PER_EPOCH) {
             slots.push(slot);
         }
         slot += 1;

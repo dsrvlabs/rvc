@@ -85,7 +85,7 @@ for anything but ARCH-2b/2c.
 
 ### Exit criteria — the milestone, as a checklist
 
-- [ ] **M8 = 0.** `raw_spawn.rs` (G-4) is green: zero raw `tokio::spawn` under `crates/rvc/src/**` +
+- [x] **M8 = 0.** `raw_spawn.rs` (G-4) is green: zero raw `tokio::spawn` under `crates/rvc/src/**` +
       `bin/rvc/src/**` outside `bootstrap/executor.rs` and the shrinking-only allow-list, and the
       gate's RED is demonstrated on synthetic input in the same PR.
 - [ ] **M10.** A test that signals shutdown while a block publish is in flight asserts the publish
@@ -661,16 +661,18 @@ did not update wins. `BackgroundTasks` may reduce to nothing, in which case dele
   a behavioural regression, not a migration.
 
 **Acceptance criteria.**
-- [ ] All nine sites route through `TaskExecutor`; `rg 'tokio::spawn' crates/rvc/src bin/rvc/src`
+- [x] All nine sites route through `TaskExecutor`; `rg 'tokio::spawn' crates/rvc/src bin/rvc/src`
       returns hits **only** inside `bootstrap/executor.rs` and `#[cfg(test)]`/`tests/` regions.
-- [ ] Each site's tier matches the table above, and the tier choice is defensible from the drain
+- [x] Each site's tier matches the table above, and the tier choice is defensible from the drain
       semantics (Ingress admits new work; Telemetry flushes last).
-- [ ] `BackgroundTasks::shutdown`'s private drain is deleted; there is exactly **one** shutdown path.
-- [ ] `rg 'spawn_blocking' crates/rvc/src bin/rvc/src` is unchanged by this diff.
-- [ ] No new channel of any kind; `rg 'unbounded_channel'` unchanged workspace-wide (C9 anchor 6,
+- [x] `BackgroundTasks::shutdown`'s private drain is deleted; there is exactly **one** shutdown path.
+- [x] `rg 'spawn_blocking' crates/rvc/src bin/rvc/src` is unchanged by this diff.
+- [x] No new channel of any kind; `rg 'unbounded_channel'` unchanged workspace-wide (C9 anchor 6,
       NFR-2).
-- [ ] The three tests above pass; every pre-existing test for the nine tasks passes **unmodified**.
-- [ ] `cargo nextest run --workspace` green; `cargo build --workspace` green.
+- [x] The three tests above pass; every pre-existing test for the nine tasks passes **unmodified**.
+- [x] `cargo nextest run --workspace` green; `cargo build --workspace` green.
+
+**Status:** Done (ARCH-2g, branch `feature/p2-2g-migrate-spawns-to-executor`). G-4 `ALLOW_LIST` emptied (M8 = 0 / ARCH-2k acceptance).
 
 ---
 
@@ -942,7 +944,7 @@ contain `spawn_blocking`**, so the prohibition is mechanical rather than a comme
 **Acceptance criteria.**
 - [ ] `crates/architecture-tests/tests/raw_spawn.rs` exists, uses no new dependency, and runs under
       the Phase-0 `arch-gates` job.
-- [ ] **M8 = 0**: the gate is green on `develop` after ARCH-2g lands.
+- [x] **M8 = 0**: the gate is green on `develop` after ARCH-2g lands. *(ALLOW_LIST emptied with ARCH-2g)*
 - [ ] Every failure message names the offending `path:line` (NFR-5, R10).
 - [ ] **The allow-list is empty** (VD-2f), documented as shrinking-only, with the four out-of-path
       Infra sites and their reasons in the file header comment — not as exemption rows.

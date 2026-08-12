@@ -36,6 +36,7 @@ use eth_types::{Epoch, SECONDS_PER_SLOT};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
 use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
 
@@ -58,8 +59,10 @@ pub fn merge_validator_indices(
 }
 
 /// Handle returned by [`spawn_liveness_loop`].
+///
+/// The loop future is registered on the process [`TaskExecutor`] (ARCH-2g);
+/// this struct only carries the shared index registry for callers.
 pub struct LivenessLoopSpawn {
-    pub join: tokio::task::JoinHandle<()>,
     /// Shared pubkey↔index registry (import/refresh may call [`merge_validator_indices`]).
     pub pubkey_index: SharedPubkeyIndexRegistry,
 }
@@ -114,7 +117,7 @@ impl LivenessObservationLoop {
         Arc::clone(&self.pubkey_index)
     }
 
-    /// Run until cancelled. Spawns no tasks — call from `tokio::spawn`.
+    /// Run until cancelled. Spawns no tasks — register via [`spawn_liveness_loop`].
     pub async fn run(self) {
         info!(
             slot_duration_secs = self.slot_duration.as_secs(),
@@ -321,13 +324,15 @@ impl LivenessObservationLoop {
 /// `pubkey_index` is the workspace-shared registry (same handle used by
 /// `prepare_proposers` / duty tracking). Callers must seed it before spawn or
 /// attach a non-empty `pubkey_map` so re-resolve can fill it later.
+///
+/// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
 pub fn spawn_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn BeaconNodeClient>,
     pubkey_index: SharedPubkeyIndexRegistry,
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
-    cancel: CancellationToken,
+    executor: &TaskExecutor,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let has_pubkeys = pubkey_map.as_ref().is_some_and(|m| !m.read().is_empty());
@@ -347,15 +352,16 @@ pub fn spawn_liveness_loop(
     }
 
     let pubkey_index_ret = Arc::clone(&pubkey_index);
+    let cancel = executor.token();
     let mut loop_task =
         LivenessObservationLoop::new(machine, beacon, pubkey_index, epoch_clock, cancel);
     if let Some(pm) = pubkey_map {
         loop_task = loop_task.with_pubkey_map(pm);
     }
-    let join = tokio::spawn(async move {
+    executor.spawn("liveness_loop", ShutdownTier::Orchestrator, async move {
         loop_task.run().await;
     });
-    Some(LivenessLoopSpawn { join, pubkey_index: pubkey_index_ret })
+    Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret })
 }
 
 #[cfg(test)]
@@ -635,37 +641,38 @@ mod tests {
         let reg = PubkeyIndexRegistry::shared();
         reg.write().insert(pk.to_bytes(), "1".to_string());
         let bn: Arc<dyn BeaconNodeClient> = Arc::new(all_not_live(&["1"]).0);
-        let cancel = CancellationToken::new();
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
         let handle = spawn_liveness_loop(
             Some(Arc::clone(&m)),
             bn,
             Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 1_000_000)),
-            cancel.clone(),
+            &exec,
         );
         assert!(handle.is_some(), "production loop must spawn with indices");
-        cancel.cancel();
-        let _ = handle.unwrap().join.await;
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
 
         let empty = PubkeyIndexRegistry::shared();
+        let (exec2, _rx2) = TaskExecutor::new(CancellationToken::new());
         let no_handle = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
             None,
             Arc::new(MonotonicEpochClock::new(0)),
-            CancellationToken::new(),
+            &exec2,
         );
         assert!(no_handle.is_none());
 
+        let (exec3, _rx3) = TaskExecutor::new(CancellationToken::new());
         let no_machine = spawn_liveness_loop(
             None,
             Arc::new(all_not_live(&["1"]).0),
             Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::new(0)),
-            CancellationToken::new(),
+            &exec3,
         );
         assert!(no_machine.is_none());
     }
@@ -776,17 +783,16 @@ mod tests {
         pm.insert(pk.to_bytes(), pk);
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
         let empty = PubkeyIndexRegistry::shared();
-        let cancel = CancellationToken::new();
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
         let spawn = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
             Some(pubkey_map),
             Arc::new(MonotonicEpochClock::new(0)),
-            cancel.clone(),
+            &exec,
         );
         assert!(spawn.is_some(), "must start so pending-activation keys can re-resolve");
-        cancel.cancel();
-        let _ = spawn.unwrap().join.await;
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
     }
 }

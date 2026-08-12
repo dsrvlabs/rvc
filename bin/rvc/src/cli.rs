@@ -802,10 +802,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
 
             let shutdown_token = tokio_util::sync::CancellationToken::new();
+            let (executor, _shutdown_rx) = rvc::bootstrap::TaskExecutor::new(shutdown_token);
             spawn_log_reload_handler(
                 enable_log_reload,
                 logging_guards.reload_handle.clone(),
-                shutdown_token.clone(),
+                &executor,
             );
 
             let run_result = rvc::bootstrap::run(
@@ -815,7 +816,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     strict_slashing_semantics,
                     timeouts,
                 },
-                shutdown_token,
+                executor,
             )
             .await;
 

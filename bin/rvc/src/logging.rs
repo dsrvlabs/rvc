@@ -195,18 +195,19 @@ pub fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppende
     })
 }
 
-/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2 / ARCH-2g P1-1).
 ///
 /// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
 /// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
 /// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
-/// filter, raising/lowering verbosity without a restart. The task is scoped to
-/// `shutdown_token`, so it exits cleanly on shutdown. On non-Unix targets there
-/// is no `SIGHUP`; the flag is accepted but inert (logged once).
+/// filter, raising/lowering verbosity without a restart. The task is registered
+/// on `executor` at Telemetry tier and exits when the process token is cancelled.
+/// On non-Unix targets there is no `SIGHUP`; the flag is accepted but inert
+/// (logged once).
 pub fn spawn_log_reload_handler(
     enabled: bool,
     reload_handle: telemetry::LogReloadHandle,
-    shutdown_token: tokio_util::sync::CancellationToken,
+    executor: &rvc::bootstrap::TaskExecutor,
 ) {
     if !enabled {
         return;
@@ -214,7 +215,10 @@ pub fn spawn_log_reload_handler(
 
     #[cfg(unix)]
     {
-        tokio::spawn(async move {
+        use rvc::bootstrap::ShutdownTier;
+
+        let shutdown_token = executor.token();
+        executor.spawn("log_reload", ShutdownTier::Telemetry, async move {
             let mut sighup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
                     Ok(s) => s,
@@ -246,7 +250,7 @@ pub fn spawn_log_reload_handler(
 
     #[cfg(not(unix))]
     {
-        let _ = (reload_handle, shutdown_token);
+        let _ = (reload_handle, executor);
         warn!("--enable-log-reload set, but SIGHUP-based reload is only supported on Unix");
     }
 }

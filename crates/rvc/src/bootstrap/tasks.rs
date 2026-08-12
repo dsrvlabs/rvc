@@ -9,28 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::{serve_metrics_with_health, SharedHealthStatus};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use validator_store::ValidatorStore;
 
+use super::executor::{ShutdownTier, TaskExecutor};
 use super::BootstrapError;
 use crate::config::{redact_url, Config};
 use crate::orchestrator::PubkeyMap;
 
 /// Env var that opts in to non-loopback metrics binds (ISSUE-4.10 / L-10).
 pub const METRICS_ALLOW_NON_LOOPBACK_ENV: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
-
-/// Timeout used when draining the metrics server after abort on shutdown.
-pub const METRICS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Handles for background tasks spawned after services are ready.
-///
-/// Owned by [`super::run`]; drained in a fixed order on shutdown.
-pub struct BackgroundTasks {
-    /// Metrics HTTP server task (`serve_metrics_with_health`).
-    pub metrics_handle: JoinHandle<Result<(), std::io::Error>>,
-}
 
 /// Enforce the ISSUE-4.10 non-loopback metrics bind gate.
 ///
@@ -87,54 +75,60 @@ fn live_monitoring_counts(pubkey_map: &PubkeyMap, validator_store: &ValidatorSto
 }
 
 /// Spawn metrics server, optional monitoring push, and optional proposer-config
-/// refresh. Callers must hold [`BackgroundTasks`] until graceful shutdown.
+/// refresh through the process [`TaskExecutor`] (ARCH-2g).
 ///
-/// Tasks that take `shutdown` exit when the token is cancelled. The metrics
-/// server is aborted and awaited with [`METRICS_SHUTDOWN_TIMEOUT`] via
-/// [`BackgroundTasks::shutdown`].
+/// Cooperative tasks take `executor.token()` and exit on cancel. The metrics
+/// server has no token (abort-drain on Telemetry tier via `TaskExecutor::shutdown`).
 ///
 /// `pubkey_map` and `validator_store` are captured by the monitoring push so
 /// each interval reports live totals (not a boot-time constant).
 pub fn spawn_background_tasks(
     config: &Config,
     health_status: SharedHealthStatus,
-    shutdown: &CancellationToken,
+    executor: &TaskExecutor,
     pubkey_map: PubkeyMap,
     validator_store: Arc<ValidatorStore>,
-) -> Result<BackgroundTasks, BootstrapError> {
+) -> Result<(), BootstrapError> {
     let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
 
     check_metrics_bind_gate(metrics_address)?;
 
     info!(addr = %metrics_address, port = metrics_port, "Starting metrics server");
-    let metrics_handle =
-        tokio::spawn(serve_metrics_with_health(metrics_address, metrics_port, health_status));
+    // P1-2: Telemetry tier; no cooperative token (abort-drain).
+    executor.spawn("metrics_server", ShutdownTier::Telemetry, async move {
+        if let Err(e) =
+            serve_metrics_with_health(metrics_address, metrics_port, health_status).await
+        {
+            error!(error = %e, "Metrics server exited with error");
+        }
+    });
 
-    // Spawn monitoring push task if endpoint is configured (T3.6)
+    // P1-3: monitoring push (PB-B2) — Background tier.
     if let Some(ref monitoring_endpoint) = config.monitoring.endpoint {
         let monitoring_config = crate::background_tasks::monitoring::MonitoringConfig {
             endpoint: monitoring_endpoint.clone(),
             interval: Duration::from_secs(config.monitoring.interval),
             insecure: config.monitoring.endpoint_insecure,
         };
-        let monitoring_shutdown = shutdown.clone();
-        // Clone so the proposer-config apply path can still own `validator_store`.
+        let monitoring_shutdown = executor.token();
         let store_for_monitoring = Arc::clone(&validator_store);
         info!(
             endpoint = %redact_url(monitoring_endpoint),
             interval_secs = config.monitoring.interval,
             "Starting monitoring push task"
         );
-        // Element 0 = total loaded; element 1 = active/enabled (see live_monitoring_counts).
-        tokio::spawn(crate::background_tasks::monitoring::start_monitoring_push(
-            monitoring_config,
-            monitoring_shutdown,
-            move || live_monitoring_counts(&pubkey_map, &store_for_monitoring),
-        ));
+        executor.spawn("monitoring_push", ShutdownTier::Background, async move {
+            crate::background_tasks::monitoring::start_monitoring_push(
+                monitoring_config,
+                monitoring_shutdown,
+                move || live_monitoring_counts(&pubkey_map, &store_for_monitoring),
+            )
+            .await;
+        });
     }
 
-    // Spawn proposer config URL refresh task if configured (T3.12)
+    // P1-4: proposer config URL refresh (PB-B1) — Background tier.
     if let Some(ref proposer_config_url) = config.proposer_config.url {
         let settings = crate::background_tasks::config_url::ProposerConfigUrlSettings {
             url: proposer_config_url.clone(),
@@ -142,38 +136,29 @@ pub fn spawn_background_tasks(
             token: config.proposer_config.url_token.clone(),
             insecure: config.proposer_config.url_insecure,
         };
-        let config_refresh_shutdown = shutdown.clone();
+        let config_refresh_shutdown = executor.token();
         info!(
             url = %redact_url(proposer_config_url),
             refresh_interval_secs = config.proposer_config.refresh_interval,
             "Starting proposer config URL refresh task"
         );
-        // ARCH-4b: map URL entries into ValidatorStore (ARCH-4a); malformed → warn + leave previous.
-        tokio::spawn(crate::background_tasks::config_url::start_proposer_config_refresh(
-            settings,
-            config_refresh_shutdown,
-            move |updates, default_update| {
-                crate::background_tasks::config_url::apply_proposer_config_updates(
-                    &validator_store,
-                    updates,
-                    default_update,
-                );
-            },
-        ));
+        executor.spawn("proposer_config_refresh", ShutdownTier::Background, async move {
+            crate::background_tasks::config_url::start_proposer_config_refresh(
+                settings,
+                config_refresh_shutdown,
+                move |updates, default_update| {
+                    crate::background_tasks::config_url::apply_proposer_config_updates(
+                        &validator_store,
+                        updates,
+                        default_update,
+                    );
+                },
+            )
+            .await;
+        });
     }
 
-    Ok(BackgroundTasks { metrics_handle })
-}
-
-impl BackgroundTasks {
-    /// Abort the metrics server and wait up to [`METRICS_SHUTDOWN_TIMEOUT`].
-    pub async fn shutdown(self) {
-        self.metrics_handle.abort();
-        let _ = tokio::time::timeout(METRICS_SHUTDOWN_TIMEOUT, async {
-            self.metrics_handle.await.ok()
-        })
-        .await;
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -189,8 +174,10 @@ mod tests {
     use keymanager_api::traits::KeystoreManager;
     use tempfile::TempDir;
     use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
     use validator_store::ValidatorConfig;
 
+    use super::super::executor::TierBudget;
     use crate::keymanager_adapters::KeystoreManagerAdapter;
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -274,22 +261,20 @@ mod tests {
             ..Config::default()
         };
         let health = metrics::new_health_status();
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let tasks = spawn_background_tasks(
+        spawn_background_tasks(
             &config,
             health,
-            &shutdown,
+            &executor,
             empty_pubkey_map(),
             empty_validator_store(),
         )
         .expect("loopback metrics spawn");
 
-        // Give the server a moment to start, then shut down.
+        // Give the server a moment to start, then drain via the executor.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown.cancel();
-        tasks.shutdown().await;
-        // If we reach here without hang, cancel/drain succeeded.
+        let _ = executor.shutdown(TierBudget::default()).await;
     }
 
     #[tokio::test]
@@ -300,23 +285,63 @@ mod tests {
             ..Config::default()
         };
         let health = metrics::new_health_status();
-        let shutdown = CancellationToken::new();
-        let tasks = spawn_background_tasks(
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_background_tasks(
             &config,
             health,
-            &shutdown,
+            &executor,
             empty_pubkey_map(),
             empty_validator_store(),
         )
         .expect("spawn");
 
         let start = std::time::Instant::now();
-        tasks.shutdown().await;
-        // Drain is bounded by METRICS_SHUTDOWN_TIMEOUT (2s); abort is near-instant.
+        let outcome = executor.shutdown(TierBudget::default()).await;
+        // Telemetry tier default is 0.5 s abort-drain; stay under a generous bound.
+        assert!(start.elapsed() < Duration::from_secs(3), "metrics drain exceeded shutdown bound");
         assert!(
-            start.elapsed() < METRICS_SHUTDOWN_TIMEOUT + Duration::from_millis(500),
-            "metrics drain exceeded shutdown bound"
+            outcome.joined.contains(&"metrics_server")
+                || outcome.aborted.contains(&"metrics_server"),
+            "metrics_server must be accounted for in ShutdownOutcome"
         );
+    }
+
+    #[tokio::test]
+    async fn test_background_tasks_are_registered_by_name() {
+        let config = Config {
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            metrics_port: 0,
+            monitoring: crate::config::MonitoringConfig {
+                endpoint: Some("http://127.0.0.1:9/metrics".into()),
+                interval: 60,
+                endpoint_insecure: true,
+            },
+            proposer_config: crate::config::ProposerConfigSource {
+                url: Some("http://127.0.0.1:9/proposer".into()),
+                refresh_interval: 60,
+                url_token: None,
+                url_insecure: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let health = metrics::new_health_status();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_background_tasks(
+            &config,
+            health,
+            &executor,
+            empty_pubkey_map(),
+            empty_validator_store(),
+        )
+        .expect("spawn");
+
+        let names: Vec<_> = executor.registered_names();
+        for expected in ["metrics_server", "monitoring_push", "proposer_config_refresh"] {
+            assert!(names.contains(&expected), "missing registered task {expected}: {names:?}");
+        }
+
+        let _ = executor.shutdown(TierBudget::default()).await;
     }
 
     #[test]

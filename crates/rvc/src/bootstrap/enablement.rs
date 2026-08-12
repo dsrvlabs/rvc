@@ -11,10 +11,10 @@ use std::sync::Arc;
 use bn_manager::BeaconNodeClient;
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use slashing::SlashingDb;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::beacon::BeaconHandles;
+use super::executor::TaskExecutor;
 use super::keys::LoadedKeys;
 use super::BootstrapError;
 use crate::config::{Config, ServiceBuilder};
@@ -70,7 +70,7 @@ pub async fn wire_signing_enablement(
     keys: &LoadedKeys,
     beacon: &BeaconHandles,
     slashing_db: Arc<SlashingDb>,
-    shutdown: &CancellationToken,
+    executor: &TaskExecutor,
 ) -> Result<EnablementHandles, BootstrapError> {
     let builder = ServiceBuilder::new(config.clone());
     let doppelganger_enabled = config.doppelganger_detection;
@@ -144,7 +144,7 @@ pub async fn wire_signing_enablement(
             Arc::clone(&pubkey_index),
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),
-            shutdown.clone(),
+            executor,
         )
     } else {
         None
@@ -204,6 +204,7 @@ mod tests {
     use slashing::SlashingDbReader;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -299,10 +300,10 @@ mod tests {
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         let handles =
-            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                 .await
                 .expect("phase succeeds with empty index resolution");
 
@@ -320,7 +321,7 @@ mod tests {
             !handles.signing_enablement.is_signing_enabled(&other),
             "unregistered key must be fail-closed"
         );
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
@@ -330,10 +331,10 @@ mod tests {
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         let handles =
-            wire_signing_enablement(&base_config(false), &keys, &beacon, slashing_db, &shutdown)
+            wire_signing_enablement(&base_config(false), &keys, &beacon, slashing_db, &executor)
                 .await
                 .expect("opt-out phase succeeds");
 
@@ -345,7 +346,7 @@ mod tests {
             handles.signing_enablement.is_signing_enabled(&other),
             "opt-out enables every pubkey"
         );
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
@@ -359,10 +360,10 @@ mod tests {
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         let handles =
-            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                 .await
                 .expect("epoch-0 phase succeeds");
 
@@ -373,7 +374,7 @@ mod tests {
         );
         let machine = handles.forward_window_machine.expect("machine present");
         assert_eq!(machine.status(&pk), ForwardWindowStatus::Safe);
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     /// Restart safe-skip requires local slashing history under this GVR.
@@ -384,14 +385,14 @@ mod tests {
         let pk = sk.public_key();
         let pk_hex = hex::encode(pk.to_bytes());
         let keys = loaded_keys_with_pubkey(pk.clone());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         // Without history: Pending (no safe-skip).
         {
             let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
             slashing_db.set_genesis_validators_root(&GVR).unwrap();
             let handles =
-                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                     .await
                     .expect("phase");
             assert!(
@@ -416,7 +417,7 @@ mod tests {
             );
 
             let handles =
-                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                     .await
                     .expect("phase with history");
             assert!(
@@ -424,7 +425,7 @@ mod tests {
                 "recent local attestation under GVR → restart safe-skip → Safe"
             );
         }
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
@@ -434,20 +435,29 @@ mod tests {
         let sk = SecretKey::generate();
         let keys = loaded_keys_with_pubkey(sk.public_key());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         let handles =
-            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                 .await
                 .expect("phase");
 
-        let task = handles.liveness_task.expect("liveness loop should spawn with pubkeys");
-        shutdown.cancel();
+        assert!(handles.liveness_task.is_some(), "liveness loop should spawn with pubkeys");
+        assert!(
+            executor.registered_names().contains(&"liveness_loop"),
+            "liveness_loop must be registered on the executor"
+        );
         // Loop must observe cancellation and exit without hanging.
-        tokio::time::timeout(Duration::from_secs(5), task.join)
-            .await
-            .expect("liveness task must terminate on shutdown token")
-            .expect("join ok");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.shutdown(crate::bootstrap::executor::TierBudget::default()),
+        )
+        .await
+        .expect("liveness task must terminate on shutdown token");
+        assert!(
+            outcome.joined.contains(&"liveness_loop") || outcome.aborted.contains(&"liveness_loop"),
+            "liveness_loop must drain"
+        );
     }
 
     /// Sanity: empty keystore path still produces a usable enablement handle.
@@ -456,10 +466,10 @@ mod tests {
         let (_server, beacon) = mock_beacon(0).await;
         let keys = empty_loaded_keys();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         let handles =
-            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &shutdown)
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                 .await
                 .expect("empty keys ok");
 
@@ -471,6 +481,6 @@ mod tests {
         assert!(!handles.signing_enablement.is_signing_enabled(&other));
         // Silence unused import warning paths
         let _ = Signer::public_keys(keys.composite_signer.as_ref());
-        shutdown.cancel();
+        executor.token().cancel();
     }
 }

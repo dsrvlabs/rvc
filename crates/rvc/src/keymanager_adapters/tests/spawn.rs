@@ -102,9 +102,10 @@ fn test_spawn_keymanager_api_disabled_constructs_nothing() {
 
     // spawn path is also a no-op
     let deps = spawn_test_deps(dir.path(), None);
-    let handle = spawn_keymanager_api(&config, deps, &CancellationToken::new())
-        .expect("disabled spawn is Ok");
-    assert!(handle.is_none(), "disabled spawn must return no JoinHandle");
+    let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+    let started = spawn_keymanager_api(&config, deps, &exec).expect("disabled spawn is Ok");
+    assert!(!started, "disabled spawn must not start a task");
+    assert!(exec.registered_names().is_empty());
 }
 
 /// Both monitor variants re-arm exactly once (single call site after branch).
@@ -202,10 +203,12 @@ fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
     assert!(logs_contain("non-loopback address"), "must warn when Keymanager binds non-loopback");
 }
 
-/// Enabled spawn returns a joinable handle that completes after token cancel.
+/// Enabled spawn registers on the executor and drains after token cancel.
 #[tokio::test]
 async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
     use std::time::Duration;
+
+    use crate::bootstrap::executor::{TaskExecutor, TierBudget};
 
     let dir = TempDir::new().unwrap();
     let addr = {
@@ -215,9 +218,10 @@ async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
     let config = spawn_test_config(&dir, true, &addr);
     let deps = spawn_test_deps(dir.path(), None);
     let token = CancellationToken::new();
-    let handle = spawn_keymanager_api(&config, deps, &token)
-        .expect("spawn")
-        .expect("enabled must return a JoinHandle");
+    let (exec, _rx) = TaskExecutor::new(token.clone());
+    let started = spawn_keymanager_api(&config, deps, &exec).expect("spawn");
+    assert!(started, "enabled must start keymanager_api");
+    assert_eq!(exec.registered_names(), vec!["keymanager_api"]);
 
     // Wait until the listener accepts.
     let sock: std::net::SocketAddr = addr.parse().unwrap();
@@ -229,8 +233,12 @@ async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
     }
 
     token.cancel();
-    let finished = tokio::time::timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("JoinHandle must complete within 2s after cancel");
-    finished.expect("server task must not panic");
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(2), exec.shutdown(TierBudget::default()))
+            .await
+            .expect("keymanager must complete within 2s after cancel");
+    assert!(
+        outcome.joined.contains(&"keymanager_api") || outcome.aborted.contains(&"keymanager_api"),
+        "keymanager_api must be drained"
+    );
 }

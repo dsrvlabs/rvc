@@ -27,6 +27,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use validator_store::ValidatorStore;
 
+use crate::bootstrap::executor::TaskExecutor;
 use crate::orchestrator::PubkeyMap;
 
 fn test_pubkey(id: u8) -> Pubkey {
