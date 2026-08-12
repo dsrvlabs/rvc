@@ -1157,14 +1157,14 @@ annotations disappear for those nine flags. That is expected, and the two existi
   expectations if `--help` text changed is in scope; changing what flags exist is not.
 
 **Acceptance criteria.**
-- [ ] The nine clap fields are `Option<T>` with no `default_value`; the nine `Some(...)` wrappers are gone.
-- [ ] Each of the nine defaults is present in `Config::default()` and **equals** the clap default it
+- [x] The nine clap fields are `Option<T>` with no `default_value`; the nine `Some(...)` wrappers are gone.
+- [x] Each of the nine defaults is present in `Config::default()` and **equals** the clap default it
       replaced (verified field by field, not assumed).
-- [ ] A TOML value survives when the flag is absent, for at least four of the nine.
-- [ ] An explicit flag still beats the TOML.
-- [ ] **`CLAP_DEFAULT_CLOBBERS` is empty, and the detector still flags a synthetic reintroduction.**
-- [ ] `--help` changes are recorded in the release note; both existing `--help`/conversion tests green.
-- [ ] `rg 'value_source' bin/rvc/src` is empty, or every hit names its field and reason.
+- [x] A TOML value survives when the flag is absent, for at least four of the nine.
+- [x] An explicit flag still beats the TOML.
+- [x] **`CLAP_DEFAULT_CLOBBERS` is empty, and the detector still flags a synthetic reintroduction.**
+- [x] `--help` changes are recorded in the release note; both existing `--help`/conversion tests green.
+- [x] `rg 'value_source' bin/rvc/src` is empty, or every hit names its field and reason.
 
 ---
 

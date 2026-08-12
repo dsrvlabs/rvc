@@ -1,6 +1,6 @@
 //! CLI types and command dispatch for the `rvc` binary.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -14,11 +14,6 @@ use crate::logging::{
     build_file_layer_config, build_tracing_config, init_logging, load_config,
     spawn_log_reload_handler,
 };
-
-const DEFAULT_GRPC_ADDRESS: &str = "127.0.0.1";
-const DEFAULT_GRPC_PORT: u16 = 50051;
-const DEFAULT_METRICS_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const DEFAULT_METRICS_PORT: u16 = 8080;
 
 #[derive(Parser)]
 #[command(name = "rvc")]
@@ -207,9 +202,9 @@ pub struct BeaconArgs {
     /// before the full body is allocated.  Raise this only if your beacon node
     /// legitimately returns larger responses.
     ///
-    /// Default: 33554432 (32 MiB).
-    #[arg(long, default_value_t = beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES)]
-    pub beacon_max_body_bytes: usize,
+    /// Default when unset: 33554432 (32 MiB), from `Config::default()`.
+    #[arg(long)]
+    pub beacon_max_body_bytes: Option<usize>,
 
     /// Block production timeout in seconds (default: 3)
     #[arg(long)]
@@ -284,20 +279,20 @@ pub struct KeysArgs {
 #[derive(Args, Debug)]
 pub struct ServerArgs {
     /// Bind address for the metrics HTTP server (default: 127.0.0.1)
-    #[arg(long, default_value_t = DEFAULT_METRICS_ADDRESS)]
-    pub metrics_address: IpAddr,
+    #[arg(long)]
+    pub metrics_address: Option<IpAddr>,
 
-    /// Port for the metrics HTTP server
-    #[arg(long, default_value_t = DEFAULT_METRICS_PORT)]
-    pub metrics_port: u16,
+    /// Port for the metrics HTTP server (default: 8080)
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
 
-    /// Port for the gRPC server
-    #[arg(long, default_value_t = DEFAULT_GRPC_PORT)]
-    pub grpc_port: u16,
+    /// Port for the gRPC server (default: 50051)
+    #[arg(long)]
+    pub grpc_port: Option<u16>,
 
-    /// Bind address for the gRPC server
-    #[arg(long, default_value = DEFAULT_GRPC_ADDRESS)]
-    pub grpc_address: String,
+    /// Bind address for the gRPC server (default: 127.0.0.1)
+    #[arg(long)]
+    pub grpc_address: Option<String>,
 }
 
 /// Network preset and genesis overrides.
@@ -323,9 +318,9 @@ pub struct NetworkArgs {
 /// Console logging and logfile rotation settings.
 #[derive(Args, Debug)]
 pub struct LoggingArgs {
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
+    /// Log level (trace, debug, info, warn, error). Default when unset: info.
+    #[arg(long)]
+    pub log_level: Option<String>,
 
     /// Console log output format: `pretty` (default, human-readable) or
     /// `json` (one structured object per event, for log-aggregation backends
@@ -374,8 +369,8 @@ pub struct TracingArgs {
     pub tracing_endpoint: Option<String>,
 
     /// Exporter backend: "otlp" (default) or "gcp"
-    #[arg(long, default_value_t = TracingExporter::Otlp)]
-    pub tracing_exporter: TracingExporter,
+    #[arg(long)]
+    pub tracing_exporter: Option<TracingExporter>,
 
     /// Head-based sampling ratio 0.0–1.0 (default: 0.01 when unset; see OTEL_TRACES_SAMPLER_ARG)
     #[arg(long)]
@@ -426,8 +421,8 @@ pub struct KeymanagerArgs {
     pub keymanager_cors_origins: Option<Vec<String>>,
 
     /// Maximum request body size in bytes for the Keymanager API (default: 10 MB)
-    #[arg(long, default_value_t = keymanager_api::DEFAULT_BODY_LIMIT)]
-    pub keymanager_body_limit: usize,
+    #[arg(long)]
+    pub keymanager_body_limit: Option<usize>,
 }
 
 /// gRPC remote signer connection settings.
@@ -467,9 +462,9 @@ pub struct SafetyArgs {
     #[arg(long)]
     pub disable_attesting: bool,
 
-    /// Action when a slashed validator is detected: disable-only, shutdown, none
-    #[arg(long, default_value_t = SlashedAction::DisableOnly)]
-    pub slashed_validators_action: SlashedAction,
+    /// Action when a slashed validator is detected: disable-only (default), shutdown, none
+    #[arg(long)]
+    pub slashed_validators_action: Option<SlashedAction>,
 
     /// Allow startup when the beacon node's current fork version is not in
     /// the client's schedule (SEC-9 / M-15). For testnets / experimental
@@ -611,15 +606,15 @@ impl From<StartArgs> for CliOverrides {
             slashing_db_path: slashing.slashing_db_path,
             init_slashing_db: flag(slashing.init_slashing_db),
             allow_unsupported_fork: flag(safety.allow_unsupported_fork),
-            metrics_address: Some(server.metrics_address),
-            metrics_port: Some(server.metrics_port),
-            grpc_port: Some(server.grpc_port),
-            grpc_address: Some(server.grpc_address),
+            metrics_address: server.metrics_address,
+            metrics_port: server.metrics_port,
+            grpc_port: server.grpc_port,
+            grpc_address: server.grpc_address,
             network: network.network,
             genesis_time: network.genesis_time,
             genesis_validators_root: network.genesis_validators_root,
             graffiti: network.graffiti,
-            log_level: Some(logging.log_level),
+            log_level: logging.log_level,
             doppelganger_detection: if safety.no_doppelganger_detection {
                 Some(false)
             } else {
@@ -638,7 +633,7 @@ impl From<StartArgs> for CliOverrides {
             remote_signer_allowed_hosts: keymanager.remote_signer_allowed_hosts,
             key_decrypt_threads: keys.key_decrypt_threads,
             tracing_endpoint: tracing.tracing_endpoint,
-            tracing_exporter: Some(tracing.tracing_exporter),
+            tracing_exporter: tracing.tracing_exporter,
             tracing_sample_rate: tracing.tracing_sample_rate,
             tracing_max_queue_size: tracing.tracing_max_queue_size,
             tracing_max_export_batch_size: tracing.tracing_max_export_batch_size,
@@ -649,13 +644,13 @@ impl From<StartArgs> for CliOverrides {
             secret_provider_strict: flag(keys.secret_provider_strict),
             allow_insecure_remote_signer: flag(keymanager.allow_insecure_remote_signer),
             keymanager_cors_origins: keymanager.keymanager_cors_origins,
-            keymanager_body_limit: Some(keymanager.keymanager_body_limit),
+            keymanager_body_limit: keymanager.keymanager_body_limit,
             grpc_signer_url: grpc_signer.grpc_signer_url,
             grpc_signer_tls_cert: grpc_signer.grpc_signer_tls_cert,
             grpc_signer_tls_key: grpc_signer.grpc_signer_tls_key,
             grpc_signer_tls_ca_cert: grpc_signer.grpc_signer_tls_ca_cert,
             disable_attesting: flag(safety.disable_attesting),
-            slashed_validators_action: Some(safety.slashed_validators_action),
+            slashed_validators_action: safety.slashed_validators_action,
             builder_circuit_breaker_consecutive_limit: builder
                 .builder_circuit_breaker_consecutive_limit,
             builder_circuit_breaker_epoch_limit: builder.builder_circuit_breaker_epoch_limit,
@@ -679,7 +674,7 @@ impl From<StartArgs> for CliOverrides {
             validator_registration_batch_size: builder.validator_registration_batch_size,
             validator_registration_batch_delay: builder.validator_registration_batch_delay,
             validators_config: keys.validators_config,
-            beacon_max_body_bytes: Some(beacon.beacon_max_body_bytes),
+            beacon_max_body_bytes: beacon.beacon_max_body_bytes,
         }
     }
 }
@@ -769,7 +764,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
 
             let config_path = args.config.clone();
-            let log_level = args.logging.log_level.clone();
             let log_format = args.logging.log_format.clone();
             let enable_log_reload = args.logging.enable_log_reload;
             let strict_permissions = args.slashing.strict_permissions;
@@ -783,8 +777,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let tracing_config = build_tracing_config(&cfg);
             let file_layer_config = build_file_layer_config(&cfg);
             let log_format = telemetry::LogFormat::resolve(Some(&log_format));
+            // Use post-merge cfg so a TOML log_level is not clobbered by a clap default.
             let logging_guards = init_logging(
-                &log_level,
+                &cfg.log_level,
                 log_format,
                 tracing_config.as_ref(),
                 file_layer_config.as_ref(),
@@ -1240,6 +1235,108 @@ mod tests {
         assert_eq!(ov.logfile_compress, None);
         // RF5-15: no default_value_t — absent flag yields None (not Some(0.01)).
         assert_eq!(ov.tracing_sample_rate, None);
+        // ADR-009 / ARCH-6b: former clap-default fields are Option; absent → None.
+        assert_eq!(ov.metrics_address, None);
+        assert_eq!(ov.metrics_port, None);
+        assert_eq!(ov.grpc_port, None);
+        assert_eq!(ov.grpc_address, None);
+        assert_eq!(ov.log_level, None);
+        assert_eq!(ov.tracing_exporter, None);
+        assert_eq!(ov.keymanager_body_limit, None);
+        assert_eq!(ov.slashed_validators_action, None);
+        assert_eq!(ov.beacon_max_body_bytes, None);
+    }
+
+    /// ADR-009: TOML values must survive when the matching clap flag is absent.
+    /// Before ARCH-6b, clap `default_value` + unconditional `Some(...)` forced 8080 over 9090.
+    #[test]
+    fn a_toml_metrics_port_survives_when_the_flag_is_absent() {
+        use rvc::config::Config;
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+metrics_port = 9090
+grpc_port = 60051
+keymanager_body_limit = 2048
+beacon_max_body_bytes = 1024
+log_level = "debug"
+metrics_address = "0.0.0.0"
+grpc_address = "0.0.0.0"
+tracing_exporter = "gcp"
+slashed_validators_action = "shutdown"
+"#
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("default start should parse");
+        let Commands::Start(args) = cli.command else {
+            panic!("expected Start");
+        };
+        let ov = CliOverrides::from(*args);
+        let mut cfg = Config::from_file(file.path()).unwrap();
+        cfg.merge_with_cli(&ov);
+
+        assert_eq!(
+            cfg.metrics_port, 9090,
+            "TOML metrics_port must not be clobbered by clap default"
+        );
+        assert_eq!(cfg.grpc_port, 60051, "TOML grpc_port must not be clobbered by clap default");
+        assert_eq!(
+            cfg.keymanager.body_limit, 2048,
+            "TOML keymanager_body_limit must not be clobbered by clap default"
+        );
+        assert_eq!(
+            cfg.beacon_max_body_bytes, 1024,
+            "TOML beacon_max_body_bytes must not be clobbered by clap default"
+        );
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(
+            cfg.metrics_address,
+            "0.0.0.0".parse::<IpAddr>().unwrap(),
+            "TOML metrics_address must not be clobbered"
+        );
+        assert_eq!(cfg.grpc_address, "0.0.0.0");
+        assert_eq!(cfg.tracing.exporter, TracingExporter::Gcp);
+        assert_eq!(cfg.slashed_validators_action, SlashedAction::Shutdown);
+    }
+
+    /// Explicit CLI flags still beat TOML (precedence CLI > file).
+    #[test]
+    fn an_explicit_flag_still_wins_over_the_toml() {
+        use rvc::config::Config;
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+metrics_port = 9090
+grpc_port = 60051
+"#
+        )
+        .unwrap();
+
+        let cli =
+            Cli::try_parse_from(["rvc", "start", "--metrics-port", "7000", "--grpc-port", "7001"])
+                .expect("argv should parse");
+        let Commands::Start(args) = cli.command else {
+            panic!("expected Start");
+        };
+        let ov = CliOverrides::from(*args);
+        let mut cfg = Config::from_file(file.path()).unwrap();
+        cfg.merge_with_cli(&ov);
+
+        assert_eq!(cfg.metrics_port, 7000);
+        assert_eq!(cfg.grpc_port, 7001);
     }
 
     #[test]

@@ -70,3 +70,4 @@ on gRPC healthz, migrate before the removal release.
 **Unchanged this release:** `grpc_address` and `grpc_port` still work; the
 endpoint still answers. Disposal of those knobs is deferred to the removal
 release.
+- ADR-009: clap defaults no longer clobber TOML when flags are absent (nine fields become Option).

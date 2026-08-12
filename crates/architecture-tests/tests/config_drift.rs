@@ -26,12 +26,13 @@
 //!
 //! ## Clause (iv) — `CLAP_DEFAULT_CLOBBERS` (ADR-009 / F9)
 //!
-//! Nine `CliOverrides` fields are populated with unconditional `Some(<clap field with
+//! Formerly nine `CliOverrides` fields were populated with unconditional `Some(<clap field with
 //! default_value>)` in `From<StartArgs>`. Clap's default is indistinguishable from an operator
-//! flag, so `merge_with_cli`'s `set` arm overwrites a TOML value even when the flag was absent
-//! (e.g. TOML `metrics_port = 9090` silently becomes 8080). [`CLAP_DEFAULT_CLOBBERS`] seeds those
-//! nine; **shrinking-only** — a tenth instance is a new live defect (flagged until ARCH-6b
-//! empties the list). The detector still flags a synthetic reintroduction when the list is empty.
+//! flag, so `merge_with_cli`'s `set` arm overwrote a TOML value even when the flag was absent
+//! (e.g. TOML `metrics_port = 9090` silently became 8080). ARCH-6b converted those clap fields to
+//! `Option<T>` without `default_value`, so [`CLAP_DEFAULT_CLOBBERS`] is now **empty**. The list
+//! remains **shrinking-only** (may not grow); the detector still flags a synthetic reintroduction
+//! so an empty list is not a dead gate.
 //!
 //! ## Tests that *look* like precedence tests and are not
 //!
@@ -135,50 +136,12 @@ const ALIASES: &[(&str, &str, &str, &str)] = &[
 /// `Some(<binding>.<field>)` from a non-`Option` clap field that carries `default_value` /
 /// `default_value_t`. Clap's default then clobbers a TOML value when the flag is absent.
 ///
-/// **Shrinking-only.** Seeded with the nine verified HEAD instances. Entries may be **removed**
-/// (ARCH-6b converts the clap fields to `Option<T>` without defaults); a **tenth** entry is a
-/// new instance of a known live defect. An empty list after the fix must still flag a synthetic
-/// reintroduction — empty alone is not a dead gate.
+/// **Shrinking-only.** Emptied by ARCH-6b (nine clap fields → `Option<T>` without defaults).
+/// A new instance is a live defect and fails the gate. The synthetic RED in
+/// `clap_default_clobber_detector_flags_a_tenth_instance` keeps an empty list falsifiable.
 ///
 /// Tuple: `(cli_overrides_field, reason)`. Sorted by field name.
-const CLAP_DEFAULT_CLOBBERS: &[(&str, &str)] = &[
-    (
-        "beacon_max_body_bytes",
-        "Some(beacon.beacon_max_body_bytes) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "grpc_address",
-        "Some(server.grpc_address) from default_value; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "grpc_port",
-        "Some(server.grpc_port) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "keymanager_body_limit",
-        "Some(keymanager.keymanager_body_limit) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "log_level",
-        "Some(logging.log_level) from default_value; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "metrics_address",
-        "Some(server.metrics_address) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "metrics_port",
-        "Some(server.metrics_port) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "slashed_validators_action",
-        "Some(safety.slashed_validators_action) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-    (
-        "tracing_exporter",
-        "Some(tracing.tracing_exporter) from default_value_t; clobbers TOML (ADR-009/F9)",
-    ),
-];
+const CLAP_DEFAULT_CLOBBERS: &[(&str, &str)] = &[];
 
 /// Clause (iii): `CliOverrides` fields whose names do **not** appear (identifier-bounded) in
 /// `Config::validate`'s body. Most knobs legitimately have nothing to check at startup.
@@ -198,10 +161,7 @@ const UNVALIDATED: &[(&str, &str)] = &[
     ("disable_keystore_locking", "no field-name check in Config::validate"),
     ("doppelganger_detection", "no field-name check in Config::validate"),
     ("gcp_secret_prefix", "no field-name check in Config::validate"),
-    (
-        "genesis_time",
-        "checked via effective_genesis_time(); name not in validate body",
-    ),
+    ("genesis_time", "checked via effective_genesis_time(); name not in validate body"),
     (
         "genesis_validators_root",
         "checked via effective_genesis_validators_root(); name not in validate body",
@@ -823,11 +783,7 @@ fn clobber_growth(found: &[String], allowed: &HashSet<&str>) -> Vec<String> {
 /// Allow-list entries not present in the detector output (stale list / source drift).
 fn clobber_stale(found: &[String], allowed: &[&str]) -> Vec<String> {
     let found_set: HashSet<&str> = found.iter().map(String::as_str).collect();
-    allowed
-        .iter()
-        .filter(|f| !found_set.contains(*f))
-        .map(|s| (*s).to_string())
-        .collect()
+    allowed.iter().filter(|f| !found_set.contains(*f)).map(|s| (*s).to_string()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,16 +1231,15 @@ fn clap_default_clobbers_list_matches_the_source() {
     let allowed: Vec<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
     let allowed_set: HashSet<&str> = allowed.iter().copied().collect();
 
-    assert_eq!(
-        CLAP_DEFAULT_CLOBBERS.len(),
-        9,
-        "CLAP_DEFAULT_CLOBBERS must seed exactly the nine F9 fields; got {}",
+    // ARCH-6b: list is empty; detector must find no live clobbers.
+    assert!(
+        CLAP_DEFAULT_CLOBBERS.is_empty(),
+        "CLAP_DEFAULT_CLOBBERS must be empty after ARCH-6b; got {} entries",
         CLAP_DEFAULT_CLOBBERS.len()
     );
-    assert_eq!(
-        found.len(),
-        9,
-        "detector must find exactly nine clap-default clobbers at HEAD; got {found:?}"
+    assert!(
+        found.is_empty(),
+        "detector must find zero clap-default clobbers after ARCH-6b; got {found:?}"
     );
 
     let growth = clobber_growth(&found, &allowed_set);
@@ -1311,7 +1266,7 @@ fn clap_default_clobbers_list_matches_the_source() {
 
 #[test]
 fn every_clobber_entry_carries_a_reason() {
-    assert_eq!(CLAP_DEFAULT_CLOBBERS.len(), 9);
+    // Empty list is valid post-ARCH-6b; non-empty entries still need reasons + sort order.
     let mut seen = HashSet::new();
     let mut prev: Option<&str> = None;
     for &(field, reason) in CLAP_DEFAULT_CLOBBERS {
@@ -1398,10 +1353,7 @@ fn every_cli_override_field_is_validated_or_listed() {
     );
 
     let validate_body = config_validate_body(&types);
-    assert!(
-        !validate_body.is_empty(),
-        "failed to extract Config::validate body from types.rs"
-    );
+    assert!(!validate_body.is_empty(), "failed to extract Config::validate body from types.rs");
     assert!(
         has_ident(&validate_body, "metrics_port"),
         "validate body extraction broke (missing metrics_port)"
@@ -1428,11 +1380,7 @@ fn every_cli_override_field_is_validated_or_listed() {
     }
 
     let violations = unvalidated_violations(&override_fields, &validate_body, &unvalidated);
-    assert!(
-        violations.is_empty(),
-        "ARCH-P1-1 / G-2 clause (iii):\n  {}",
-        violations.join("\n  ")
-    );
+    assert!(violations.is_empty(), "ARCH-P1-1 / G-2 clause (iii):\n  {}", violations.join("\n  "));
 }
 
 #[test]
@@ -1443,10 +1391,7 @@ fn unvalidated_list_is_shrinking_only() {
         assert!(!reason.trim().is_empty(), "UNVALIDATED::{field} missing reason");
         assert!(seen.insert(field), "duplicate UNVALIDATED entry: {field}");
         if let Some(p) = prev {
-            assert!(
-                p < field,
-                "UNVALIDATED must stay sorted by field; {p:?} precedes {field}"
-            );
+            assert!(p < field, "UNVALIDATED must stay sorted by field; {p:?} precedes {field}");
         }
         prev = Some(field);
     }
@@ -1460,10 +1405,10 @@ fn unvalidated_list_is_shrinking_only() {
 
 #[test]
 fn unvalidated_detector_flags_an_unlist_field() {
-    let override_fields =
-        vec!["metrics_port".into(), "brand_new_knob".into(), "graffiti".into()];
+    let override_fields = vec!["metrics_port".into(), "brand_new_knob".into(), "graffiti".into()];
     // metrics_port and graffiti appear; brand_new_knob does not.
-    let validate_body = "if self.metrics_port == 0 { ... } if let Some(ref graffiti) = self.graffiti";
+    let validate_body =
+        "if self.metrics_port == 0 { ... } if let Some(ref graffiti) = self.graffiti";
     let unvalidated: HashSet<&str> = HashSet::new();
     let violations = unvalidated_violations(&override_fields, validate_body, &unvalidated);
     assert!(
