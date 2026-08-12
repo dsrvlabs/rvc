@@ -545,14 +545,14 @@ Moving the site is fine; changing its mechanism is scope creep into another phas
   `enablement.rs:155`.
 
 **Acceptance criteria.**
-- [ ] `rg 'RefreshService' crates/rvc/src/bootstrap/enablement.rs` returns nothing.
-- [ ] The refresh spawn site in `run.rs` is lexically **after** the `key_gen_tx` creation and has
+- [x] `rg 'RefreshService' crates/rvc/src/bootstrap/enablement.rs` returns nothing.
+- [x] The refresh spawn site in `run.rs` is lexically **after** the `key_gen_tx` creation and has
       `validator_store` in scope.
-- [ ] The callback body is byte-identical to `enablement.rs:172-190` at HEAD (diff-checkable).
-- [ ] The `refresh_interval > 0 && !secret_providers.is_empty()` guard is preserved and tested.
-- [ ] `local_pubkeys` and `secret_providers` are no longer discarded in `run.rs`'s destructure.
-- [ ] No new channel; the relocated `tokio::spawn` is not converted to anything else.
-- [ ] Standing invariants green.
+- [x] The callback body is byte-identical to `enablement.rs:172-190` at HEAD (diff-checkable).
+- [x] The `refresh_interval > 0 && !secret_providers.is_empty()` guard is preserved and tested.
+- [x] `local_pubkeys` and `secret_providers` are no longer discarded in `run.rs`'s destructure.
+- [x] No new channel; the relocated `tokio::spawn` is not converted to anything else.
+- [x] Standing invariants green.
 
 ---
 

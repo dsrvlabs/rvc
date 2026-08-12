@@ -4,13 +4,20 @@
 //! every bootstrap phase, owns the duty-loop `select!`, and performs graceful
 //! shutdown (cancel token → orchestrator → metrics drain).
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
+use crypto::CompositeSigner;
+use doppelganger::{ForwardWindowMachine, MonotonicEpochClock};
 use metrics::{new_health_status, SharedHealthStatus};
+use secret_provider::SecretProvider;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
+use validator_store::ValidatorStore;
 
 use super::tasks::{spawn_background_tasks, BackgroundTasks};
 use super::{
@@ -18,6 +25,7 @@ use super::{
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
 };
 use crate::config::{redact_url, Config};
+use crate::deletion_denylist::DeletionDenylist;
 use crate::grpc_health::DutyTrackerService;
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
 use crate::startup;
@@ -123,13 +131,12 @@ pub async fn run(
         }
     };
 
-    // Step 6: SEC-2b/2c enablement + liveness loop + secret-provider refresh.
+    // Step 6: SEC-2b/2c enablement + liveness loop.
     let enablement = wire_signing_enablement(
         &config,
         &loaded_keys,
         &beacon_handles,
-        std::sync::Arc::clone(&slashing_db),
-        std::sync::Arc::clone(&deletion_denylist),
+        Arc::clone(&slashing_db),
         &shutdown_token,
     )
     .await?;
@@ -140,7 +147,7 @@ pub async fn run(
         &loaded_keys,
         &enablement,
         &beacon_handles,
-        std::sync::Arc::clone(&slashing_db),
+        Arc::clone(&slashing_db),
         options.timeouts,
     )
     .await?;
@@ -156,9 +163,9 @@ pub async fn run(
     let LoadedKeys {
         composite_signer,
         validator_count: _,
-        local_pubkeys: _,
+        local_pubkeys,
         pubkey_map,
-        secret_providers: _,
+        secret_providers,
         grpc_signer: _grpc_remote_signer,
     } = loaded_keys;
 
@@ -189,6 +196,21 @@ pub async fn run(
     // adapters (tx) and DutyOrchestrator (rx).
     let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
 
+    // ARCH-2a / VD-E1: refresh after key_gen_tx + validator_store are in scope
+    // (RefreshService sleeps `interval` before first fetch — no startup timing change).
+    let _secret_provider_refresh = spawn_secret_provider_refresh(
+        &config,
+        secret_providers,
+        local_pubkeys,
+        Arc::clone(&deletion_denylist),
+        Arc::clone(&composite_signer),
+        forward_window_machine.clone(),
+        Arc::clone(&epoch_clock),
+        &shutdown_token,
+        Arc::clone(&validator_store),
+        key_gen_tx.clone(),
+    );
+
     // Step 7c: optionally start Keymanager API.
     spawn_keymanager_api(
         &config,
@@ -200,10 +222,10 @@ pub async fn run(
             beacon_client: beacon_client.clone(),
             signer: signer.clone(),
             fork_schedule: orchestrator_config.fork_schedule.clone(),
-            deletion_denylist: std::sync::Arc::clone(&deletion_denylist),
+            deletion_denylist: Arc::clone(&deletion_denylist),
             attesting_enabled: attesting_enabled.clone(),
             forward_window_machine: forward_window_machine.clone(),
-            epoch_clock: std::sync::Arc::clone(&epoch_clock),
+            epoch_clock: Arc::clone(&epoch_clock),
             pubkey_map: pubkey_map.clone(),
             key_gen_tx,
         },
@@ -396,6 +418,73 @@ fn log_grpc_healthz_deprecation() {
     );
 }
 
+/// Spawn secret-provider refresh when configured and providers are present.
+///
+/// Relocated from `wire_signing_enablement` so `validator_store` and `key_gen_tx`
+/// are in scope (ARCH-2a / VD-E1). Callback body is intentionally identical to
+/// the former enablement site; ARCH-2b replaces it with `KeyAdmissionService::admit`.
+///
+/// `validator_store` and `key_gen_tx` pin the VD-E1 ordering; they are unused
+/// until ARCH-2b rewrites the callback.
+#[allow(clippy::too_many_arguments)] // pure relocation of former enablement captures
+fn spawn_secret_provider_refresh(
+    config: &Config,
+    secret_providers: Vec<Arc<dyn SecretProvider>>,
+    local_pubkeys: HashSet<[u8; 48]>,
+    denylist: Arc<DeletionDenylist>,
+    composite_signer: Arc<CompositeSigner>,
+    forward_window_machine: Option<Arc<ForwardWindowMachine>>,
+    epoch_clock: Arc<MonotonicEpochClock>,
+    shutdown: &CancellationToken,
+    _validator_store: Arc<ValidatorStore>,
+    _key_gen_tx: tokio::sync::watch::Sender<u64>,
+) -> Option<JoinHandle<()>> {
+    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
+    if refresh_interval > 0 && !secret_providers.is_empty() {
+        let denylist_for_refresh = Arc::clone(&denylist);
+        let is_denied: secret_provider::DenylistCheck =
+            Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
+        let refresh_service = secret_provider::RefreshService::with_denylist(
+            secret_providers,
+            local_pubkeys,
+            Some(is_denied),
+            std::time::Duration::from_secs(refresh_interval),
+            shutdown.clone(),
+        );
+        let signer_for_refresh = composite_signer;
+        let denylist_for_callback = denylist;
+        let machine_for_refresh = forward_window_machine;
+        let epoch_clock_for_refresh = epoch_clock;
+        let handle = tokio::spawn(async move {
+            refresh_service
+                .run(move |sk| {
+                    let pk_bytes = sk.public_key().to_bytes();
+                    if denylist_for_callback.contains(&pk_bytes) {
+                        tracing::info!(
+                            pubkey = %observability::logging::TruncatedPubkey::new(&format!(
+                                "0x{}",
+                                hex::encode(pk_bytes)
+                            )),
+                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
+                        );
+                        return;
+                    }
+                    let pk = sk.public_key();
+                    if let Some(ref machine) = machine_for_refresh {
+                        // Import-strict: no restart Safe-skip for dynamically added keys.
+                        machine.register_for_import(&pk, epoch_clock_for_refresh.current_epoch());
+                    }
+                    signer_for_refresh.add_local_key(sk);
+                })
+                .await;
+        });
+        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
+        Some(handle)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +541,127 @@ mod tests {
         assert!(response.get_ref().status, "healthz must still report healthy");
 
         server.abort();
+    }
+
+    /// ARCH-2a: pin that refresh spawn accepts `watch::Sender` + `ValidatorStore`
+    /// (VD-E1 ordering — both must be constructible at the call site).
+    #[tokio::test]
+    async fn secret_provider_refresh_is_spawned_after_key_gen_channel_exists() {
+        let (key_gen_tx, _key_gen_rx) = tokio::sync::watch::channel(0u64);
+        let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
+        let shutdown = CancellationToken::new();
+        let config = Config {
+            secret_provider: crate::config::SecretProviderConfig {
+                refresh_interval: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider: Arc<dyn SecretProvider> = Arc::new(DummySecretProvider);
+        let composite =
+            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let denylist = Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys")));
+
+        let handle = spawn_secret_provider_refresh(
+            &config,
+            vec![provider],
+            HashSet::new(),
+            denylist,
+            composite,
+            None,
+            Arc::new(MonotonicEpochClock::new(0)),
+            &shutdown,
+            validator_store,
+            key_gen_tx,
+        );
+        assert!(handle.is_some(), "refresh must spawn when interval > 0 and providers present");
+        shutdown.cancel();
+        if let Some(h) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+        }
+        // Keep TempDir alive for full test body (F1).
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn secret_provider_refresh_not_spawned_when_interval_is_zero() {
+        let (key_gen_tx, _) = tokio::sync::watch::channel(0u64);
+        let shutdown = CancellationToken::new();
+        let config = Config {
+            secret_provider: crate::config::SecretProviderConfig {
+                refresh_interval: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider: Arc<dyn SecretProvider> = Arc::new(DummySecretProvider);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_secret_provider_refresh(
+            &config,
+            vec![provider],
+            HashSet::new(),
+            Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"))),
+            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new()))),
+            None,
+            Arc::new(MonotonicEpochClock::new(0)),
+            &shutdown,
+            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
+            key_gen_tx,
+        );
+        assert!(handle.is_none(), "refresh_interval = 0 must not spawn");
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn secret_provider_refresh_not_spawned_when_no_providers() {
+        let (key_gen_tx, _) = tokio::sync::watch::channel(0u64);
+        let shutdown = CancellationToken::new();
+        let config = Config {
+            secret_provider: crate::config::SecretProviderConfig {
+                refresh_interval: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let handle = spawn_secret_provider_refresh(
+            &config,
+            vec![],
+            HashSet::new(),
+            Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"))),
+            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new()))),
+            None,
+            Arc::new(MonotonicEpochClock::new(0)),
+            &shutdown,
+            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
+            key_gen_tx,
+        );
+        assert!(handle.is_none(), "empty providers must not spawn");
+        drop(dir);
+    }
+
+    /// Minimal provider so tests can build a non-empty `Vec<Arc<dyn SecretProvider>>`.
+    struct DummySecretProvider;
+
+    #[async_trait::async_trait]
+    impl SecretProvider for DummySecretProvider {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+
+        async fn list_keys(
+            &self,
+        ) -> Result<Vec<secret_provider::SecretKeyEntry>, secret_provider::SecretProviderError>
+        {
+            Ok(vec![])
+        }
+
+        async fn fetch_key(
+            &self,
+            _id: &str,
+        ) -> Result<secret_provider::KeyMaterial, secret_provider::SecretProviderError> {
+            Err(secret_provider::SecretProviderError::NotFound("dummy".into()))
+        }
     }
 }
