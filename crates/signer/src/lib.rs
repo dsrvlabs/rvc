@@ -618,7 +618,9 @@ impl ValidatorSigner for SignerService {
                 }
                 let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
                 session.stage_then_sign(|| {
-                    scoped
+                    // Bind PendingAudit explicitly; StagedRow bridge emits after
+                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
+                    let (staged, audit) = scoped
                         .stage_attestation(
                             &pubkey_hex_clone,
                             source_epoch,
@@ -635,7 +637,8 @@ impl ValidatorSigner for SignerService {
                                 "Slashing protection rejected attestation"
                             );
                             e
-                        })
+                        })?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -720,7 +723,9 @@ impl ValidatorSigner for SignerService {
                 tracing::trace!("staging block slashing-protection record on blocking thread");
                 let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
                 session.stage_then_sign(|| {
-                    scoped
+                    // Bind PendingAudit explicitly; StagedRow bridge emits after
+                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
+                    let (staged, audit) = scoped
                         .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
                         .map_err(|e| {
                             error!(
@@ -730,7 +735,8 @@ impl ValidatorSigner for SignerService {
                                 "Slashing protection rejected block proposal"
                             );
                             e
-                        })
+                        })?;
+                    Ok((staged, audit))
                 })
             },
         )

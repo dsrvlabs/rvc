@@ -690,7 +690,9 @@ mod tests {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                 session.stage_then_sign(|| {
-                    scoped.stage_block(&pk_hex, 7, Some(hex::encode(signing_root)))
+                    let (staged, audit) =
+                        scoped.stage_block(&pk_hex, 7, Some(hex::encode(signing_root)))?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -769,7 +771,9 @@ mod tests {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                 session.stage_then_sign(|| {
-                    scoped.stage_block(&pk_hex, 15, Some(hex::encode(signing_root)))
+                    let (staged, audit) =
+                        scoped.stage_block(&pk_hex, 15, Some(hex::encode(signing_root)))?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -812,7 +816,9 @@ mod tests {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                 session.stage_then_sign(|| {
-                    scoped.stage_block(&pk_hex, 13, Some(hex::encode(signing_root)))
+                    let (staged, audit) =
+                        scoped.stage_block(&pk_hex, 13, Some(hex::encode(signing_root)))?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -865,7 +871,9 @@ mod tests {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                 session.stage_then_sign(|| {
-                    scoped.stage_block(&pk_hex, 9, Some(hex::encode(signing_root)))
+                    let (staged, audit) =
+                        scoped.stage_block(&pk_hex, 9, Some(hex::encode(signing_root)))?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -911,7 +919,9 @@ mod tests {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                 session.stage_then_sign(|| {
-                    scoped.stage_block(&pk_hex, 11, Some(hex::encode(signing_root)))
+                    let (staged, audit) =
+                        scoped.stage_block(&pk_hex, 11, Some(hex::encode(signing_root)))?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -959,7 +969,9 @@ mod tests {
                     let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
                     let pk_hex = hex::encode(pk_for_stage.to_bytes());
                     session.stage_then_sign(|| {
-                        scoped.stage_block(&pk_hex, 13, Some(hex::encode([0x44; 32])))
+                        let (staged, audit) =
+                            scoped.stage_block(&pk_hex, 13, Some(hex::encode([0x44; 32])))?;
+                        Ok((staged, audit))
                     })
                 },
             )

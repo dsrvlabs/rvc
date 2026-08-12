@@ -439,15 +439,15 @@ audited. Do **not** move the `emit()` before the commit/discard; do **not** hois
   outside the production migration list.
 
 **Acceptance criteria.**
-- [ ] All four production sites bind and emit `PendingAudit`, on both the commit and discard branches.
-- [ ] `db_reading_subscriber_completes_a_full_stage_sign_commit` passes within its 5 s thread timeout.
-- [ ] `audit_event_fires_after_the_guard_is_released` asserts the lock is free at emission time.
-- [ ] `rg 'audit_log' crates/` shows call sites only in `crates/slashing/src/audit.rs` (definition),
+- [x] All four production sites bind and emit `PendingAudit`, on both the commit and discard branches.
+- [x] `db_reading_subscriber_completes_a_full_stage_sign_commit` passes within its 5 s thread timeout.
+- [x] `audit_event_fires_after_the_guard_is_released` asserts the lock is free at emission time.
+- [x] `rg 'audit_log' crates/` shows call sites only in `crates/slashing/src/audit.rs` (definition),
       `scoped.rs` (the `Err` path), and `PendingAudit::emit`.
-- [ ] `crates/slashing/src/stage.rs` is byte-unchanged, and `crates/signer/src/core.rs`'s **production**
+- [x] `crates/slashing/src/stage.rs` is byte-unchanged, and `crates/signer/src/core.rs`'s **production**
       code (`:1-565`) is unchanged — only its `#[cfg(test)]` module's six call shapes are updated.
-- [ ] All 38 EIP-3076 conformance vectors green.
-- [ ] `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings` green (Gate 1) — the
+- [x] All 38 EIP-3076 conformance vectors green.
+- [x] `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings` green (Gate 1) — the
       DVT surface consumes `SigningGate` and is outside the default workspace run (`clippy.toml:21-24`).
 
 ---

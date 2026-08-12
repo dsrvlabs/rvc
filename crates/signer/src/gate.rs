@@ -278,7 +278,9 @@ impl SigningGate {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
                 session.stage_then_sign(|| {
-                    scoped
+                    // Bind PendingAudit explicitly; StagedRow bridge emits after
+                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
+                    let (staged, audit) = scoped
                         .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
                         .map_err(|e| {
                             error!(
@@ -288,7 +290,8 @@ impl SigningGate {
                                 "SigningGate: sign_block blocked by slashing protection"
                             );
                             e
-                        })
+                        })?;
+                    Ok((staged, audit))
                 })
             },
         )
@@ -364,7 +367,9 @@ impl SigningGate {
             move |session| {
                 let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
                 session.stage_then_sign(|| {
-                    scoped
+                    // Bind PendingAudit explicitly; StagedRow bridge emits after
+                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
+                    let (staged, audit) = scoped
                         .stage_attestation(
                             &pubkey_hex_clone,
                             source_epoch,
@@ -380,7 +385,8 @@ impl SigningGate {
                                 "SigningGate: sign_attestation blocked by slashing protection"
                             );
                             e
-                        })
+                        })?;
+                    Ok((staged, audit))
                 })
             },
         )
