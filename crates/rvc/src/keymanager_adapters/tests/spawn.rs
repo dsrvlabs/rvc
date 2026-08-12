@@ -27,6 +27,8 @@ fn spawn_test_deps(
     keystore_dir: &Path,
     forward_window_machine: Option<Arc<ForwardWindowMachine>>,
 ) -> KeymanagerApiDeps {
+    use crate::key_admission::KeyAdmissionService;
+
     let composite = create_empty_composite_signer();
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer = Arc::new(
@@ -36,22 +38,35 @@ fn spawn_test_deps(
     let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:9");
     let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
     let (key_gen_tx, _rx) = watch::channel(0u64);
+    let pubkey_map = create_pubkey_map();
+    let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
+    let deletion_denylist =
+        Arc::new(DeletionDenylist::empty_at(keystore_dir.join(".rvc.deleted_keys")));
+    let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+    let admissions = Arc::new(KeyAdmissionService::new(
+        Arc::clone(&pubkey_map),
+        key_gen_tx.clone(),
+        Arc::clone(&composite),
+        Arc::clone(&validator_store),
+        Arc::clone(&deletion_denylist),
+        forward_window_machine.clone(),
+        Arc::clone(&epoch_clock),
+    ));
     KeymanagerApiDeps {
         composite_signer: composite,
         slashing_db,
         genesis_validators_root: [0x11u8; 32],
-        validator_store: Arc::new(ValidatorStore::new([0u8; 20], 100)),
+        validator_store,
         beacon_client,
         signer,
         fork_schedule: test_fork_schedule(),
-        deletion_denylist: Arc::new(DeletionDenylist::empty_at(
-            keystore_dir.join(".rvc.deleted_keys"),
-        )),
+        deletion_denylist,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         forward_window_machine,
-        epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
-        pubkey_map: create_pubkey_map(),
+        epoch_clock,
+        pubkey_map,
         key_gen_tx,
+        admissions,
     }
 }
 

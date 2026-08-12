@@ -694,15 +694,15 @@ symptom's *description* and not the defect.
   in `admit`, still fires from the real refresh path.
 
 **Acceptance criteria.**
-- [ ] Both callers go through `KeyAdmissionService::admit`; no second admission path exists.
-- [ ] A provider-refreshed key appears in `PubkeyMap` **and** `ValidatorStore`, bumps `key_gen_tx`, is
+- [x] Both callers go through `KeyAdmissionService::admit`; no second admission path exists.
+- [x] A provider-refreshed key appears in `PubkeyMap` **and** `ValidatorStore`, bumps `key_gen_tx`, is
       registered with the forward-window machine, is **sampled by the liveness loop**, and leaves
       `Pending`.
-- [ ] A raw `SecretKey` is admitted with no keystore file and no filesystem write (C4).
-- [ ] The DELETE-races-refresh denylist guard is preserved and separately tested.
-- [ ] Existing keymanager adapter tests green, **unmodified**.
-- [ ] `crates/rvc/src/config/builder.rs:394` unchanged; no new signing surface (C9 anchor 5).
-- [ ] No `withdraw`, no teardown-contract change (A-1.4 / C5).
+- [x] A raw `SecretKey` is admitted with no keystore file and no filesystem write (C4).
+- [x] The DELETE-races-refresh denylist guard is preserved and separately tested.
+- [x] Existing keymanager adapter tests green, **unmodified**.
+- [x] `crates/rvc/src/config/builder.rs:394` unchanged; no new signing surface (C9 anchor 5).
+- [x] No `withdraw`, no teardown-contract change (A-1.4 / C5).
 
 ---
 

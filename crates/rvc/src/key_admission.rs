@@ -101,12 +101,13 @@ impl KeyAdmissionService {
     ///
     /// Order (generation bump **last** so no orchestrator wake sees a
     /// half-populated set):
-    /// 1. denylist re-check
+    /// 1. denylist re-check (`RawSecret` only — DELETE-races-refresh)
     /// 2. composite signer (`add_local_key`)
     /// 3. `PubkeyMap`
     /// 4. `ValidatorStore` (`add_validator`)
-    /// 5. doppelganger `register_for_import` (when enabled)
-    /// 6. `key_gen_tx` bump
+    /// 5. denylist re-check again (TOCTOU: DELETE may have raced the mutations)
+    /// 6. doppelganger `register_for_import` (when enabled)
+    /// 7. `key_gen_tx` bump
     ///
     /// # Synchronous by necessity
     ///
@@ -122,6 +123,13 @@ impl KeyAdmissionService {
     /// [`AdmissionSource::RawSecret`] performs **no** filesystem write and
     /// requires no denylist row. Writing a synthetic keystore, or failing when
     /// no keystore path is present, is explicitly rejected.
+    ///
+    /// # Denylist and [`AdmissionSource::Keystore`]
+    ///
+    /// Intentional keymanager re-import is the authorized recovery path and
+    /// clears the denylist *after* successful persistence (SEC-1b). The
+    /// denylist guard therefore applies only to [`AdmissionSource::RawSecret`]
+    /// (provider refresh / boot resurrection races), not to keystore import.
     pub fn admit(
         &self,
         secret: SecretKey,
@@ -133,20 +141,21 @@ impl KeyAdmissionService {
             AdmissionSource::RawSecret => "raw_secret",
             AdmissionSource::Keystore { .. } => "keystore",
         };
+        let enforce_denylist = matches!(source, AdmissionSource::RawSecret);
 
-        // 1. Denylist re-check (DELETE-races-refresh guard). Skip is not Err.
-        if self.denylist.contains(&pubkey) {
-            info!(
-                pubkey = %TruncatedPubkey::new(&format!("0x{}", hex::encode(pubkey))),
-                source = source_label,
-                "Skipping denylisted key at admission (DELETE raced refresh)"
-            );
-            return Ok(AdmissionOutcome::SkippedDenylisted { pubkey });
+        // 1. Early denylist re-check (DELETE-races-refresh). Skip is not Err.
+        if enforce_denylist && self.denylist.contains(&pubkey) {
+            return Ok(Self::skipped_denylisted(pubkey, source_label));
         }
 
         // Idempotent no-op: already in the duty-matching map.
         if self.notifier.pubkey_map().read().contains_key(&pubkey) {
             return Ok(AdmissionOutcome::AlreadyPresent { pubkey });
+        }
+
+        // Re-check immediately before the first mutation (narrow TOCTOU window).
+        if enforce_denylist && self.denylist.contains(&pubkey) {
+            return Ok(Self::skipped_denylisted(pubkey, source_label));
         }
 
         // 2. Composite signer
@@ -158,12 +167,21 @@ impl KeyAdmissionService {
         // 4. ValidatorStore
         self.validator_store.add_validator(ValidatorConfig::new(pubkey));
 
-        // 5. Doppelganger import registration (optional machine)
+        // 5. Final denylist re-check before irreversible notify / doppelganger.
+        // If DELETE won the race after mutations, roll stores back and skip.
+        if enforce_denylist && self.denylist.contains(&pubkey) {
+            let _ = self.composite_signer.remove_local_key(&pubkey);
+            self.notifier.pubkey_map().write().remove(&pubkey);
+            let _ = self.validator_store.remove_validator(&pubkey);
+            return Ok(Self::skipped_denylisted(pubkey, source_label));
+        }
+
+        // 6. Doppelganger import registration (optional machine)
         if let Some(ref machine) = self.machine {
             machine.register_for_import(&public_key, self.epoch_clock.current_epoch());
         }
 
-        // 6. Generation bump last
+        // 7. Generation bump last
         self.notifier.notify();
         let key_gen = *self.key_gen_tx.borrow();
 
@@ -175,6 +193,15 @@ impl KeyAdmissionService {
         );
 
         Ok(AdmissionOutcome::Admitted { pubkey, key_gen })
+    }
+
+    fn skipped_denylisted(pubkey: [u8; 48], source_label: &str) -> AdmissionOutcome {
+        info!(
+            pubkey = %TruncatedPubkey::new(&format!("0x{}", hex::encode(pubkey))),
+            source = source_label,
+            "Skipping denylisted key at admission (DELETE raced refresh)"
+        );
+        AdmissionOutcome::SkippedDenylisted { pubkey }
     }
 }
 

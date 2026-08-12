@@ -9,15 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bn_manager::OperationTimeouts;
-use crypto::CompositeSigner;
-use doppelganger::{ForwardWindowMachine, MonotonicEpochClock};
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
-use validator_store::ValidatorStore;
 
 use super::tasks::{spawn_background_tasks, BackgroundTasks};
 use super::{
@@ -27,6 +24,7 @@ use super::{
 use crate::config::{redact_url, Config};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::grpc_health::DutyTrackerService;
+use crate::key_admission::{AdmissionSource, KeyAdmissionService};
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
 use crate::startup;
 use crate::DutyTrackerServer;
@@ -196,6 +194,17 @@ pub async fn run(
     // adapters (tx) and DutyOrchestrator (rx).
     let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
 
+    // ARCH-2c: single admission choke point for provider refresh + keymanager import.
+    let admissions = Arc::new(KeyAdmissionService::new(
+        Arc::clone(&pubkey_map),
+        key_gen_tx.clone(),
+        Arc::clone(&composite_signer),
+        Arc::clone(&validator_store),
+        Arc::clone(&deletion_denylist),
+        forward_window_machine.clone(),
+        Arc::clone(&epoch_clock),
+    ));
+
     // ARCH-2a / VD-E1: refresh after key_gen_tx + validator_store are in scope
     // (RefreshService sleeps `interval` before first fetch — no startup timing change).
     let _secret_provider_refresh = spawn_secret_provider_refresh(
@@ -203,12 +212,8 @@ pub async fn run(
         secret_providers,
         local_pubkeys,
         Arc::clone(&deletion_denylist),
-        Arc::clone(&composite_signer),
-        forward_window_machine.clone(),
-        Arc::clone(&epoch_clock),
+        Arc::clone(&admissions),
         &shutdown_token,
-        Arc::clone(&validator_store),
-        key_gen_tx.clone(),
     );
 
     // Step 7c: optionally start Keymanager API.
@@ -228,6 +233,7 @@ pub async fn run(
             epoch_clock: Arc::clone(&epoch_clock),
             pubkey_map: pubkey_map.clone(),
             key_gen_tx,
+            admissions,
         },
     )?;
 
@@ -426,23 +432,16 @@ fn log_grpc_healthz_deprecation() {
 /// Spawn secret-provider refresh when configured and providers are present.
 ///
 /// Relocated from `wire_signing_enablement` so `validator_store` and `key_gen_tx`
-/// are in scope (ARCH-2a / VD-E1). Callback body is intentionally identical to
-/// the former enablement site; ARCH-2b replaces it with `KeyAdmissionService::admit`.
-///
-/// `validator_store` and `key_gen_tx` pin the VD-E1 ordering; they are unused
-/// until ARCH-2b rewrites the callback.
-#[allow(clippy::too_many_arguments)] // pure relocation of former enablement captures
+/// are in scope (ARCH-2a / VD-E1). ARCH-2c: callback is a single
+/// [`KeyAdmissionService::admit`] with [`AdmissionSource::RawSecret`].
+/// Denylist re-check lives inside `admit` (not duplicated here).
 fn spawn_secret_provider_refresh(
     config: &Config,
     secret_providers: Vec<Arc<dyn SecretProvider>>,
     local_pubkeys: HashSet<[u8; 48]>,
     denylist: Arc<DeletionDenylist>,
-    composite_signer: Arc<CompositeSigner>,
-    forward_window_machine: Option<Arc<ForwardWindowMachine>>,
-    epoch_clock: Arc<MonotonicEpochClock>,
+    admissions: Arc<KeyAdmissionService>,
     shutdown: &CancellationToken,
-    _validator_store: Arc<ValidatorStore>,
-    _key_gen_tx: tokio::sync::watch::Sender<u64>,
 ) -> Option<JoinHandle<()>> {
     let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
     if refresh_interval > 0 && !secret_providers.is_empty() {
@@ -456,30 +455,11 @@ fn spawn_secret_provider_refresh(
             std::time::Duration::from_secs(refresh_interval),
             shutdown.clone(),
         );
-        let signer_for_refresh = composite_signer;
-        let denylist_for_callback = denylist;
-        let machine_for_refresh = forward_window_machine;
-        let epoch_clock_for_refresh = epoch_clock;
         let handle = tokio::spawn(async move {
             refresh_service
                 .run(move |sk| {
-                    let pk_bytes = sk.public_key().to_bytes();
-                    if denylist_for_callback.contains(&pk_bytes) {
-                        tracing::info!(
-                            pubkey = %observability::logging::TruncatedPubkey::new(&format!(
-                                "0x{}",
-                                hex::encode(pk_bytes)
-                            )),
-                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
-                        );
-                        return;
-                    }
-                    let pk = sk.public_key();
-                    if let Some(ref machine) = machine_for_refresh {
-                        // Import-strict: no restart Safe-skip for dynamically added keys.
-                        machine.register_for_import(&pk, epoch_clock_for_refresh.current_epoch());
-                    }
-                    signer_for_refresh.add_local_key(sk);
+                    // Denylist DELETE-races-refresh guard is inside admit.
+                    let _ = admissions.admit(sk, AdmissionSource::RawSecret);
                 })
                 .await;
         });
@@ -548,12 +528,37 @@ mod tests {
         server.abort();
     }
 
-    /// ARCH-2a: pin that refresh spawn accepts `watch::Sender` + `ValidatorStore`
-    /// (VD-E1 ordering — both must be constructible at the call site).
+    fn test_admissions(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<KeyAdmissionService>, Arc<DeletionDenylist>, crate::orchestrator::PubkeyMap) {
+        use std::collections::HashMap;
+
+        use crypto::CompositeSigner;
+        use doppelganger::MonotonicEpochClock;
+        use validator_store::ValidatorStore;
+
+        let denylist = Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys")));
+        let pubkey_map: crate::orchestrator::PubkeyMap =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let (key_gen_tx, _) = tokio::sync::watch::channel(0u64);
+        let composite =
+            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new())));
+        let admissions = Arc::new(KeyAdmissionService::new(
+            Arc::clone(&pubkey_map),
+            key_gen_tx,
+            composite,
+            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
+            Arc::clone(&denylist),
+            None,
+            Arc::new(MonotonicEpochClock::new(0)),
+        ));
+        (admissions, denylist, pubkey_map)
+    }
+
+    /// ARCH-2a: pin that refresh spawn accepts a fully-wired `KeyAdmissionService`
+    /// (VD-E1 ordering — validator_store + key_gen must be constructible at the call site).
     #[tokio::test]
     async fn secret_provider_refresh_is_spawned_after_key_gen_channel_exists() {
-        let (key_gen_tx, _key_gen_rx) = tokio::sync::watch::channel(0u64);
-        let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
         let shutdown = CancellationToken::new();
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
@@ -563,22 +568,16 @@ mod tests {
             ..Default::default()
         };
         let provider: Arc<dyn SecretProvider> = Arc::new(DummySecretProvider);
-        let composite =
-            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new())));
         let dir = tempfile::tempdir().unwrap();
-        let denylist = Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys")));
+        let (admissions, denylist, _) = test_admissions(&dir);
 
         let handle = spawn_secret_provider_refresh(
             &config,
             vec![provider],
             HashSet::new(),
             denylist,
-            composite,
-            None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            admissions,
             &shutdown,
-            validator_store,
-            key_gen_tx,
         );
         assert!(handle.is_some(), "refresh must spawn when interval > 0 and providers present");
         shutdown.cancel();
@@ -591,7 +590,6 @@ mod tests {
 
     #[tokio::test]
     async fn secret_provider_refresh_not_spawned_when_interval_is_zero() {
-        let (key_gen_tx, _) = tokio::sync::watch::channel(0u64);
         let shutdown = CancellationToken::new();
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
@@ -602,17 +600,14 @@ mod tests {
         };
         let provider: Arc<dyn SecretProvider> = Arc::new(DummySecretProvider);
         let dir = tempfile::tempdir().unwrap();
+        let (admissions, denylist, _) = test_admissions(&dir);
         let handle = spawn_secret_provider_refresh(
             &config,
             vec![provider],
             HashSet::new(),
-            Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"))),
-            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new()))),
-            None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            denylist,
+            admissions,
             &shutdown,
-            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
-            key_gen_tx,
         );
         assert!(handle.is_none(), "refresh_interval = 0 must not spawn");
         drop(dir);
@@ -620,7 +615,6 @@ mod tests {
 
     #[tokio::test]
     async fn secret_provider_refresh_not_spawned_when_no_providers() {
-        let (key_gen_tx, _) = tokio::sync::watch::channel(0u64);
         let shutdown = CancellationToken::new();
         let config = Config {
             secret_provider: crate::config::SecretProviderConfig {
@@ -630,19 +624,62 @@ mod tests {
             ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
+        let (admissions, denylist, _) = test_admissions(&dir);
         let handle = spawn_secret_provider_refresh(
             &config,
             vec![],
             HashSet::new(),
-            Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"))),
-            Arc::new(CompositeSigner::new(crypto::LocalSigner::new(crypto::KeyManager::new()))),
-            None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            denylist,
+            admissions,
             &shutdown,
-            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
-            key_gen_tx,
         );
         assert!(handle.is_none(), "empty providers must not spawn");
+        drop(dir);
+    }
+
+    /// ARCH-2c: refresh callback admits through the service only (denylist in admit).
+    #[test]
+    fn refresh_admits_through_the_service_only() {
+        // Source-shape guard: the refresh closure must be a single admit call.
+        let src = include_str!("run.rs");
+        let spawn_fn = src
+            .split("fn spawn_secret_provider_refresh")
+            .nth(1)
+            .expect("spawn_secret_provider_refresh present");
+        let body = spawn_fn.split("#[cfg(test)]").next().expect("fn body before tests");
+        assert!(
+            body.contains("admissions.admit(sk, AdmissionSource::RawSecret)"),
+            "refresh callback must call admit(RawSecret)"
+        );
+        assert!(!body.contains("add_local_key"), "refresh must not call add_local_key directly");
+        assert!(
+            !body.contains("register_for_import"),
+            "refresh must not register doppelganger outside admit"
+        );
+        assert!(
+            !body.contains("denylist_for_callback"),
+            "denylist guard must live inside admit, not at the call site"
+        );
+    }
+
+    /// ARCH-2c: DELETE then refresh skips the denylisted key via admit.
+    #[test]
+    fn delete_then_refresh_race_skips_the_denylisted_key() {
+        use crypto::SecretKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (admissions, denylist, pubkey_map) = test_admissions(&dir);
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        denylist.insert(&pk).expect("denylist insert");
+
+        // Simulate the refresh callback body.
+        let outcome = admissions.admit(sk, AdmissionSource::RawSecret).expect("admit ok");
+        assert!(
+            matches!(outcome, crate::key_admission::AdmissionOutcome::SkippedDenylisted { pubkey } if pubkey == pk),
+            "denylisted key must be skipped, got {outcome:?}"
+        );
+        assert!(!pubkey_map.read().contains_key(&pk), "skipped key must not enter PubkeyMap");
         drop(dir);
     }
 

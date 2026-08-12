@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use doppelganger::MonotonicEpochClock;
 use parking_lot::Mutex;
+use validator_store::ValidatorStore;
 
 use crypto::{CompositeSigner, Keystore};
 use keymanager_api::traits::{DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey};
@@ -12,6 +14,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use crate::deletion_denylist::DeletionDenylist;
+use crate::key_admission::{AdmissionOutcome, AdmissionSource, KeyAdmissionService};
 use crate::orchestrator::PubkeyMap;
 
 use super::notifier::{pubkey_hex, KeyChangeNotifier};
@@ -23,8 +26,9 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 /// The source of truth for "which local keys can this VC sign with" is
 /// [`CompositeSigner::local_public_keys`] / [`CompositeSigner::has_local_key`] —
 /// the union of boot-loaded keys (keystore-dir / secret-provider in
-/// `LocalSigner`) and keys added via `add_local_key` (API import, secret-provider
-/// refresh). `list_keys` / `has_key` / `delete_keystore` all consult that set.
+/// `LocalSigner`) and keys admitted via [`KeyAdmissionService`] (API import,
+/// secret-provider refresh). `list_keys` / `has_key` / `delete_keystore` all
+/// consult that set.
 ///
 /// `tracked_keys` is retained only as an import serialization lock and a record of
 /// keys imported through this adapter (for concurrent import TOCTOU safety); it is
@@ -41,30 +45,71 @@ pub struct KeystoreManagerAdapter {
     /// API-imported keys; also serializes concurrent `import_keystore` / `delete_keystore`.
     pub(crate) tracked_keys: Mutex<Vec<Pubkey>>,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
+    /// Used for DELETE (`remove_and_notify`); import goes through [`KeyAdmissionService`].
     notifier: KeyChangeNotifier,
     /// Durable deletion denylist; `None` disables persistence (tests).
     denylist: Option<Arc<DeletionDenylist>>,
+    /// Single multi-store admission path (ADR-007 / ARCH-2c).
+    admissions: Arc<KeyAdmissionService>,
 }
 
 impl KeystoreManagerAdapter {
+    /// Construct an adapter with a private admission service over the same
+    /// `pubkey_map` / `key_gen_tx` / signer (unit tests and simple call sites).
+    ///
+    /// Production should call [`Self::with_admission_service`] with the process-wide
+    /// [`KeyAdmissionService`] so import and provider refresh share one choke point.
     pub fn new(
         keystore_dir: PathBuf,
         composite_signer: Arc<CompositeSigner>,
         pubkey_map: PubkeyMap,
         key_gen_tx: watch::Sender<u64>,
     ) -> Self {
+        // Private default admissions for unit tests / call sites that do not
+        // inject a process-wide service. Production always calls
+        // `with_admission_service` with the shared choke point.
+        //
+        // `load` treats a missing file as empty. On IO failure (rare in tests),
+        // fall back to a process-temp empty denylist so construction never panics.
+        let default_denylist =
+            Arc::new(DeletionDenylist::load(keystore_dir.as_path()).unwrap_or_else(|_| {
+                DeletionDenylist::load(
+                    &std::env::temp_dir()
+                        .join(format!(".rvc.admission_denylist.{}", std::process::id())),
+                )
+                .expect("temp admission denylist")
+            }));
+        let admissions = Arc::new(KeyAdmissionService::new(
+            Arc::clone(&pubkey_map),
+            key_gen_tx.clone(),
+            Arc::clone(&composite_signer),
+            Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
+            default_denylist,
+            None,
+            Arc::new(MonotonicEpochClock::new(0)),
+        ));
         Self {
             keystore_dir,
             composite_signer,
             tracked_keys: Mutex::new(Vec::new()),
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
             denylist: None,
+            admissions,
         }
     }
 
     /// Attach the process-wide deletion denylist (SEC-1b).
     pub fn with_denylist(mut self, denylist: Arc<DeletionDenylist>) -> Self {
         self.denylist = Some(denylist);
+        self
+    }
+
+    /// Use the process-wide [`KeyAdmissionService`] (ARCH-2c).
+    ///
+    /// Required in production so keymanager import and secret-provider refresh
+    /// share `ValidatorStore`, doppelganger machine, and denylist.
+    pub fn with_admission_service(mut self, admissions: Arc<KeyAdmissionService>) -> Self {
+        self.admissions = admissions;
         self
     }
 }
@@ -263,15 +308,29 @@ impl KeystoreManager for KeystoreManagerAdapter {
             let _ = std::fs::write(&meta_path, meta_json.as_bytes());
         }
 
-        // Add to composite signer for signing
-        let public_key = secret_key.public_key();
-        self.composite_signer.add_local_key(secret_key);
+        // Multi-store admission (ARCH-2c): composite signer, PubkeyMap,
+        // ValidatorStore, doppelganger, key_gen bump — single choke point.
+        let outcome = self
+            .admissions
+            .admit(secret_key, AdmissionSource::Keystore { keystore_path: file_path.clone() })
+            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+
+        match outcome {
+            AdmissionOutcome::Admitted { .. } => {}
+            AdmissionOutcome::AlreadyPresent { .. } => {
+                return Err(ImportKeystoreError::Duplicate);
+            }
+            AdmissionOutcome::SkippedDenylisted { .. } => {
+                // Keystore source does not enforce denylist inside admit;
+                // this branch is defensive.
+                return Err(ImportKeystoreError::Io(
+                    "admission skipped denylisted key unexpectedly".into(),
+                ));
+            }
+        }
 
         // Track the key (lock still held)
         keys.push(pubkey_bytes);
-
-        // Update shared pubkey_map and notify orchestrator (required at construction).
-        self.notifier.insert_and_notify(&pubkey_bytes, public_key);
 
         // SEC-1b: clear denylist only *after* successful persistence + registry
         // add so a mid-import IO failure cannot un-delete a previously deleted

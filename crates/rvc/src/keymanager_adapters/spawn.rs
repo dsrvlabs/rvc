@@ -18,6 +18,7 @@ use validator_store::ValidatorStore;
 
 use crate::config::Config;
 use crate::deletion_denylist::DeletionDenylist;
+use crate::key_admission::KeyAdmissionService;
 use crate::orchestrator::PubkeyMap;
 
 use super::config::ValidatorConfigManagerAdapter;
@@ -45,6 +46,8 @@ pub struct KeymanagerApiDeps {
     pub epoch_clock: Arc<MonotonicEpochClock>,
     pub pubkey_map: PubkeyMap,
     pub key_gen_tx: watch::Sender<u64>,
+    /// Shared admission choke point (ARCH-2c); keymanager import calls `admit`.
+    pub admissions: Arc<KeyAdmissionService>,
 }
 
 /// Which doppelganger monitor was selected when assembling the keymanager API.
@@ -153,7 +156,8 @@ pub fn build_keymanager_api(
             deps.pubkey_map.clone(),
             deps.key_gen_tx.clone(),
         )
-        .with_denylist(Arc::clone(&deps.deletion_denylist)),
+        .with_denylist(Arc::clone(&deps.deletion_denylist))
+        .with_admission_service(deps.admissions),
     );
     let slashing_prot =
         Arc::new(SlashingProtectionAdapter::new(deps.slashing_db, deps.genesis_validators_root));
