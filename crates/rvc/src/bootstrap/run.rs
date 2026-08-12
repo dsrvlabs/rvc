@@ -219,8 +219,8 @@ pub async fn run(
         &shutdown_token,
     );
 
-    // Step 7c: optionally start Keymanager API.
-    spawn_keymanager_api(
+    // Step 7c: optionally start Keymanager API (Ingress; ARCH-2g registers the handle).
+    let _keymanager_api_handle = spawn_keymanager_api(
         &config,
         KeymanagerApiDeps {
             composite_signer: composite_signer.clone(),
@@ -238,6 +238,7 @@ pub async fn run(
             key_gen_tx,
             admissions,
         },
+        &shutdown_token,
     )?;
 
     // Step 8: duty orchestrator.

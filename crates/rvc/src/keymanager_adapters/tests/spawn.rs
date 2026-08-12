@@ -102,7 +102,9 @@ fn test_spawn_keymanager_api_disabled_constructs_nothing() {
 
     // spawn path is also a no-op
     let deps = spawn_test_deps(dir.path(), None);
-    spawn_keymanager_api(&config, deps).expect("disabled spawn is Ok");
+    let handle = spawn_keymanager_api(&config, deps, &CancellationToken::new())
+        .expect("disabled spawn is Ok");
+    assert!(handle.is_none(), "disabled spawn must return no JoinHandle");
 }
 
 /// Both monitor variants re-arm exactly once (single call site after branch).
@@ -198,4 +200,37 @@ fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
     let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
     assert!(!built.addr.ip().is_loopback());
     assert!(logs_contain("non-loopback address"), "must warn when Keymanager binds non-loopback");
+}
+
+/// Enabled spawn returns a joinable handle that completes after token cancel.
+#[tokio::test]
+async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let config = spawn_test_config(&dir, true, &addr);
+    let deps = spawn_test_deps(dir.path(), None);
+    let token = CancellationToken::new();
+    let handle = spawn_keymanager_api(&config, deps, &token)
+        .expect("spawn")
+        .expect("enabled must return a JoinHandle");
+
+    // Wait until the listener accepts.
+    let sock: std::net::SocketAddr = addr.parse().unwrap();
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(sock).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    token.cancel();
+    let finished = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("JoinHandle must complete within 2s after cancel");
+    finished.expect("server task must not panic");
 }

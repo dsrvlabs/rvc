@@ -13,6 +13,8 @@ use keymanager_api::traits::{DoppelgangerMonitor, VoluntaryExitManager};
 use signer::SignerService;
 use slashing::SlashingDb;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use validator_store::ValidatorStore;
 
@@ -232,14 +234,19 @@ pub fn build_keymanager_api(
 
 /// Bootstrap phase: optionally assemble and spawn the Keymanager API server.
 ///
-/// When `config.keymanager.enabled` is false, returns immediately without
+/// When `config.keymanager.enabled` is false, returns `Ok(None)` without
 /// constructing adapters or touching the token file.
+///
+/// When enabled, returns a [`JoinHandle`] for the server task (Ingress tier).
+/// ARCH-2g registers this handle on the executor; cancellation is driven by
+/// `shutdown` via [`keymanager_api::KeymanagerServer::run_with_shutdown`].
 pub fn spawn_keymanager_api(
     config: &Config,
     deps: KeymanagerApiDeps,
-) -> Result<(), SpawnKeymanagerApiError> {
+    shutdown: &CancellationToken,
+) -> Result<Option<JoinHandle<()>>, SpawnKeymanagerApiError> {
     let Some(built) = build_keymanager_api(config, deps)? else {
-        return Ok(());
+        return Ok(None);
     };
 
     info!(
@@ -248,11 +255,12 @@ pub fn spawn_keymanager_api(
         "Keymanager API enabled"
     );
 
-    tokio::spawn(async move {
-        if let Err(e) = built.server.run().await {
+    let token = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = built.server.run_with_shutdown(token).await {
             error!("Keymanager API server error: {}", e);
         }
     });
 
-    Ok(())
+    Ok(Some(handle))
 }

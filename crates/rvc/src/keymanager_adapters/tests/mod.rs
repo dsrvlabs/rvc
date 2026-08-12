@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use validator_store::ValidatorStore;
 
 use crate::orchestrator::PubkeyMap;

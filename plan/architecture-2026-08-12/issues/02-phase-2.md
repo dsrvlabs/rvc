@@ -835,14 +835,14 @@ the failure C5 exists to prevent. State this in the PR description so a reviewer
   — the handle is returned rather than discarded.
 
 **Acceptance criteria.**
-- [ ] `crates/keymanager-api/src/server.rs` uses `with_graceful_shutdown` driven by a
+- [x] `crates/keymanager-api/src/server.rs` uses `with_graceful_shutdown` driven by a
       `CancellationToken`; `run()` still exists and is unchanged for existing callers.
-- [ ] `spawn_keymanager_api` returns `JoinHandle<()>` (or `Option<JoinHandle<()>>` for the disabled
+- [x] `spawn_keymanager_api` returns `JoinHandle<()>` (or `Option<JoinHandle<()>>` for the disabled
       case, feeding `register_opt`) instead of discarding it.
-- [ ] Cancelling the token stops the server within 2 s **and** lets an in-flight request finish.
-- [ ] `git diff --stat` shows **no** change to `crates/keymanager-api/src/lifecycle.rs` (C5).
-- [ ] `cargo metadata` shows no new workspace crate edge; `ARCHITECTURE.md` regenerates byte-identically.
-- [ ] All existing keymanager API tests pass unmodified.
+- [x] Cancelling the token stops the server within 2 s **and** lets an in-flight request finish.
+- [x] `git diff --stat` shows **no** change to `crates/keymanager-api/src/lifecycle.rs` (C5).
+- [x] `cargo metadata` shows no new workspace crate edge; `ARCHITECTURE.md` regenerates byte-identically.
+- [x] All existing keymanager API tests pass unmodified.
 
 ---
 
