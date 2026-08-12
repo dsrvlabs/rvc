@@ -587,11 +587,11 @@ criteria are two numbers.
   (`slashing_monitor.rs:122-123`'s idiom is what this replaces).
 
 **Acceptance criteria.**
-- [ ] Exactly two series exist; `rg 'rvc_task' crates/` shows no third.
-- [ ] Every registered task's name appears as a label value in `rvc_tasks_running`.
-- [ ] The gauge returns to 0 after a full drain, including for panicked and aborted tasks.
-- [ ] `outcome` takes exactly the three documented values.
-- [ ] No measurable cost on the per-slot deadline path at default `info` (NFR-1) — the executor is
+- [x] Exactly two series exist; `rg 'rvc_task' crates/` shows no third.
+- [x] Every registered task's name appears as a label value in `rvc_tasks_running`.
+- [x] The gauge returns to 0 after a full drain, including for panicked and aborted tasks.
+- [x] `outcome` takes exactly the three documented values.
+- [x] No measurable cost on the per-slot deadline path at default `info` (NFR-1) — the executor is
       touched at register and at exit only, never per slot; state this in the PR rather than
       re-running the Phase-0 M1/M2 harness for a metric that cannot be on that path.
 
