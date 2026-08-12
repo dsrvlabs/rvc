@@ -22,7 +22,7 @@ fidelity; the refactoring phase only reconciles status after layout changes.
 
 ### Post-RF6-10 home for block-service mocks
 
-Plan text still mentions `crates/block-service/src/service.rs`. After RF6-10 the capturing surface lives at:
+Plan text still mentions crates/block-service/src/service.rs (pre-RF6-10 layout; path no longer exists). After RF6-10 the capturing surface lives at:
 
 - `crates/block-service/src/service/tests/mocks.rs` — `CapturedProduceCall`, `CapturedPublishCall`, `CapturedSignBlockCall`, `MockBeaconClient`, `MockSigner`, assertion helpers
 - Exactly **one** `impl BeaconBlockClient for` in the crate (merged capture mock)
