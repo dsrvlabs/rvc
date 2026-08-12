@@ -1,0 +1,1882 @@
+//! Axum handlers for the Web3Signer HTTP API.
+//!
+//! `GET /upcheck`, `GET /api/v1/eth2/publicKeys`, and the live
+//! `POST /api/v1/eth2/sign/{identifier}` sign route.
+
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::header::ACCEPT;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
+
+use super::dispatch::{plan_sign, Slashing};
+use super::pubkey::{resolve_identifier, PubkeyError};
+use super::request::{SignPayload, SignRequest};
+use super::response::{sign_response, HttpSignError};
+use super::tls::{audit_cn, PeerCert};
+use super::Web3SignerState;
+use crate::audit;
+
+use tracing::Instrument;
+
+use crypto::logging::fields::{self, Duty};
+use crypto::logging::{new_request_id, record_display, TruncatedPubkey};
+
+/// `GET /upcheck` — liveness probe (FR-1).
+///
+/// Returns `200 OK` with the body `OK`. It takes no state and never calls the
+/// gate, so orchestration health-checks succeed even while the signing path is
+/// busy or erroring.
+#[tracing::instrument(skip_all)]
+pub(super) async fn upcheck() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+/// `GET /api/v1/eth2/publicKeys` (FR-2).
+///
+/// Returns `200` with a JSON array of `0x`-prefixed lowercase BLS public keys
+/// for every key currently loaded in the backend — the same key set the gRPC
+/// `list_public_keys` handler serves (one source of truth, both transports). An
+/// empty backend returns `[]` (still `200`, not `404`). No gate call.
+#[tracing::instrument(skip_all)]
+pub(super) async fn public_keys(State(state): State<Web3SignerState>) -> Json<Vec<String>> {
+    let keys =
+        state.backend.public_keys().iter().map(|pk| format!("0x{}", hex::encode(pk))).collect();
+    Json(keys)
+}
+
+/// `POST /api/v1/eth2/sign/{identifier}` (FR-3..FR-24).
+///
+/// Resolves `{identifier}` to a loaded key (`400`/`404`), decodes the request,
+/// computes the signing root via the dispatcher, routes the matching
+/// `SigningGate.sign_*` call (the single signing authority — slashing + lock +
+/// timeout), and shapes the body per `Accept`. The gate result maps to the exact
+/// HTTP status (`200/400/404/412/500`) via [`HttpSignError`].
+pub(super) async fn sign(
+    State(state): State<Web3SignerState>,
+    Path(identifier): Path<String>,
+    peer: Option<Extension<PeerCert>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Continue the caller's W3C trace: the handler span is parented from the
+    // inbound `traceparent` BEFORE it is entered (set_parent is a no-op once the
+    // span has started), then the body future is instrumented with it.
+    let span = sign_span(&headers);
+
+    // request_id correlates one signing request end to end, including across this
+    // :9000 hop — reuse the caller's `x-request-id` if present, else mint one.
+    // The reused value is recorded on the span and inherits into the signing
+    // audit line, so bound it (non-empty, <= 128 ASCII-graphic chars) to deny an
+    // attacker-chosen, header-buffer-sized token polluting the audit log; any
+    // value outside that gate is replaced by a fresh minted correlator.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| new_request_id().to_string());
+
+    let mut response = sign_traced(state, identifier, peer, headers, body, request_id.clone())
+        .instrument(span)
+        .await;
+
+    // Echo the correlator so the caller can stitch both sides of the trace.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// Build the per-request handler span and continue the caller's trace.
+///
+/// `set_parent_from_headers` MUST run before the span is entered/started (it is a
+/// no-op once started — see `telemetry::propagation`), so the span is created
+/// here, parented from the inbound `traceparent`, and returned **unentered**; the
+/// caller instruments the body future with it. The correlation fields are
+/// declared `Empty` and late-bound by the handler once the payload parses.
+fn sign_span(headers: &axum::http::HeaderMap) -> tracing::Span {
+    let span = tracing::info_span!(
+        "sign",
+        otel.kind = "server",
+        request_id = tracing::field::Empty,
+        slot = tracing::field::Empty,
+        duty = tracing::field::Empty,
+        pubkey = tracing::field::Empty,
+    );
+    telemetry::set_parent_from_headers(&span, headers);
+    span
+}
+
+/// The body of [`sign`], instrumented with the handler span so every event it
+/// emits (including the audit line) inherits the span's correlation fields.
+/// Split out so [`sign`] can build + parent the span first.
+async fn sign_traced(
+    state: Web3SignerState,
+    identifier: String,
+    peer: Option<Extension<PeerCert>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+    request_id: String,
+) -> Response {
+    // request_id is a span field declared `Empty` in `sign_span`; record it so it
+    // lands on the handler span and inherits to the audit line.
+    record_display(&tracing::Span::current(), fields::REQUEST_ID, &request_id);
+
+    let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
+    // Derive the audit CN from the TLS peer cert (Phase 3). `None` extension
+    // (socket-free tests / no-TLS) or no client cert (Prysm / server-TLS-only)
+    // both degrade to the configured default (`AUDIT_CN_DEFAULT`).
+    //
+    // SEC-4: when `client_cn_allow_list` is configured, the CN *is* an
+    // authorization gate (same list as gRPC). When unset, missing/default CN
+    // still signs (backward compatible).
+    let cn = audit_cn(peer.as_ref().map(|Extension(p)| p), &state.audit.default_cn);
+
+    // Audit posture (Issue 4.4): emit exactly one structured entry per request —
+    // success at `info`, every rejection at `warn` — carrying only metadata
+    // (pubkey identifier, Web3Signer `type`, outcome, peer CN, backend, latency).
+    // NEVER the request body, signing root, or signature. `rpc_type` is filled by
+    // `sign_inner` once the payload parses, so a pre-parse 400 audits with no
+    // `type` rather than a wrong one.
+    let started = std::time::Instant::now();
+    let mut rpc_type: Option<&'static str> = None;
+    let (response, result_label) = if let Err(status) =
+        audit::authorize_client_cn(state.client_cn_allow_list.as_deref(), &cn)
+    {
+        // Reject before any parse / gate / BLS work (mirrors gRPC SEC-4 order).
+        let err = HttpSignError::Unauthorized(status.message().to_string());
+        let label = err.audit_label();
+        (err.into_response(), label)
+    } else {
+        match sign_inner(&state, &identifier, accept, &cn, body.as_ref(), &mut rpc_type).await {
+            Ok(resp) => (resp, "success"),
+            Err(e) => {
+                let label = e.audit_label();
+                (e.into_response(), label)
+            }
+        }
+    };
+    let elapsed = started.elapsed();
+
+    // HTTP-path metrics (Issue 4.5): count by `type` × outcome and observe
+    // latency on series distinct from the gRPC vecs, scraped on the same `:9101`
+    // listener. A pre-parse failure has no `type` → "unknown" (a single bounded
+    // bucket, never request-derived, so the label set stays low-cardinality).
+    state
+        .metrics
+        .http_sign_total
+        .with_label_values(&[rpc_type.unwrap_or("unknown"), result_label])
+        .inc();
+    state
+        .metrics
+        .http_sign_duration_seconds
+        .with_label_values(&[] as &[&str])
+        .observe(elapsed.as_secs_f64());
+
+    audit::log_audit(&audit::AuditEntry {
+        timestamp: audit::now_rfc3339(),
+        pubkey_hex: identifier,
+        client_cn: cn,
+        backend: state.audit.backend_name.clone(),
+        result: result_label.to_string(),
+        duration_ms: elapsed.as_millis() as u64,
+        rpc: rpc_type.map(str::to_string),
+    });
+    response
+}
+
+/// Map a Web3Signer payload to its canonical [`Duty`] category (the span's `duty`
+/// field). Several request types collapse onto one duty (e.g. RANDAO_REVEAL is a
+/// proposer/block duty); the Web3Signer `type` stays distinct in the audit line.
+fn payload_duty(payload: &SignPayload) -> Duty {
+    match payload {
+        SignPayload::Attestation { .. } => Duty::Attestation,
+        SignPayload::BlockV2 { .. } | SignPayload::RandaoReveal { .. } => Duty::Block,
+        SignPayload::AggregationSlot { .. }
+        | SignPayload::AggregateAndProof { .. }
+        | SignPayload::AggregateAndProofV2 { .. } => Duty::Aggregate,
+        SignPayload::SyncCommitteeMessage { .. } => Duty::SyncCommittee,
+        SignPayload::SyncCommitteeContributionAndProof { .. }
+        | SignPayload::SyncCommitteeSelectionProof { .. } => Duty::SyncContribution,
+        SignPayload::ValidatorRegistration { .. } => Duty::ValidatorRegistration,
+        SignPayload::VoluntaryExit { .. } => Duty::VoluntaryExit,
+    }
+}
+
+/// The `slot` a payload pertains to, when it carries one. Epoch-only types
+/// (RANDAO_REVEAL, VOLUNTARY_EXIT) and the slotless VALIDATOR_REGISTRATION have
+/// none, so the span's `slot` field stays unset for them.
+fn payload_slot(payload: &SignPayload) -> Option<u64> {
+    match payload {
+        SignPayload::BlockV2 { beacon_block } => Some(beacon_block.block_header.slot),
+        SignPayload::Attestation { attestation } => Some(attestation.slot),
+        SignPayload::AggregationSlot { aggregation_slot } => Some(aggregation_slot.slot),
+        SignPayload::AggregateAndProof { aggregate_and_proof } => {
+            Some(aggregate_and_proof.aggregate.data.slot)
+        }
+        SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
+            Some(aggregate_and_proof.aggregate.data.slot)
+        }
+        SignPayload::SyncCommitteeMessage { sync_committee_message } => {
+            Some(sync_committee_message.slot)
+        }
+        SignPayload::SyncCommitteeContributionAndProof { contribution_and_proof } => {
+            Some(contribution_and_proof.contribution.slot)
+        }
+        SignPayload::SyncCommitteeSelectionProof { sync_aggregator_selection_data } => {
+            Some(sync_aggregator_selection_data.slot)
+        }
+        SignPayload::RandaoReveal { .. }
+        | SignPayload::ValidatorRegistration { .. }
+        | SignPayload::VoluntaryExit { .. } => None,
+    }
+}
+
+/// The fallible core of [`sign`], split out so every failure renders through the
+/// single [`HttpSignError`] → status mapping. `rpc_type` is an out-param set to
+/// the Web3Signer `type` as soon as the body parses, so the caller can audit the
+/// type even on a post-parse failure (slashing/gate error).
+async fn sign_inner(
+    state: &Web3SignerState,
+    identifier: &str,
+    accept: Option<&str>,
+    cn: &str,
+    body: &[u8],
+    rpc_type: &mut Option<&'static str>,
+) -> Result<Response, HttpSignError> {
+    // 1. Resolve {identifier} to a loaded key: malformed → 400, unloaded → 404.
+    //    The pre-check runs before any decode/gate work.
+    let pubkey = resolve_identifier(identifier, state.backend.as_ref()).map_err(|e| match e {
+        PubkeyError::Malformed => {
+            HttpSignError::BadRequest("malformed public key identifier".to_string())
+        }
+        PubkeyError::NotLoaded => HttpSignError::UnknownKey,
+    })?;
+    // pubkey is a span field declared `Empty` in `sign_span`; record it truncated
+    // (never the full key) so the handler span carries the canonical correlator.
+    record_display(&tracing::Span::current(), fields::PUBKEY, TruncatedPubkey::new(identifier));
+
+    // 2. Decode the body. A serde decode failure maps to a FIXED 400 — the
+    //    decoder message can echo request bytes / field text and is NEVER
+    //    surfaced to the client (SEC-INFO-01).
+    let req: SignRequest = serde_json::from_slice(body)
+        .map_err(|_| HttpSignError::BadRequest("invalid sign request body".to_string()))?;
+    // Record the type for the audit entry now that the payload is known, so a
+    // later slashing/gate rejection still audits the correct `type` (Issue 4.4).
+    *rpc_type = Some(req.payload.type_name());
+    // Record the canonical duty + slot (when the payload carries one) on the span.
+    let span = tracing::Span::current();
+    record_display(&span, fields::DUTY, payload_duty(&req.payload).as_str());
+    if let Some(slot) = payload_slot(&req.payload) {
+        record_display(&span, fields::SLOT, slot);
+    }
+
+    // 3. Compute the signing root + slashing inputs; enforce the signingRoot /
+    //    fork_info policy (the dispatcher owns the domain).
+    let plan = plan_sign(&req)?;
+    let root = plan.signing_root;
+
+    // 4. Route to the matching gate method. `cn` is the TLS peer-cert audit CN
+    //    derived by the caller (Phase 3), or the audit default.
+    let sig = match plan.slashing {
+        Slashing::Block { slot, gvr } => state.gate.sign_block(&pubkey, slot, root, gvr, cn).await,
+        Slashing::Attestation { source_epoch, target_epoch, gvr } => {
+            state.gate.sign_attestation(&pubkey, source_epoch, target_epoch, root, gvr, cn).await
+        }
+        Slashing::NonSlashable => match &req.payload {
+            SignPayload::RandaoReveal { .. } => state.gate.sign_randao_reveal(&pubkey, root).await,
+            SignPayload::AggregationSlot { .. } => {
+                state.gate.sign_selection_proof(&pubkey, root).await
+            }
+            SignPayload::AggregateAndProof { .. } => {
+                state.gate.sign_aggregate_and_proof(&pubkey, root).await
+            }
+            SignPayload::SyncCommitteeMessage { .. } => {
+                state.gate.sign_sync_committee_message(&pubkey, root).await
+            }
+            SignPayload::SyncCommitteeContributionAndProof { .. } => {
+                state.gate.sign_contribution_and_proof(&pubkey, root).await
+            }
+            // Same gate method as AGGREGATION_SLOT; the dispatcher already applied
+            // the DISTINCT 0x08 domain, so the gate just signs the root.
+            SignPayload::SyncCommitteeSelectionProof { .. } => {
+                state.gate.sign_selection_proof(&pubkey, root).await
+            }
+            SignPayload::ValidatorRegistration { .. } => {
+                state.gate.sign_builder_registration(&pubkey, root).await
+            }
+            SignPayload::VoluntaryExit { .. } => {
+                state.gate.sign_voluntary_exit(&pubkey, root).await
+            }
+            // Electra: SAME gate method as the base AGGREGATE_AND_PROOF; the
+            // dispatcher already applied the (identical) domain over the Electra
+            // SSZ root, so the gate just signs the pre-computed root.
+            SignPayload::AggregateAndProofV2 { .. } => {
+                state.gate.sign_aggregate_and_proof(&pubkey, root).await
+            }
+            // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
+            // a no-`_` match keeps a future payload variant a compile error.
+            SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
+                return Err(HttpSignError::BadRequest("internal dispatch mismatch".to_string()))
+            }
+        },
+    }
+    .map_err(HttpSignError::Gate)?;
+
+    // 5. Shape the success body per Accept (FR-17).
+    Ok(sign_response(accept, &sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::response::Response;
+    use tower::ServiceExt; // oneshot
+
+    use crate::http_api::router;
+    use crate::http_api::test_support::{
+        test_keypair, test_state, MockBackend, RealSigningBackend,
+    };
+    use crate::http_api::tls::PeerCert;
+
+    use crypto::{compute_domain, compute_signing_root};
+    // Import BeaconBlockHeader EXPLICITLY from eth_types: an unrelated all-String
+    // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
+    use eth_types::{
+        AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
+        ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, Root,
+        SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
+        ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+        DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    };
+
+    const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
+
+    fn fork_info_json() -> &'static str {
+        r#""fork_info": { "fork": { "previous_version": "0x03000000",
+                                    "current_version": "0x04000000",
+                                    "epoch": "100" },
+             "genesis_validators_root": "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899" }"#
+    }
+
+    fn expected_gvr() -> Root {
+        let half = [
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99,
+        ];
+        let mut g = [0u8; 32];
+        g[..16].copy_from_slice(&half);
+        g[16..].copy_from_slice(&half);
+        g
+    }
+
+    /// The canonical attestation used by the happy-path tests, matching
+    /// `attestation_body`.
+    fn sample_attestation() -> AttestationData {
+        AttestationData {
+            slot: 5,
+            index: 0,
+            beacon_block_root: [0u8; 32],
+            source: Checkpoint { epoch: 1, root: [0u8; 32] },
+            target: Checkpoint { epoch: 2, root: [0u8; 32] },
+        }
+    }
+
+    fn attestation_body(extra_signing_root: Option<&str>) -> String {
+        let sr =
+            extra_signing_root.map(|r| format!(r#""signingRoot": "{r}","#)).unwrap_or_default();
+        format!(
+            r#"{{ "type": "ATTESTATION", {fi}, {sr}
+                  "attestation": {{ "slot": "5", "index": "0",
+                                    "beacon_block_root": "0x{z}",
+                                    "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                    "target": {{ "epoch": "2", "root": "0x{z}" }} }} }}"#,
+            fi = fork_info_json(),
+            z = "00".repeat(32),
+        )
+    }
+
+    /// An ATTESTATION body with the same source/target epochs (1/2) as
+    /// `attestation_body` but a caller-chosen `beacon_block_root`, so two calls
+    /// with different bytes produce two DISTINCT attestations sharing a target
+    /// epoch — a double vote (Issue 2.8b slashing harness, reused by 2.9).
+    fn attestation_body_with_block_root(block_root_byte: u8) -> String {
+        let br = format!("{block_root_byte:02x}").repeat(32);
+        format!(
+            r#"{{ "type": "ATTESTATION", {fi},
+                  "attestation": {{ "slot": "5", "index": "0",
+                                    "beacon_block_root": "0x{br}",
+                                    "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                    "target": {{ "epoch": "2", "root": "0x{z}" }} }} }}"#,
+            fi = fork_info_json(),
+            z = "00".repeat(32),
+        )
+    }
+
+    /// A `BeaconBlockHeader` (slot 3_000_000) with a caller-chosen `state_root`,
+    /// so two headers at the same slot with different bytes are two DISTINCT
+    /// blocks — a double block proposal. Matches `block_v2_body`.
+    fn sample_block_header(state_root_byte: u8) -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot: 3_000_000,
+            proposer_index: 12_345,
+            parent_root: [0xaa; 32],
+            state_root: [state_root_byte; 32],
+            body_root: [0xcc; 32],
+        }
+    }
+
+    fn block_v2_body(state_root_byte: u8) -> String {
+        format!(
+            r#"{{ "type": "BLOCK_V2", {fi},
+                  "beacon_block": {{ "version": "DENEB",
+                                     "block_header": {{ "slot": "3000000",
+                                                        "proposer_index": "12345",
+                                                        "parent_root": "0x{aa}",
+                                                        "state_root": "0x{sr}",
+                                                        "body_root": "0x{cc}" }} }} }}"#,
+            fi = fork_info_json(),
+            aa = "aa".repeat(32),
+            sr = format!("{state_root_byte:02x}").repeat(32),
+            cc = "cc".repeat(32),
+        )
+    }
+
+    fn randao_body(epoch: u64) -> String {
+        format!(
+            r#"{{ "type": "RANDAO_REVEAL", {fi}, "randao_reveal": {{ "epoch": "{epoch}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    fn aggregation_slot_body(slot: u64) -> String {
+        format!(
+            r#"{{ "type": "AGGREGATION_SLOT", {fi}, "aggregation_slot": {{ "slot": "{slot}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    async fn post_sign(
+        state: crate::http_api::Web3SignerState,
+        identifier: &str,
+        accept: Option<&str>,
+        body: String,
+    ) -> Response {
+        let mut rb = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{identifier}"))
+            .header("content-type", "application/json");
+        if let Some(a) = accept {
+            rb = rb.header("accept", a);
+        }
+        router(state).oneshot(rb.body(Body::from(body)).unwrap()).await.unwrap()
+    }
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    // ── Real-gate 412 slashing harness (Issue 2.8b, reused by 2.9) ───────────
+
+    #[tokio::test]
+    async fn conflicting_attestation_same_target_epoch_returns_412() {
+        let (sk, pk_bytes) = test_keypair();
+        // One real gate over one in-memory slashing DB shared across both POSTs.
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // First attestation (target epoch 2) stages + commits → 200.
+        let first =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x00)).await;
+        assert_eq!(first.status(), StatusCode::OK, "first attestation signs");
+
+        // A DISTINCT attestation with the SAME target epoch (different
+        // beacon_block_root → different signing root) is a double vote → 412.
+        let second =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x11)).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "double vote must be rejected by the gate as 412"
+        );
+        // The 412 body must not leak slashing-DB internals (paths/rusqlite).
+        let body = String::from_utf8(body_bytes(second).await).unwrap();
+        assert!(
+            !body.contains(".db") && !body.to_lowercase().contains("sqlite"),
+            "no DB internals: {body}"
+        );
+    }
+
+    // ── RANDAO_REVEAL + AGGREGATION_SLOT (Issue 2.10): non-slashable KATs ─────
+
+    /// Sign `body` with a fresh real-key gate and return the raw 96-byte sig.
+    async fn sign_ok(body: String) -> Vec<u8> {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, Some("application/json"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let hexsig = v["signature"].as_str().unwrap().strip_prefix("0x").unwrap().to_string();
+        hex::decode(hexsig).unwrap()
+    }
+
+    #[tokio::test]
+    async fn randao_reveal_kat_signs_epoch_under_randao_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_RANDAO, CURRENT_VERSION, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&42u64, domain)).to_bytes();
+        assert_eq!(sign_ok(randao_body(42)).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn aggregation_slot_kat_signs_slot_under_selection_proof_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_SELECTION_PROOF, CURRENT_VERSION, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&77u64, domain)).to_bytes();
+        assert_eq!(sign_ok(aggregation_slot_body(77)).await, expected.to_vec());
+    }
+
+    /// RANDAO and AGGREGATION_SLOT share neither domain nor gate method; the same
+    /// scalar must NOT collide (0x02 RANDAO vs 0x05 SELECTION_PROOF).
+    #[tokio::test]
+    async fn randao_and_aggregation_slot_domains_do_not_collide() {
+        assert_ne!(sign_ok(randao_body(7)).await, sign_ok(aggregation_slot_body(7)).await);
+    }
+
+    /// Non-slashable: re-signing the same RANDAO succeeds (no slashing-DB row).
+    #[tokio::test]
+    async fn randao_reveal_is_non_slashable_resign_ok() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        for _ in 0..2 {
+            let resp = post_sign(state.clone(), &id, None, randao_body(9)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "randao is non-slashable");
+        }
+    }
+
+    // ── P1 aggregation + sync-committee arms (Issue 4.1) ─────────────────────
+
+    fn dummy_sig() -> Vec<u8> {
+        vec![0xAB; 96]
+    }
+
+    /// A valid (small, in-limit) pre-Electra aggregation bitlist: `0x01` is a
+    /// 0-data-bit bitlist (just the length delimiter).
+    fn valid_agg_bits() -> Vec<u8> {
+        vec![0x01]
+    }
+
+    fn sample_aggregate_and_proof() -> AggregateAndProof {
+        AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: Attestation {
+                aggregation_bits: valid_agg_bits(),
+                data: sample_attestation(),
+                signature: dummy_sig(),
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    fn sample_contribution_and_proof() -> ContributionAndProof {
+        ContributionAndProof {
+            aggregator_index: 1,
+            contribution: SyncCommitteeContribution {
+                slot: 5,
+                beacon_block_root: [0x11; 32],
+                subcommittee_index: 0,
+                aggregation_bits: vec![0u8; 16],
+                signature: dummy_sig(),
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    /// Wrap a serialized payload object in the sign envelope with `fork_info`.
+    fn p1_body(type_name: &str, payload_key: &str, payload_json: String) -> String {
+        format!(
+            r#"{{ "type": "{type_name}", {fi}, "{payload_key}": {payload_json} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    #[tokio::test]
+    async fn aggregate_and_proof_kat() {
+        let agg = sample_aggregate_and_proof();
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = agg.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn sync_committee_message_kat_signs_the_block_root() {
+        let msg = SyncCommitteeMessage {
+            slot: 5,
+            beacon_block_root: [0x22; 32],
+            validator_index: 0,
+            signature: dummy_sig(),
+        };
+        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, CURRENT_VERSION, expected_gvr());
+        // The signed object is the block ROOT, not the message container.
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&msg.beacon_block_root, domain)).to_bytes();
+        let body = p1_body(
+            "SYNC_COMMITTEE_MESSAGE",
+            "sync_committee_message",
+            serde_json::to_string(&msg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn sync_committee_contribution_and_proof_kat() {
+        let cap = sample_contribution_and_proof();
+        let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&cap, domain)).to_bytes();
+        let body = p1_body(
+            "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+            "contribution_and_proof",
+            serde_json::to_string(&cap).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn aggregate_and_proof_malformed_bits_is_400_not_panic() {
+        // An over-length aggregation_bits bitlist must surface as 400 via
+        // try_tree_hash_root, never a panic (the liveness-DoS class).
+        let mut agg = sample_aggregate_and_proof();
+        agg.aggregate.aggregation_bits = vec![0xff; 4096]; // far past the committee limit
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
+    }
+
+    /// 4.1-review polish: lock the no-panic property at the ROUTE layer for the
+    /// contribution arm — a multi-KB `aggregation_bits` signs cleanly (200), not
+    /// a panic (`SyncCommitteeContribution` hashes the bits via a self-sizing
+    /// `vec_u8_tree_hash_root`, so any length is safe).
+    #[tokio::test]
+    async fn sync_committee_contribution_large_bits_is_200() {
+        let mut cap = sample_contribution_and_proof();
+        cap.contribution.aggregation_bits = vec![0xff; 4096];
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+            "contribution_and_proof",
+            serde_json::to_string(&cap).unwrap(),
+        );
+        let resp = post_sign(state, &id, Some("application/json"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "large contribution bits sign cleanly, no panic");
+    }
+
+    // ── SYNC_COMMITTEE_SELECTION_PROOF (Issue 4.2): the 0x08 disambiguation ───
+
+    fn sync_selection_body(slot: u64, subcommittee_index: u64) -> String {
+        format!(
+            r#"{{ "type": "SYNC_COMMITTEE_SELECTION_PROOF", {fi},
+                  "sync_aggregator_selection_data": {{ "slot": "{slot}",
+                                                       "subcommittee_index": "{subcommittee_index}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_committee_selection_proof_kat() {
+        let sasd = SyncAggregatorSelectionData { slot: 7, subcommittee_index: 3 };
+        let domain =
+            compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, CURRENT_VERSION, expected_gvr());
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&sasd, domain)).to_bytes();
+        assert_eq!(sign_ok(sync_selection_body(7, 3)).await, expected.to_vec());
+    }
+
+    /// The load-bearing test: `SYNC_COMMITTEE_SELECTION_PROOF` (0x08 over the
+    /// `SyncAggregatorSelectionData` struct) must NOT collide with
+    /// `AGGREGATION_SLOT` (0x05 over a bare slot) for the same slot — a
+    /// regression pointing this arm at `DOMAIN_SELECTION_PROOF` would pass every
+    /// other check but fail here.
+    #[tokio::test]
+    async fn sync_selection_and_aggregation_slot_domains_do_not_collide() {
+        assert_ne!(
+            sign_ok(aggregation_slot_body(7)).await,
+            sign_ok(sync_selection_body(7, 0)).await,
+            "0x08 sync-selection must not equal 0x05 aggregation-slot for the same slot"
+        );
+    }
+
+    // ── VALIDATOR_REGISTRATION (Issue 4.3): no fork_info, fixed builder domain ─
+
+    fn sample_registration() -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: [0x11; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            pubkey: test_keypair().1,
+        }
+    }
+
+    fn registration_body(reg: &ValidatorRegistrationV1, with_fork_info: bool) -> String {
+        let reg_json = serde_json::to_string(reg).unwrap();
+        if with_fork_info {
+            format!(
+                r#"{{ "type": "VALIDATOR_REGISTRATION", {fi}, "validator_registration": {reg_json} }}"#,
+                fi = fork_info_json(),
+            )
+        } else {
+            format!(
+                r#"{{ "type": "VALIDATOR_REGISTRATION", "validator_registration": {reg_json} }}"#
+            )
+        }
+    }
+
+    /// Independently compute the builder signing root: fixed builder fork version
+    /// `0x00000000` + a ZERO genesis validators root (ADR-008), NOT a fork_info gvr.
+    fn expected_registration_sig(reg: &ValidatorRegistrationV1) -> Vec<u8> {
+        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, [0, 0, 0, 0], [0u8; 32]);
+        let (sk, _) = test_keypair();
+        sk.sign(&compute_signing_root(reg, domain)).to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn validator_registration_without_fork_info_signs_kat() {
+        // A body that OMITS fork_info must parse + sign (not 400), and sign the
+        // builder root (zero gvr, fixed builder fork version).
+        let reg = sample_registration();
+        assert_eq!(
+            sign_ok(registration_body(&reg, false)).await,
+            expected_registration_sig(&reg),
+            "VALIDATOR_REGISTRATION omitting fork_info signs the builder root"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_registration_with_fork_info_is_ignored_not_rejected() {
+        // A body that DOES include fork_info still signs and produces the SAME
+        // signature — fork_info is ignored for this type, not rejected.
+        let reg = sample_registration();
+        assert_eq!(
+            sign_ok(registration_body(&reg, true)).await,
+            expected_registration_sig(&reg),
+            "fork_info is ignored for VALIDATOR_REGISTRATION (same builder root)"
+        );
+    }
+
+    // ── BLOCK_V2 (Issue 2.9): KAT over the block header + double-proposal 412 ─
+
+    #[tokio::test]
+    async fn block_v2_happy_path_signs_the_block_header_root() {
+        // BLOCK_V2 signs the `block_header` (a BeaconBlockHeader), never a
+        // reconstructed block, under DOMAIN_BEACON_PROPOSER.
+        let header = sample_block_header(0xbb);
+        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, CURRENT_VERSION, expected_gvr());
+        let expected_root = compute_signing_root(&header, domain);
+
+        let (sk, pk_bytes) = test_keypair();
+        let expected_sig = sk.sign(&expected_root).to_bytes();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, Some("application/json"), block_v2_body(0xbb)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let got = v["signature"].as_str().unwrap().strip_prefix("0x").unwrap();
+        assert_eq!(hex::decode(got).unwrap(), expected_sig.to_vec(), "route signs the header root");
+    }
+
+    #[tokio::test]
+    async fn conflicting_block_same_slot_returns_412() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // First block at slot 3_000_000 stages + commits → 200.
+        let first = post_sign(state.clone(), &id, None, block_v2_body(0xaa)).await;
+        assert_eq!(first.status(), StatusCode::OK, "first block signs");
+
+        // A DISTINCT block at the SAME slot (different state_root → different
+        // signing root) is a double block proposal → 412.
+        let second = post_sign(state.clone(), &id, None, block_v2_body(0xbb)).await;
+        assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED, "double proposal → 412");
+
+        // Safe-body check (2.8b review polish): the 412 surfaces only the safe
+        // slashing-violation detail, never the signature or DB internals.
+        let body = String::from_utf8(body_bytes(second).await).unwrap();
+        assert!(body.contains("slashing protection violation"), "safe violation message: {body}");
+        assert!(!body.contains("0x") && !body.contains(".db"), "no signature/DB internals: {body}");
+    }
+
+    // ── ATTESTATION happy path — KAT: the route signs the correct root ───────
+
+    #[tokio::test]
+    async fn attestation_happy_path_signs_the_expected_root() {
+        let att = sample_attestation();
+        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, CURRENT_VERSION, expected_gvr());
+        let expected_root = compute_signing_root(&att, domain);
+
+        let (sk, pk_bytes) = test_keypair();
+        let expected_sig = sk.sign(&expected_root).to_bytes();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, Some("application/json"), attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let got = v["signature"].as_str().unwrap().strip_prefix("0x").unwrap();
+        let got_sig = hex::decode(got).unwrap();
+        assert_eq!(got_sig, expected_sig.to_vec(), "route must sign the dispatcher-computed root");
+    }
+
+    #[tokio::test]
+    async fn attestation_text_plain_returns_bare_hex_signature() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, Some("text/plain"), attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.starts_with("0x") && !body.contains('{'), "bare 0x.. body: {body}");
+        assert_eq!(body.len(), 2 + 192, "0x + 96-byte sig hex");
+    }
+
+    // ── Request hardening (Issue 2.11) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        // Empty backend: were the body cap missing, the route would resolve the
+        // (unloaded) key and return 404 — so a 413 strictly proves the cap fired
+        // at extraction, before any handler/gate work.
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48));
+        let oversized = "x".repeat((1 << 20) + 1); // 1 MiB + 1 byte
+        let resp = post_sign(state, &id, None, oversized).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ── Pre-gate error paths ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unloaded_key_returns_404() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        // A well-formed 48-byte hex key that is simply not loaded.
+        let id = format!("0x{}", "ab".repeat(48));
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn malformed_identifier_returns_400() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let resp = post_sign(state, "0xdeadbeef", None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalid_body_returns_400_without_decoder_detail() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, None, "{ this is not json".to_string()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        // SEC-INFO-01: a fixed body, no serde decoder text (no line/column/"expected").
+        assert_eq!(body, "invalid sign request body");
+        assert!(
+            !body.contains("column") && !body.contains("expected"),
+            "no decoder detail: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signing_root_mismatch_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let bad = format!("0x{}", "ff".repeat(32));
+        let resp = post_sign(state, &id, None, attestation_body(Some(&bad))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_fork_info_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "ATTESTATION",
+                  "attestation": {{ "slot": "5", "index": "0",
+                                    "beacon_block_root": "0x{z}",
+                                    "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                    "target": {{ "epoch": "2", "root": "0x{z}" }} }} }}"#,
+            z = "00".repeat(32),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Issue 4.4: HTTP audit logging ────────────────────────────────────────
+    //
+    // Every sign request emits exactly one structured audit entry (success at
+    // `info`, every rejection at `warn` via `log_audit`) carrying only
+    // metadata — pubkey identifier, Web3Signer `type`, outcome, peer CN,
+    // backend, latency — NEVER the body, signing root, or signature. These tests
+    // capture the emitted tracing events with `tracing-test` and assert the
+    // field set plus the absence of secrets.
+
+    use tracing_test::traced_test;
+
+    /// Mint a self-signed leaf whose subject CN is `cn`. Only the CN is read by
+    /// the audit extractor and no chain validation happens at the audit layer, so
+    /// a self-signed cert suffices to drive the cert-bearing CN path.
+    fn peer_cert_with_cn(cn: &str) -> PeerCert {
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        PeerCert(Some(cert.der().clone()))
+    }
+
+    /// `post_sign` with a Phase-3 `PeerCert` request extension injected, so the
+    /// handler derives the audit CN from a (test) client cert instead of the
+    /// default.
+    async fn post_sign_with_peer(
+        state: crate::http_api::Web3SignerState,
+        identifier: &str,
+        body: String,
+        peer: PeerCert,
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{identifier}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(peer);
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    /// Pull the `0x`-prefixed signature out of a JSON `{"signature":"0x.."}` body.
+    fn signature_hex(json_body: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(json_body).unwrap();
+        v["signature"].as_str().unwrap().to_string()
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_success_records_type_default_cn_and_omits_signature() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        let sig = signature_hex(&body);
+
+        // One audit line: success, with the Web3Signer type and the default CN
+        // (no client cert on the socket-free path → AUDIT_CN_DEFAULT).
+        assert!(logs_contain("sign request audit"));
+        assert!(logs_contain("result=success"));
+        assert!(logs_contain("rpc=ATTESTATION"));
+        assert!(logs_contain("client_cn=signing-gate"));
+        // The signature (hence no key material) must NOT appear in any log line.
+        assert!(!logs_contain(&sig), "audit log leaked the signature");
+    }
+
+    /// SEC-4 residual F1: HTTP path shares the primary CN allow-list with gRPC.
+    /// Socket-free requests use `AUDIT_CN_DEFAULT` (`signing-gate`); a list that
+    /// does not include it must reject with 401 before any signature.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_http_non_allowlisted_cn_rejected_before_sign() {
+        let (sk, pk_bytes) = test_keypair();
+        let mut state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        state.client_cn_allow_list =
+            Some(Arc::new(crate::audit::ClientCnAllowList::from_cns(["vc-A"])));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "non-allow-listed CN must not obtain a signature over HTTP"
+        );
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("not on the allow-list"), "body: {body}");
+        assert!(logs_contain("client_cn_not_allowed") || logs_contain("sign request audit"));
+    }
+
+    /// SEC-4: allow-listed default CN still signs over HTTP.
+    #[tokio::test]
+    async fn test_http_allowlisted_cn_succeeds() {
+        let (sk, pk_bytes) = test_keypair();
+        let mut state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        // Socket-free path degrades to AUDIT_CN_DEFAULT ("signing-gate").
+        state.client_cn_allow_list =
+            Some(Arc::new(crate::audit::ClientCnAllowList::from_cns(["signing-gate"])));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("signature"), "body: {body}");
+    }
+
+    /// Gate 3 (:9000): a real sign over the HTTP frontend proves the exported
+    /// handler span carries the late-bound canonical fields — `pubkey` (truncated),
+    /// `duty`, `slot`, `request_id` — and that no raw secret (full pubkey hex or
+    /// the returned signature) reaches any handler or audit line.
+    #[tokio::test]
+    async fn sign_span_records_truncated_fields_and_logs_no_secrets() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        struct ValueVisitor<'a>(&'a mut Vec<(String, String)>);
+        impl tracing::field::Visit for ValueVisitor<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push((f.name().to_string(), format!("{v:?}")));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push((f.name().to_string(), v.to_string()));
+            }
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                self.0.push((f.name().to_string(), v.to_string()));
+            }
+        }
+        struct LineVisitor(String);
+        impl tracing::field::Visit for LineVisitor {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={v:?} ", f.name()));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push_str(&format!("{}={v} ", f.name()));
+            }
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                self.0.push_str(&format!("{}={v} ", f.name()));
+            }
+        }
+        struct SignCapture {
+            span_fields: Arc<Mutex<Vec<(String, String)>>>,
+            event_lines: Arc<Mutex<Vec<String>>>,
+        }
+        impl<S> Layer<S> for SignCapture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut buf = self.span_fields.lock().unwrap();
+                attrs.record(&mut ValueVisitor(&mut buf));
+            }
+            fn on_record(
+                &self,
+                _id: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut buf = self.span_fields.lock().unwrap();
+                values.record(&mut ValueVisitor(&mut buf));
+            }
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut line = LineVisitor(String::new());
+                event.record(&mut line);
+                self.event_lines.lock().unwrap().push(line.0);
+            }
+        }
+
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let full_pubkey_hex = hex::encode(pk_bytes);
+
+        let span_fields = Arc::new(Mutex::new(Vec::new()));
+        let event_lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(SignCapture {
+            span_fields: span_fields.clone(),
+            event_lines: event_lines.clone(),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = String::from_utf8(body_bytes(resp).await).unwrap();
+        let sig = signature_hex(&resp_body);
+        drop(guard);
+
+        // (a) The exported handler span carries the late-bound canonical fields.
+        let fields = span_fields.lock().unwrap();
+        let pubkey =
+            fields.iter().find(|(k, _)| k == "pubkey").expect("sign span must record pubkey");
+        assert!(pubkey.1.contains("..."), "exported pubkey must be truncated: {}", pubkey.1);
+        assert!(
+            !pubkey.1.contains(&full_pubkey_hex),
+            "exported pubkey must not be the full hex: {}",
+            pubkey.1
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "duty" && v == "attestation"),
+            "sign span must record duty=attestation; fields were {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, _)| k == "slot"),
+            "sign span must record slot; fields were {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, _)| k == "request_id"),
+            "sign span must record request_id; fields were {fields:?}"
+        );
+
+        // (b) No raw secret reaches any handler or audit line.
+        let lines = event_lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("sign request audit")),
+            "audit line must be captured; lines were {lines:?}"
+        );
+        for l in lines.iter() {
+            assert!(!l.contains(&full_pubkey_hex), "full pubkey hex leaked into a log line: {l}");
+            assert!(!l.contains(&sig), "signature leaked into a log line: {l}");
+        }
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_rejection_412_logged_with_slashing_outcome_and_type() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // Commit, then a conflicting same-target-epoch attestation → 412.
+        let first =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x00)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x11)).await;
+        assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED);
+
+        // The rejection is audited (at `warn` per `log_audit`) with the gate
+        // outcome label and the still-known type.
+        assert!(logs_contain("result=slashing"));
+        assert!(logs_contain("rpc=ATTESTATION"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_unknown_key_404_logged_with_key_not_found() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48)); // well-formed, not loaded
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Resolved before the body parses → outcome label set, no `type` recorded.
+        assert!(logs_contain("result=key_not_found"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_records_client_cert_leaf_cn() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign_with_peer(
+            state,
+            &id,
+            attestation_body(None),
+            peer_cert_with_cn("lighthouse-vc"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // mTLS path: the audit CN is the leaf cert's first CN, not the default.
+        assert!(logs_contain("client_cn=lighthouse-vc"));
+        assert!(!logs_contain("client_cn=signing-gate"));
+    }
+
+    // ── Issue 4.5: HTTP metrics ──────────────────────────────────────────────
+
+    /// A successful HTTP sign increments `http_sign_total{type,result}` for the
+    /// exact type×outcome and records one latency-histogram sample.
+    #[tokio::test]
+    async fn http_sign_records_type_outcome_counter_and_latency() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            metrics.http_sign_total.with_label_values(&["ATTESTATION", "success"]).get(),
+            1,
+            "one ATTESTATION/success request counted"
+        );
+        assert_eq!(
+            metrics.http_sign_duration_seconds.with_label_values(&[] as &[&str]).get_sample_count(),
+            1,
+            "one latency sample recorded"
+        );
+    }
+
+    /// A rejection is counted under its outcome label, not `success`.
+    #[tokio::test]
+    async fn http_sign_counts_rejection_outcome() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", "ab".repeat(48)); // well-formed, not loaded → 404
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Resolved before the body parses → type "unknown", outcome key_not_found.
+        assert_eq!(
+            metrics.http_sign_total.with_label_values(&["unknown", "key_not_found"]).get(),
+            1
+        );
+    }
+
+    /// AC: a single `:9101` scrape spans BOTH transports — after exercising a
+    /// gRPC-style series and an HTTP sign on the shared registry, the encoded
+    /// output carries both the gRPC `rvc_signer_sign_total` and the HTTP
+    /// `rvc_signer_http_sign_total` series.
+    #[tokio::test]
+    async fn single_scrape_spans_grpc_and_http_series() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // gRPC-style increment on the shared registry (RF1-09 arity: backend,type,result)...
+        metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        // ...and a real HTTP sign on the same registry.
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(scrape.contains("rvc_signer_sign_total"), "gRPC series present");
+        assert!(scrape.contains("rvc_signer_http_sign_total"), "HTTP series present");
+        assert!(scrape.contains("beacon_block"), "gRPC type label present after arity change");
+    }
+
+    // ── Issue 5.1: VOLUNTARY_EXIT (P2, non-slashable, FR-13) ──────────────────
+
+    fn voluntary_exit_body(epoch: u64, validator_index: u64) -> String {
+        format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi},
+                  "voluntary_exit": {{ "epoch": "{epoch}", "validator_index": "{validator_index}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    /// A VOLUNTARY_EXIT body with an explicit `current_version` (drives the
+    /// EIP-7044 cap test) over the same gvr the other helpers use.
+    fn voluntary_exit_body_with_version(
+        epoch: u64,
+        validator_index: u64,
+        current_version_hex: &str,
+    ) -> String {
+        format!(
+            r#"{{ "type": "VOLUNTARY_EXIT",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
+                                             "current_version": "0x{cv}",
+                                             "epoch": "100" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "voluntary_exit": {{ "epoch": "{epoch}", "validator_index": "{validator_index}" }} }}"#,
+            cv = current_version_hex,
+            gvr = hex::encode(expected_gvr()),
+        )
+    }
+
+    /// KAT: the signing root is `DOMAIN_VOLUNTARY_EXIT` over the eth-types
+    /// `VoluntaryExit` SSZ object, and the BLS signature verifies.
+    #[tokio::test]
+    async fn voluntary_exit_kat_signs_under_voluntary_exit_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, CURRENT_VERSION, expected_gvr());
+        let exit = VoluntaryExit { epoch: 256, validator_index: 99 };
+        let expected = sk.sign(&compute_signing_root(&exit, domain)).to_bytes();
+        assert_eq!(sign_ok(voluntary_exit_body(256, 99)).await, expected.to_vec());
+    }
+
+    /// EIP-7044: the domain uses the request's `current_version` verbatim, so a
+    /// Capella-capped caller gets the Capella domain. Non-tautological — a
+    /// different fork version yields a different signature.
+    #[tokio::test]
+    async fn voluntary_exit_domain_uses_request_fork_version_eip7044() {
+        let (sk, _) = test_keypair();
+        let exit = VoluntaryExit { epoch: 300, validator_index: 7 };
+
+        // Caller supplies the Capella fork version (0x03000000) per EIP-7044.
+        let capella = [0x03u8, 0x00, 0x00, 0x00];
+        let domain_capella = compute_domain(DOMAIN_VOLUNTARY_EXIT, capella, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&exit, domain_capella)).to_bytes();
+        let got = sign_ok(voluntary_exit_body_with_version(300, 7, "03000000")).await;
+        assert_eq!(got, expected.to_vec(), "domain must use the request's (capped) version");
+
+        // A DIFFERENT fork version (Deneb) would produce a DIFFERENT signature —
+        // proving the request's version actually drives the domain.
+        let domain_deneb = compute_domain(DOMAIN_VOLUNTARY_EXIT, CURRENT_VERSION, expected_gvr());
+        let under_deneb = sk.sign(&compute_signing_root(&exit, domain_deneb)).to_bytes();
+        assert_ne!(got, under_deneb.to_vec(), "fork version must change the domain");
+    }
+
+    /// VOLUNTARY_EXIT requires fork_info (it is NOT the VALIDATOR_REGISTRATION
+    /// exception): an absent fork_info is a pre-gate 400.
+    #[tokio::test]
+    async fn voluntary_exit_missing_fork_info_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = r#"{ "type": "VOLUNTARY_EXIT",
+                        "voluntary_exit": { "epoch": "5", "validator_index": "9" } }"#
+            .to_string();
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A present, non-zero `signingRoot` that mismatches the server root → 400,
+    /// no gate call (the per-type signingRoot policy applies to this arm too).
+    #[tokio::test]
+    async fn voluntary_exit_signing_root_mismatch_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let bad = format!("0x{}", "ff".repeat(32));
+        let body = format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi}, "signingRoot": "{bad}",
+                  "voluntary_exit": {{ "epoch": "5", "validator_index": "9" }} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A malformed `voluntary_exit` payload (the required `validator_index` field
+    /// is missing) → fixed 400, no decoder leak.
+    #[tokio::test]
+    async fn voluntary_exit_malformed_payload_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi},
+                  "voluntary_exit": {{ "epoch": "5" }} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Issue 5.2: AGGREGATE_AND_PROOF_V2 (Electra, P2, FR-14) ────────────────
+
+    /// The Electra sibling of `sample_aggregate_and_proof`: same data, but the
+    /// `aggregate` is an `ElectraAttestation` carrying `committee_bits`.
+    fn sample_electra_aggregate_and_proof() -> ElectraAggregateAndProof {
+        ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: ElectraAttestation {
+                aggregation_bits: valid_agg_bits(),
+                data: sample_attestation(),
+                signature: dummy_sig(),
+                committee_bits: vec![0x01; 8], // 64-bit committee bitvector (EIP-7549)
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    /// KAT: the server root is `DOMAIN_AGGREGATE_AND_PROOF` (SAME as the base
+    /// type) over the eth-types Electra `tree_hash_root`, and the sig verifies.
+    /// The use of `DOMAIN_AGGREGATE_AND_PROOF` here is the domain assertion (not
+    /// a new/wrong constant).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_electra_kat() {
+        let agg = sample_electra_aggregate_and_proof();
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = agg.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    /// The base `AGGREGATE_AND_PROOF` arm is unaffected and does NOT collide with
+    /// the Electra V2 arm: same aggregator/data/sigs, but Electra's extra
+    /// `committee_bits` leaf yields a different SSZ root → a different signature.
+    #[tokio::test]
+    async fn base_and_electra_aggregate_and_proof_do_not_collide() {
+        let base = sample_aggregate_and_proof();
+        let electra = sample_electra_aggregate_and_proof();
+        let base_body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&base).unwrap(),
+        );
+        let electra_body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&electra).unwrap(),
+        );
+        assert_ne!(sign_ok(base_body).await, sign_ok(electra_body).await);
+    }
+
+    /// An over-length `aggregation_bits` bitlist surfaces as 400 via
+    /// `try_tree_hash_root`, never a panic (the liveness-DoS class).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_malformed_bits_is_400_not_panic() {
+        let mut agg = sample_electra_aggregate_and_proof();
+        // Past the EIP-7549 Electra limit (2048*64 = 131072 bits ≈ 16384 bytes).
+        agg.aggregate.aggregation_bits = vec![0xff; 20000];
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
+    }
+
+    /// An Electra `aggregate` missing the required `committee_bits` field is a
+    /// malformed V2 payload → fixed 400 (SEC-INFO-01, no decoder leak).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_missing_committee_bits_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let agg_json = format!(
+            r#"{{ "aggregator_index": "1",
+                  "aggregate": {{ "aggregation_bits": "0x01",
+                                  "data": {data},
+                                  "signature": "0x{sig}" }},
+                  "selection_proof": "0x{sp}" }}"#,
+            data = serde_json::to_string(&sample_attestation()).unwrap(),
+            sig = "ab".repeat(96),
+            sp = "cd".repeat(96),
+        );
+        let body = p1_body("AGGREGATE_AND_PROOF_V2", "aggregate_and_proof", agg_json);
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// AGGREGATE_AND_PROOF_V2 requires fork_info (not the VALIDATOR_REGISTRATION
+    /// exception): an absent fork_info is a pre-gate 400.
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_missing_fork_info_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2", "aggregate_and_proof": {agg} }}"#,
+            agg = serde_json::to_string(&sample_electra_aggregate_and_proof()).unwrap(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Issue 5.3: freeze the Electra mapping (spec-derived fixture) ──────────
+    //
+    // FR-31 freeze. Unlike the 5.2 KAT (which round-trips our OWN struct through
+    // serde_json::to_string and back — self-consistent, so blind to a
+    // Serialize/Deserialize field-name mismatch), this fixture is HAND-AUTHORED
+    // as a client sends it: the JSON structure + field names + encodings are
+    // written out literally, so it independently pins the wire shape the server's
+    // Deserialize must accept. CAVEAT: spec-derived (Ethereum Remote Signing API
+    // AGGREGATE_AND_PROOF_V2 schema), NOT a primary-source Lighthouse/Prysm
+    // Electra capture (none reachable here); a follow-up confirms it against a
+    // live capture once Electra traffic is available, fixing any casing/encoding
+    // discrepancy in request.rs/dispatch.rs then.
+
+    /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
+    /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
+    /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
+    /// Electra addition. Only the repetitive hex blobs are generated.
+    fn electra_v2_frozen_fixture() -> String {
+        format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
+                                             "current_version": "0x04000000",
+                                             "epoch": "100" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "aggregate_and_proof": {{
+                    "aggregator_index": "1",
+                    "aggregate": {{
+                      "aggregation_bits": "0x01",
+                      "data": {{ "slot": "5", "index": "0",
+                                "beacon_block_root": "0x{z}",
+                                "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                "target": {{ "epoch": "2", "root": "0x{z}" }} }},
+                      "signature": "0x{sig}",
+                      "committee_bits": "0x0101010101010101"
+                    }},
+                    "selection_proof": "0x{sp}"
+                  }} }}"#,
+            gvr = hex::encode(expected_gvr()),
+            z = "00".repeat(32),
+            sig = "ab".repeat(96),
+            sp = "cd".repeat(96),
+        )
+    }
+
+    /// The frozen wire body decodes (independent of this crate's Serialize) and
+    /// signs to the eth-types Electra `tree_hash_root` over the
+    /// `DOMAIN_AGGREGATE_AND_PROOF` domain — pinning the Electra serde shape.
+    #[tokio::test]
+    async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
+        let fixture = electra_v2_frozen_fixture();
+
+        // Decode the inner Electra object straight from the frozen wire JSON
+        // (the same `ElectraAggregateAndProof` serde the server's variant uses),
+        // NOT from our own serializer — this is the wire-shape freeze check.
+        let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+        let electra: ElectraAggregateAndProof =
+            serde_json::from_value(v["aggregate_and_proof"].clone()).unwrap();
+        assert!(!electra.aggregate.committee_bits.is_empty(), "Electra committee_bits decoded");
+
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = electra.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+
+        // The full frozen body through the real route signs to the same root →
+        // the server's parse + dispatch agree with the eth-types Electra root.
+        assert_eq!(sign_ok(fixture).await, expected.to_vec());
+    }
+
+    // ── Issue 5.4: all-types completeness + regression gate ──────────────────
+
+    /// One valid body per supported Web3Signer `type` (FR-4..FR-14) — every duty
+    /// a running validator performs. The full Web3Signer protocol also defines
+    /// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 11
+    /// here are the complete dispatchable set.
+    fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
+        vec![
+            ("BLOCK_V2", block_v2_body(0x11)),
+            ("ATTESTATION", attestation_body(None)),
+            ("RANDAO_REVEAL", randao_body(42)),
+            ("AGGREGATION_SLOT", aggregation_slot_body(77)),
+            (
+                "AGGREGATE_AND_PROOF",
+                p1_body(
+                    "AGGREGATE_AND_PROOF",
+                    "aggregate_and_proof",
+                    serde_json::to_string(&sample_aggregate_and_proof()).unwrap(),
+                ),
+            ),
+            (
+                "SYNC_COMMITTEE_MESSAGE",
+                p1_body(
+                    "SYNC_COMMITTEE_MESSAGE",
+                    "sync_committee_message",
+                    serde_json::to_string(&SyncCommitteeMessage {
+                        slot: 5,
+                        beacon_block_root: [0x22; 32],
+                        validator_index: 0,
+                        signature: dummy_sig(),
+                    })
+                    .unwrap(),
+                ),
+            ),
+            (
+                "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+                p1_body(
+                    "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+                    "contribution_and_proof",
+                    serde_json::to_string(&sample_contribution_and_proof()).unwrap(),
+                ),
+            ),
+            ("SYNC_COMMITTEE_SELECTION_PROOF", sync_selection_body(5, 1)),
+            ("VALIDATOR_REGISTRATION", registration_body(&sample_registration(), true)),
+            ("VOLUNTARY_EXIT", voluntary_exit_body(256, 99)),
+            ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
+        ]
+    }
+
+    /// Completeness: every supported type dispatches end-to-end to `200` with a
+    /// signature, after the P2 arms landed. A regression in any arm fails here.
+    #[tokio::test]
+    async fn all_supported_types_dispatch_to_200() {
+        let bodies = all_supported_type_bodies();
+        assert_eq!(bodies.len(), 11, "all FR-4..FR-14 types are covered");
+        for (type_name, body) in bodies {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let id = format!("0x{}", hex::encode(pk_bytes));
+            let resp = post_sign(state, &id, None, body).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{type_name} must dispatch to 200");
+        }
+    }
+
+    /// A bogus/unknown `type` is rejected with `400`, never a panic — the
+    /// dispatcher's tagged-enum decode fails closed.
+    #[tokio::test]
+    async fn unknown_type_returns_400_not_panic() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "NOT_A_REAL_TYPE", {fi}, "whatever": {{}} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Status-mapping spot-check after the P2 arms: a valid body to an unloaded
+    /// key still resolves to `404` pre-gate (the `412`/`500`/signingRoot-`400`
+    /// paths are covered by the per-type tests above).
+    #[tokio::test]
+    async fn completeness_unknown_key_still_404() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48));
+        let resp = post_sign(state, &id, None, voluntary_exit_body(7, 1)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `Accept` negotiation holds for the new P2 types: `text/plain` → bare
+    /// `0x..` (2 + 192 hex), JSON default → `{"signature":"0x.."}`.
+    #[tokio::test]
+    async fn p2_types_honor_accept_text_plain_and_json() {
+        for body in [voluntary_exit_body(7, 1), electra_v2_frozen_fixture()] {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let id = format!("0x{}", hex::encode(pk_bytes));
+
+            let r = post_sign(state.clone(), &id, Some("text/plain"), body.clone()).await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let t = String::from_utf8(body_bytes(r).await).unwrap();
+            assert!(t.starts_with("0x") && !t.contains('{'), "bare 0x body: {t}");
+            assert_eq!(t.len(), 2 + 192, "0x + 96-byte sig hex");
+
+            let r = post_sign(state, &id, None, body).await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let j = String::from_utf8(body_bytes(r).await).unwrap();
+            assert!(j.contains("\"signature\"") && j.contains("0x"), "json body: {j}");
+        }
+    }
+
+    /// The P2 arms inherit Phase-4 audit + metrics automatically: each emits an
+    /// audit line (type + success) and increments the per-type success counter,
+    /// matching FR-33/FR-34.
+    #[traced_test]
+    #[tokio::test]
+    async fn p2_types_emit_audit_and_metrics() {
+        for (type_name, body) in [
+            ("VOLUNTARY_EXIT", voluntary_exit_body(7, 1)),
+            ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
+        ] {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let metrics = Arc::clone(&state.metrics);
+            let id = format!("0x{}", hex::encode(pk_bytes));
+
+            let resp = post_sign(state, &id, None, body).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            assert_eq!(
+                metrics.http_sign_total.with_label_values(&[type_name, "success"]).get(),
+                1,
+                "{type_name} success metric fired"
+            );
+            assert!(logs_contain(&format!("rpc={type_name}")), "{type_name} audited");
+            assert!(logs_contain("result=success"));
+        }
+    }
+
+    // ── Issue 2.3: :9000 trace-continuity bridge ─────────────────────────────
+
+    /// `sign_span` parents the handler span from an inbound W3C `traceparent`
+    /// BEFORE the span is entered, so re-injecting from the (now parented) span
+    /// yields the SAME trace id — the duty trace continues across :9000. Uses the
+    /// proven `inject_trace_context` oracle under a real OTel layer.
+    #[test]
+    fn sign_span_continues_inbound_trace() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // `_guard` keeps the OTel pipeline alive for the test; it shuts down on
+        // drop (its `provider` is telemetry-private — no explicit flush needed,
+        // since these assertions read the span context locally, not an export).
+        let (layer, _guard) =
+            telemetry::init_tracing(&telemetry::TelemetryConfig::default()).expect("otel init");
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let mut inbound = axum::http::HeaderMap::new();
+        inbound
+            .insert("traceparent", format!("00-{trace_id}-b7ad6b7169203331-01").parse().unwrap());
+
+        let span = super::sign_span(&inbound);
+        let _enter = span.enter();
+        let mut outbound = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut outbound);
+        let tp =
+            outbound.get("traceparent").and_then(|v| v.to_str().ok()).expect("traceparent present");
+        assert!(tp.contains(trace_id), "sign_span must continue the inbound trace (got {tp})");
+    }
+
+    /// No inbound `traceparent`: `sign_span` yields a root span and does not panic.
+    #[test]
+    fn sign_span_without_traceparent_is_root_no_panic() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // `_guard` keeps the OTel pipeline alive for the test; it shuts down on
+        // drop (its `provider` is telemetry-private — no explicit flush needed,
+        // since these assertions read the span context locally, not an export).
+        let (layer, _guard) =
+            telemetry::init_tracing(&telemetry::TelemetryConfig::default()).expect("otel init");
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = super::sign_span(&axum::http::HeaderMap::new()); // must not panic
+        let _enter = span.enter();
+        let mut outbound = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut outbound);
+        if let Some(tp) = outbound.get("traceparent").and_then(|v| v.to_str().ok()) {
+            assert!(!tp.contains("00000000000000000000000000000000"), "fresh valid root");
+        }
+    }
+
+    /// A minted request_id is echoed as `x-request-id` on the response.
+    #[tokio::test]
+    async fn sign_echoes_minted_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id echoed");
+        // A v4 uuid string: 36 chars, 4 hyphens.
+        assert_eq!(rid.len(), 36, "minted request id is a uuid string: {rid}");
+        assert_eq!(rid.matches('-').count(), 4, "uuid hyphen grouping: {rid}");
+    }
+
+    /// A caller-supplied `x-request-id` is reused verbatim (not replaced).
+    #[tokio::test]
+    async fn sign_reuses_caller_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("x-request-id", "caller-correlator-xyz")
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("caller-correlator-xyz"),
+        );
+    }
+
+    /// SEC-2.3-01: an over-long caller `x-request-id` is NOT reused (it would
+    /// otherwise pollute the signing audit log); a fresh uuid is minted instead.
+    #[tokio::test]
+    async fn sign_ignores_unbounded_caller_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let oversized = "a".repeat(200); // past the 128-char cap → must be replaced
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("x-request-id", &oversized)
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id echoed");
+        assert_ne!(rid, oversized, "oversized caller id must not be reused");
+        assert_eq!(rid.len(), 36, "a fresh uuid is minted instead: {rid}");
+    }
+
+    /// The handler records the canonical correlators (`request_id`, `duty`,
+    /// `slot`, truncated `pubkey`) on the sign span; events under it (the audit
+    /// line) inherit them, and the FULL pubkey never appears.
+    #[traced_test]
+    #[tokio::test]
+    async fn sign_records_canonical_correlators_on_span() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(logs_contain("duty=attestation"), "canonical duty on span");
+        assert!(logs_contain("slot=5"), "canonical slot on span");
+        assert!(logs_contain("request_id="), "request_id on span");
+        assert!(logs_contain("pubkey="), "truncated pubkey on span");
+        let full = hex::encode(pk_bytes);
+        assert!(!logs_contain(&full), "full pubkey must never appear in logs");
+    }
+
+    /// A synthetic inbound `traceparent` does not break the live handler.
+    #[tokio::test]
+    async fn sign_with_inbound_traceparent_still_succeeds() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "handler works with inbound traceparent");
+    }
+}

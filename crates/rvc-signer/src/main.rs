@@ -1,0 +1,1280 @@
+//! rvc-signer binary entry point.
+//!
+//! All implementation lives in `lib.rs` (crate root for the library target).
+//! This file only handles CLI parsing and wires up the library.
+
+use rvc_signer_bin::{
+    backend, config, http_api, insecure_startup, metrics, reload, service, slashing, tls,
+    SignerServiceServerV2,
+};
+#[cfg(feature = "dvt")]
+use rvc_signer_bin::{dvt, PeerSignerServiceServerV2};
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::{Parser, Subcommand};
+use tracing::{error, info};
+#[cfg(feature = "dvt")]
+use zeroize::Zeroizing;
+
+const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
+
+/// Signing backend type.
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum Backend {
+    /// Local keystore-based signing
+    Basic,
+    /// Distributed Validator Technology (DVT) signing
+    #[cfg(feature = "dvt")]
+    Dvt,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic => write!(f, "basic"),
+            #[cfg(feature = "dvt")]
+            Self::Dvt => write!(f, "dvt"),
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(name = "rvc-signer")]
+#[command(version)]
+#[command(about = "Remote BLS signer for rvc validator client", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+// `Serve` carries the full server-config arg set and is necessarily larger than
+// `SplitKey`. This enum is parsed exactly once at startup and immediately
+// matched/consumed, so the variant-size disparity costs nothing — boxing the
+// variant is not an option because clap's `Subcommand` derive requires the field
+// to implement `Args`, which `Box<ServeArgs>` does not.
+#[allow(clippy::large_enum_variant)]
+enum Command {
+    /// Start the gRPC signing server
+    Serve(ServeArgs),
+
+    /// Split a BLS secret key into Shamir shares stored as EIP-2335 keystores
+    #[cfg(feature = "dvt")]
+    SplitKey(SplitKeyCliArgs),
+}
+
+#[derive(Parser)]
+struct ServeArgs {
+    /// Path to config.toml file
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// gRPC listen address (host:port)
+    #[arg(long, default_value = DEFAULT_LISTEN_ADDRESS)]
+    listen_address: String,
+
+    /// Path to the keystore directory
+    #[arg(long)]
+    keystore_dir: Option<PathBuf>,
+
+    /// Path to a single password file used for all keystores
+    #[arg(long)]
+    password_file: Option<PathBuf>,
+
+    /// Path to the TLS certificate file (PEM)
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to the TLS private key file (PEM)
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// Path to the TLS CA certificate file for client authentication (PEM)
+    #[arg(long)]
+    tls_ca_cert: Option<PathBuf>,
+
+    /// Enable the Web3Signer HTTP Remote Signing API (opt-in; gRPC stays on).
+    /// Parsed/resolved only for now; the listener is wired in a later phase.
+    #[arg(long, default_value_t = false)]
+    http_enabled: bool,
+
+    /// HTTP Remote Signing API listen address (host:port). Default :9000.
+    #[arg(long, default_value = config::DEFAULT_HTTP_LISTEN_ADDRESS)]
+    http_listen_address: String,
+
+    /// HTTP API TLS mode: "mtls" (default) or "server-tls-only".
+    #[arg(long, default_value = config::DEFAULT_HTTP_TLS_MODE)]
+    http_tls_mode: String,
+
+    /// HTTP API server certificate (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    http_tls_cert: Option<PathBuf>,
+
+    /// HTTP API server private key (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    http_tls_key: Option<PathBuf>,
+
+    /// HTTP API client CA certificate (PEM). Required in both TLS modes.
+    #[arg(long)]
+    http_tls_ca_cert: Option<PathBuf>,
+
+    /// Validate configuration and exit without starting the server
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Allow starting without TLS (NOT recommended for production)
+    #[arg(long)]
+    insecure: bool,
+
+    /// Data directory for signer state (default: parent of keystore_dir).
+    /// The slashing protection DB is stored here as signer-slashing.db.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Disable slashing protection (UNSAFE).
+    /// Requires ALSO setting RVC_ALLOW_INSECURE=true in the environment.
+    /// Both checks are required to prevent accidental opt-out.
+    #[arg(long)]
+    disable_slashing_protection: bool,
+
+    /// Allow creating a fresh empty signer slashing DB when the path is missing
+    /// (SEC-3). DANGEROUS on a previously-active signer: the new DB has zero
+    /// signing history and can enable double-signing / slashing. Use only for
+    /// genuine first-time deployments. A 0-byte or corrupt DB is always a hard
+    /// error regardless of this flag.
+    #[arg(long, default_value_t = false)]
+    init_slashing_db: bool,
+
+    /// Signing backend to use
+    #[arg(long, value_enum, default_value_t = Backend::Basic)]
+    backend: Backend,
+
+    /// Prometheus metrics listen address (host:port)
+    #[arg(long, default_value = "127.0.0.1:9101")]
+    metrics_address: String,
+
+    /// Enable keystore hot-reload (ISSUE-4.6 / L-6).
+    ///
+    /// Disabled by default. When enabled, the signer periodically rescans
+    /// `keystore_dir` and reconciles the loaded set with files on disk —
+    /// a key-injection vector if the directory is writable by anyone other
+    /// than the signer UID. Requires the directory to be 0o700 and owned
+    /// by the signer UID at every reload pass; otherwise the reload is
+    /// skipped with a warn log.
+    #[arg(long, default_value_t = false)]
+    enable_hot_reload: bool,
+
+    /// Keystore hot-reload interval in seconds (only honoured when
+    /// `--enable-hot-reload` is set).
+    #[arg(long, default_value = "30")]
+    reload_interval: u64,
+
+    /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
+    ///
+    /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and swaps
+    /// the active log filter in place — raising or lowering verbosity without a
+    /// restart. Disabled by default so the steady-state log path is unchanged;
+    /// the always-on reload *layer* is free on the disabled hot path either way.
+    /// Distinct from `--enable-hot-reload` (which reloads keystores, not logs).
+    #[arg(long, default_value_t = false)]
+    enable_log_reload: bool,
+
+    /// Console log output format: `pretty` (default, human-readable) or `json`
+    /// (one structured object per event, for log-aggregation backends). Also
+    /// settable via the `RVC_LOG_FORMAT` env var; an explicit flag wins. Identical
+    /// to `bin/rvc`'s `--log-format` (issue 5.5); console-only (rvc-signer wires no
+    /// file appender, see ADR-004 / OPERATOR_GUIDE §7).
+    #[arg(long, default_value = "pretty")]
+    log_format: String,
+
+    /// Comma-separated list of DVT peer addresses (host:port)
+    #[cfg(feature = "dvt")]
+    #[arg(long, value_delimiter = ',')]
+    dvt_peers: Vec<String>,
+
+    /// DVT threshold for signature reconstruction
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_threshold: Option<u64>,
+
+    /// This node's DVT share index
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_index: Option<u64>,
+
+    /// DVT per-peer RPC timeout in milliseconds
+    #[cfg(feature = "dvt")]
+    #[arg(long, default_value = "2000")]
+    dvt_timeout: u64,
+
+    /// Path to the DVT allow-list TOML file (required when backend=dvt).
+    /// Format: [[peer]] entries with peer_cn and share_index.
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_allowed_peers: Option<PathBuf>,
+
+    /// Path to the primary (non-DVT) client-CN allow-list TOML (SEC-4).
+    ///
+    /// Optional. When set, only listed mTLS Common Names may invoke signing
+    /// RPCs on the primary `SignerService`. Format:
+    ///
+    /// ```toml
+    /// [[client]]
+    /// client_cn = "validator-client-1.local"
+    /// ```
+    ///
+    /// When unset, a startup warning is logged and any CA-issued client cert is
+    /// accepted (backward compatible). mTLS remains mandatory either way.
+    #[arg(long)]
+    allowed_client_cns: Option<PathBuf>,
+}
+
+#[cfg(feature = "dvt")]
+#[derive(Parser)]
+struct SplitKeyCliArgs {
+    /// Path to the source EIP-2335 keystore
+    #[arg(long)]
+    keystore: PathBuf,
+
+    /// Password for the source keystore
+    #[arg(long, group = "src_password")]
+    password: Option<String>,
+
+    /// Path to a file containing the source keystore password
+    #[arg(long, group = "src_password")]
+    password_file: Option<PathBuf>,
+
+    /// Threshold (t) for Shamir secret sharing
+    #[arg(long)]
+    threshold: u64,
+
+    /// Total number of shares (n) to generate
+    #[arg(long)]
+    shares: u64,
+
+    /// Output directory for share keystores
+    #[arg(long)]
+    output_dir: PathBuf,
+
+    /// Password for the output share keystores
+    #[arg(long, group = "out_password")]
+    output_password: Option<String>,
+
+    /// Path to a file containing the password for output share keystores
+    #[arg(long, group = "out_password")]
+    output_password_file: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() {
+    // Logging output is console-only (stdout/stderr); operators collect rvc-signer
+    // logs from the process's standard streams. Unlike `bin/rvc`, rvc-signer does
+    // NOT wire the telemetry file appender, so there is no independent file level:
+    // file == console (ADR-004 "file more verbose than console" does not apply here).
+    //
+    // Phase-3 issue 3.5 spike conclusion: the appender itself *is* capable of an
+    // independent file level — `telemetry::create_file_layer` filters each file
+    // layer with its own `EnvFilter::new(config.level)` (see
+    // `crates/telemetry/src/file_appender.rs`), exactly as `bin/rvc` uses it.
+    // Delivering it for rvc-signer would require a new `--logfile`/`logfile_level`
+    // CLI + `ResolvedConfig` surface (it has none today); per 3.5's bounded scope
+    // it is deferred as a documented fallback rather than a rushed file path in a
+    // security-sensitive signer; the console-only status is stated in the Phase-5
+    // OPERATOR_GUIDE.
+    // Parse the CLI BEFORE initializing logging so the `Serve` subcommand's
+    // `--log-format` flag can select the console format (issue 5.5). Nothing logs
+    // between parse and init, so the Phase-3 init parity (the reconciled filter is
+    // still the first subscriber installed) is preserved. One-shot subcommands
+    // without the flag (e.g. `split-key`) resolve the format from `RVC_LOG_FORMAT`
+    // env only (default pretty) via `resolve(None)`.
+    let cli = Cli::parse();
+
+    let log_format = match &cli.command {
+        Command::Serve(args) => telemetry::LogFormat::resolve(Some(&args.log_format)),
+        #[cfg(feature = "dvt")]
+        Command::SplitKey(_) => telemetry::LogFormat::resolve(None),
+    };
+
+    let reload_handle = init_logging(log_format);
+
+    match cli.command {
+        Command::Serve(args) => {
+            if let Err(e) = run_serve(args, reload_handle).await {
+                error!(error = %e, "rvc-signer failed");
+                std::process::exit(1);
+            }
+
+            info!("Shutting down rvc-signer");
+        }
+        #[cfg(feature = "dvt")]
+        Command::SplitKey(args) => {
+            if let Err(e) = run_split_key(args) {
+                error!(error = %e, "split-key failed");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Initialize the console-only tracing subscriber and return a type-erased
+/// handle to the runtime-reloadable log filter (issue 5.4 / P2-2).
+///
+/// The reconciled `EnvFilter` (unset/empty/malformed `RUST_LOG` → `info`, env
+/// otherwise wins — ADR-003) is wrapped in a `reload::Layer` so its value can be
+/// swapped at runtime. The **initial value is exactly `env_filter_or("info")`**,
+/// so this produces byte-for-byte identical *user-visible* output to the previous
+/// bare `fmt().with_env_filter(env_filter_or("info"))` — the Phase-3 cross-binary
+/// init parity is preserved.
+///
+/// Moving from the `fmt()` builder to a `registry()` + `fmt::layer()` composition
+/// flips `log_internal_errors` from `true` to `false`; this is now `false`,
+/// matching `bin/rvc` (which already composes via `registry()`). The only
+/// behavioral difference is the rare diagnostic emitted when the fmt writer
+/// itself errors — intentionally consistent across both binaries, not an operator
+/// path. The reload layer is the outer global filter over a single `fmt::layer`;
+/// a disabled `debug!`/`trace!` callsite short-circuits in the macro before
+/// reaching it (Gate 4 / P0-6 unaffected). The opt-in `SIGHUP` trigger (gated by
+/// `--enable-log-reload`) is wired in `run_serve`.
+///
+/// `log_format` selects the CONSOLE rendering (issue 5.5): `Pretty` (default,
+/// byte-identical to the previous bare `fmt::layer()`) or `Json` (one structured
+/// object per event, for log aggregation). Both arms keep the same reload
+/// composition — the 5.4 reload-wrapped reconciled filter is the outer global
+/// layer over a single console `fmt` layer — so Phase-3 init parity holds for
+/// either format.
+fn init_logging(log_format: telemetry::LogFormat) -> telemetry::LogReloadHandle {
+    use tracing_subscriber::prelude::*;
+
+    let (filter, handle) = telemetry::reloadable_env_filter("info");
+    let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
+    tracing_subscriber::registry().with(console_layer).with(filter).init();
+    telemetry::LogReloadHandle::new("info", handle)
+}
+
+async fn run_serve(
+    args: ServeArgs,
+    reload_handle: telemetry::LogReloadHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Install the rustls crypto provider before any TLS work. Idempotent and
+    // safe even with HTTP disabled. Forward-defense (ADR-006, R1): pins a single
+    // explicit default so the Phase-3 `ServerConfig::builder()` path stays
+    // deterministic and never hits rustls's automatic resolution, which panics
+    // if the feature graph ever compiles in more than one provider. Not
+    // load-bearing in today's ring-only build; see http_api::tls for details.
+    http_api::tls::install_crypto_provider();
+
+    let resolved = resolve_config(&args)?;
+
+    info!(
+        listen_address = %resolved.listen_address,
+        keystore_dir = %resolved.keystore_dir.display(),
+        backend = %resolved.backend,
+        "Starting rvc-signer"
+    );
+
+    let password = config::load_serve_password(&resolved)?;
+
+    let tls_config = match (
+        resolved.tls_cert.as_ref(),
+        resolved.tls_key.as_ref(),
+        resolved.tls_ca_cert.as_ref(),
+    ) {
+        (Some(cert), Some(key), Some(ca)) => {
+            Some(rvc_signer_bin::tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
+        }
+        _ => None,
+    };
+
+    // Set up Prometheus metrics early so DVT backend can use them
+    let signer_metrics = Arc::new(metrics::SignerMetrics::new());
+
+    // Build the signing backend and optional share-map for the PeerSignerService.
+    // The PeerSignerService is constructed later (after the slashing DB is opened),
+    // so build_dvt_backend returns the raw share_map rather than a complete service.
+    //
+    // The allow-list is loaded ONCE here (DVT arm only) and shared between the
+    // client-side SNI derivation (build_dvt_backend) and the server-side
+    // PeerSignerService (constructed below).  This avoids a TOCTOU double-read
+    // and ensures both paths see the same allow-list snapshot (ISSUE-4.1 / L-1).
+    #[cfg(feature = "dvt")]
+    type ShareMap = Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>;
+
+    // Separate variable to capture the allow-list from the DVT arm without
+    // pushing the match binding into clippy::type_complexity territory.
+    #[cfg(feature = "dvt")]
+    let mut dvt_allow_list_opt: Option<Arc<dvt::allow_list::AllowedPeers>> = None;
+
+    #[cfg(feature = "dvt")]
+    let (signing_backend, dvt_share_map_opt, basic_signer_ref): (
+        Arc<dyn backend::SigningBackend>,
+        Option<ShareMap>,
+        Option<Arc<backend::basic::BasicSigner>>,
+    ) = match parse_backend(&resolved.backend)? {
+        Backend::Basic => {
+            let signer =
+                Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+            (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
+        }
+        Backend::Dvt => {
+            // Load allow-list once; shared by client SNI pinning + server peer service.
+            let allow_list: Option<Arc<dvt::allow_list::AllowedPeers>> =
+                if let Some(path) = args.dvt_allowed_peers.as_deref() {
+                    let al = dvt::allow_list::AllowedPeers::load_from_path(path)
+                        .map_err(|e| format!("failed to load DVT allow-list: {e}"))?;
+                    info!(
+                        path = %path.display(),
+                        peer_count = al.peers.len(),
+                        "Loaded DVT allow-list"
+                    );
+                    Some(Arc::new(al))
+                } else {
+                    None
+                };
+
+            let (backend, share_map) = build_dvt_backend(
+                &resolved,
+                &password,
+                tls_config.as_ref(),
+                Arc::new(signer_metrics.dvt.clone()),
+                allow_list.clone(),
+            )
+            .await?;
+
+            dvt_allow_list_opt = allow_list;
+            (backend, Some(share_map), None)
+        }
+    };
+
+    #[cfg(not(feature = "dvt"))]
+    let (signing_backend, _peer_signer_service, basic_signer_ref): (
+        Arc<dyn backend::SigningBackend>,
+        Option<()>,
+        Option<Arc<backend::basic::BasicSigner>>,
+    ) = {
+        let signer =
+            Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+        (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
+    };
+
+    // Validate TLS certificates if provided
+    if let Some(ref tls) = tls_config {
+        tls.to_server_tls_config()?;
+    }
+
+    if resolved.dry_run {
+        println!("Configuration valid:");
+        println!("  Backend: {}", resolved.backend);
+        println!("  Keys loaded: {}", signing_backend.public_keys().len());
+        if tls_config.is_some() {
+            println!("  TLS: certificates valid");
+        } else {
+            println!("  TLS: disabled");
+        }
+        #[cfg(feature = "dvt")]
+        if resolved.backend == "dvt" {
+            println!("  DVT peers: {}", resolved.dvt_peers.len());
+            if let Some(threshold) = resolved.dvt_threshold {
+                println!("  DVT threshold: {}", threshold);
+            }
+            if let Some(index) = resolved.dvt_index {
+                println!("  DVT index: {}", index);
+            }
+        }
+        return Ok(());
+    }
+
+    // ISSUE-4.6 / L-6: keystore hot-reload is opt-in.  The reloader is only
+    // spawned when `--enable-hot-reload` is set (or the equivalent TOML key
+    // is true) AND `reload_interval_secs > 0`.  Each reload pass also
+    // enforces a strict 0o700 / signer-UID-owned directory check before
+    // touching keys (see `reload.rs::scan_and_reload`).
+    if let Some(ref basic_signer) = basic_signer_ref {
+        if resolved.enable_hot_reload && resolved.reload_interval_secs > 0 {
+            let reloader = reload::KeystoreReloader::new(
+                resolved.keystore_dir.clone(),
+                password.clone(),
+                std::time::Duration::from_secs(resolved.reload_interval_secs),
+                Arc::clone(basic_signer),
+            );
+
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                reloader.run(cancel_clone).await;
+            });
+
+            info!(
+                interval_secs = resolved.reload_interval_secs,
+                "Keystore hot-reload enabled (--enable-hot-reload)"
+            );
+        } else if resolved.reload_interval_secs > 0 {
+            // Operators upgrading from a previous release where the reloader
+            // ran by default with a 30s interval will see this notice once
+            // at startup if they had a non-zero interval configured.
+            info!(
+                "Keystore hot-reload disabled (set --enable-hot-reload to opt in; \
+                 ISSUE-4.6 / L-6)"
+            );
+        }
+    }
+
+    // Set up Prometheus metrics server
+    let key_count = signing_backend.public_keys().len() as f64;
+    signer_metrics.keys_loaded.with_label_values(&[&resolved.backend]).set(key_count);
+
+    let metrics_addr: std::net::SocketAddr = args.metrics_address.parse()?;
+    let (_metrics_handle, metrics_bound_addr) =
+        metrics::serve_metrics(metrics_addr, Arc::clone(&signer_metrics)).await?;
+    info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
+
+    // ── Slashing protection gate (OQ-A4 binding decision) ────────────────────
+    //
+    // rvc-signer refuses to start without a SlashingDb unless:
+    //   (a) --disable-slashing-protection is on the CLI, AND
+    //   (b) RVC_ALLOW_INSECURE=true is set in the environment.
+    //
+    // Both checks are required so a stray env-var leak cannot silently disable
+    // slashing protection.
+    let data_dir = args.data_dir.as_deref().or_else(|| resolved.keystore_dir.parent());
+
+    let slashing_cfg =
+        slashing::SlashingDbConfig::from_env(data_dir, args.disable_slashing_protection);
+    slashing_cfg.validate().map_err(|e| {
+        error!(error = %e, "slashing protection configuration error");
+        e
+    })?;
+
+    let slashing_db_opt: Option<Arc<::slashing::SlashingDb>> = if slashing_cfg.mode
+        == slashing::SlashingProtectionMode::DisabledBothFlags
+    {
+        None
+    } else if let Some(ref db_path) = slashing_cfg.db_path {
+        info!(path = %db_path.display(), "Opening slashing protection database");
+        // SEC-3: fail closed on missing path without --init-slashing-db; 0-byte /
+        // corrupt header is always rejected inside open_with_create_info.
+        if db_path.exists() {
+            let meta = std::fs::metadata(db_path).map_err(|e| {
+                format!("failed to stat slashing DB at {}: {}", db_path.display(), e)
+            })?;
+            if meta.len() == 0 {
+                return Err(format!(
+                    "slashing protection database at {} is empty (0-byte). \
+                     This is corruption, not a fresh init — restore from backup. \
+                     --init-slashing-db cannot override this.",
+                    db_path.display()
+                )
+                .into());
+            }
+        } else if !args.init_slashing_db {
+            return Err(format!(
+                "slashing protection database does not exist at {}. \
+                 Refusing to create a fresh empty DB (would sign with zero history). \
+                 For a genuine new deployment, pass --init-slashing-db. \
+                 If this path should hold existing history, restore the DB from backup.",
+                db_path.display()
+            )
+            .into());
+        } else {
+            error!(
+                path = %db_path.display(),
+                "CREATING A NEW EMPTY SIGNER SLASHING PROTECTION DATABASE. \
+                 This DB has ZERO signing history. If this signer was previously \
+                 active, signing with a fresh DB can DOUBLE-SIGN and get validators \
+                 SLASHED. Only proceed for a genuine first-time deployment. \
+                 Opt-in was granted via --init-slashing-db."
+            );
+        }
+
+        let (db, created_fresh) = ::slashing::SlashingDb::open_with_create_info(db_path)
+            .map_err(|e| format!("failed to open slashing DB at {}: {}", db_path.display(), e))?;
+        // TOCTOU close: refuse accidental create if path vanished mid-startup.
+        if created_fresh && !args.init_slashing_db {
+            drop(db);
+            let _ = std::fs::remove_file(db_path);
+            return Err(format!(
+                "slashing protection database was created at {} without \
+                 --init-slashing-db (possible TOCTOU / missing volume). \
+                 Refusing to sign with zero history. Restore from backup or \
+                 re-run with --init-slashing-db for a genuine first deploy.",
+                db_path.display()
+            )
+            .into());
+        }
+        Some(Arc::new(db))
+    } else {
+        None
+    };
+
+    // Build the v2 service implementation (RF2-17: v1 proto surface is gone).
+    // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` at the
+    // composition root, then inject the same `Arc` into BOTH the gRPC service and
+    // the HTTP listener (Issue 3.5). `None` when slashing protection is disabled
+    // (the gRPC `new()` path and the HTTP no-gate refusal below both handle it).
+    let shared_gate: Option<Arc<signer::SigningGate>> = slashing_db_opt.as_ref().map(|db| {
+        Arc::new(service::SignerServiceImpl::build_gate(
+            Arc::clone(&signing_backend),
+            Arc::clone(db),
+        ))
+    });
+
+    // SEC-4: optional primary-path client-CN allow-list. When unset, warn and
+    // accept any mTLS client (backward compatible). mTLS still mandatory.
+    let client_cn_allow_list: Option<Arc<rvc_signer_bin::audit::ClientCnAllowList>> =
+        if let Some(path) = args.allowed_client_cns.as_deref() {
+            let list = rvc_signer_bin::audit::ClientCnAllowList::load_from_path(path)
+                .map_err(|e| format!("failed to load client-CN allow-list: {e}"))?;
+            info!(
+                path = %path.display(),
+                client_count = list.len(),
+                "Loaded primary client-CN allow-list (SEC-4)"
+            );
+            Some(Arc::new(list))
+        } else {
+            rvc_signer_bin::audit::log_missing_client_cn_allow_list_warning();
+            None
+        };
+
+    let svc_v2 = if let Some(ref shared_gate) = shared_gate {
+        service::SignerServiceImpl::new_v2_with_gate(
+            Arc::clone(&signing_backend),
+            resolved.backend.clone(),
+            Arc::clone(shared_gate),
+        )
+        .with_metrics(Arc::clone(&signer_metrics))
+        .with_client_cn_allow_list(client_cn_allow_list.clone())
+    } else {
+        service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
+            .with_metrics(Arc::clone(&signer_metrics))
+            .with_client_cn_allow_list(client_cn_allow_list.clone())
+    };
+
+    // Build the PeerSignerService (DVT) now that we have the slashing DB.
+    // The allow-list was already loaded and validated above (hoisted from here
+    // to avoid a double file-read — ISSUE-4.1 / L-1 DRY fix).
+    #[cfg(feature = "dvt")]
+    let peer_signer_service: Option<dvt::peer_service::PeerSignerServiceImpl> =
+        if let Some(share_map) = dvt_share_map_opt {
+            // Reuse the Arc loaded in the Backend::Dvt arm above.
+            let allow_list = dvt_allow_list_opt.ok_or(
+                "DVT is enabled but --dvt-allowed-peers was not provided. \
+                 Create a dvt-allowed-peers.toml file and pass its path via --dvt-allowed-peers.",
+            )?;
+            let peer_svc = dvt::peer_service::PeerSignerServiceImpl::new(
+                share_map,
+                allow_list,
+                slashing_db_opt.clone(),
+            );
+            Some(peer_svc)
+        } else {
+            None
+        };
+
+    let addr = resolved.listen_address.parse()?;
+
+    // ── M-10: hardened server builder (concurrency + timeout limits) ──────────
+    //
+    // `hardened_server_builder()` applies per research/05 §"Recommended values":
+    //   - concurrency_limit_per_connection(32) — Tower-level cap per connection
+    //   - max_concurrent_streams(Some(64))     — H2 SETTINGS frame to clients
+    //   - timeout(Duration::from_secs(10))     — per-request timeout via Tower
+    //
+    // Per-service max_decoding_message_size(1 MiB) is set on each ServiceServer
+    // below (Tonic exposes it only at the service level, not the builder level).
+    let mut builder = tls::server_builder::hardened_server_builder();
+
+    if let Some(ref tls_cfg) = tls_config {
+        let server_tls = tls_cfg.to_server_tls_config()?;
+        builder = builder.tls_config(server_tls)?;
+        info!("mTLS enabled");
+    } else if args.insecure {
+        // ── H-9: env-var double-confirm + loopback gate ───────────────────
+        //
+        // `--insecure` requires BOTH `RVC_SIGNER_ALLOW_INSECURE=true` in the
+        // environment AND a loopback bind address.  Per NFR-10 / ISSUE-3.13
+        // (GA tag) the gate now runs in Refuse mode: startup hard-fails when
+        // the opt-in conditions are not fully met.
+        insecure_startup::check_insecure_startup(true, addr, crypto::InsecureMode::Refuse)
+            .map_err(|e| {
+                error!(error = %e, "insecure startup refused by gate");
+                e
+            })?;
+        tracing::warn!("TLS disabled via --insecure flag. Do NOT use in production!");
+    } else {
+        return Err("TLS is required. Provide --tls-cert, --tls-key, and --tls-ca-cert, \
+             or use --insecure to disable (NOT recommended for production)."
+            .into());
+    }
+
+    // ── Web3Signer HTTP API listener (Issue 3.5, FR-25/26/27, ADR-001) ────────
+    //
+    // Opt-in via `[signer.http]`; gRPC stays default-on and unchanged. The HTTP
+    // state carries the SAME `Arc<SigningGate>` injected into the gRPC service
+    // (FR-26), so slashing protection + the in-memory `ValidatorLockMap` are
+    // unified across both transports. A panic in an HTTP connection task is
+    // isolated and never touches the gRPC accept loop (Issue 3.3).
+    let http_shutdown = tokio_util::sync::CancellationToken::new();
+    let http_handle = if resolved.http_enabled {
+        // Fail closed: the HTTP API requires the shared gate. Running a remote
+        // signer's HTTP API without slashing protection is refused at startup
+        // (stricter than the gRPC per-request `require_gate()` 500).
+        let gate = shared_gate.clone().ok_or(
+            "[signer.http] is enabled but slashing protection is disabled. The HTTP \
+             API requires the shared signing gate; enable slashing protection or \
+             disable the HTTP API.",
+        )?;
+        let cert = resolved
+            .http_tls_cert
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_cert is not set")?;
+        let key = resolved
+            .http_tls_key
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_key is not set")?;
+        let ca = resolved
+            .http_tls_ca_cert
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_ca_cert is not set")?;
+
+        let state = http_api::Web3SignerState {
+            gate,
+            backend: Arc::clone(&signing_backend),
+            // Record the active backend label ("basic"/"dvt") in HTTP audit lines
+            // so they line up with the gRPC metrics `backend` label (Issue 4.4).
+            audit: http_api::AuditCfg {
+                backend_name: resolved.backend.clone(),
+                ..http_api::AuditCfg::default()
+            },
+            // Share the one SignerMetrics registry so HTTP-path series land on the
+            // same `:9101` scrape as the gRPC series (Issue 4.5).
+            metrics: Arc::clone(&signer_metrics),
+            // SEC-4 residual F1: same primary client-CN allow-list as gRPC so
+            // HTTP cannot bypass `--allowed-client-cns` as a parallel oracle.
+            client_cn_allow_list: client_cn_allow_list.clone(),
+        };
+        let (bound, handle) = http_api::tls::spawn_https_listener(
+            &resolved.http_listen_address,
+            cert,
+            key,
+            ca,
+            resolved.http_tls_mode,
+            state,
+            http_shutdown.clone(),
+        )
+        .await?;
+        info!(address = %bound, tls_mode = ?resolved.http_tls_mode, "Web3Signer HTTP API listening");
+        Some(handle)
+    } else {
+        None
+    };
+
+    info!(address = %addr, "gRPC server listening");
+
+    // 1 MiB per-message decode cap (M-10): blocks memory-pressure via oversized
+    // request bodies.  Signing a BeaconBlock is well under 1 MiB after SSZ
+    // encoding; 1 MiB is a comfortable upper bound per research/05.
+    const MAX_DECODE_BYTES: usize = 1 << 20; // 1 MiB
+
+    // SS-1 (Issue 2.2): only the v2 typed-RPC service is registered.
+    // The v1 raw-root service has been removed from the live listener.
+    let router = builder.add_service(
+        SignerServiceServerV2::new(svc_v2).max_decoding_message_size(MAX_DECODE_BYTES),
+    );
+
+    #[cfg(feature = "dvt")]
+    let router = if let Some(peer_svc) = peer_signer_service {
+        info!("PeerSignerService v2 registered for DVT");
+        router.add_service(
+            PeerSignerServiceServerV2::new(peer_svc).max_decoding_message_size(MAX_DECODE_BYTES),
+        )
+    } else {
+        router
+    };
+
+    // Runtime log-level reload (issue 5.4 / P2-2), opt-in via `--enable-log-reload`.
+    // Mirrors the `--enable-hot-reload` keystore opt-in conventions (a `--enable-*`
+    // flag + a `CancellationToken`-scoped task), but reloads the LOG filter, not
+    // keystores. On SIGHUP it re-reads `RUST_LOG` and swaps the active filter in
+    // place — no restart, no new network endpoint.
+    let log_reload_shutdown = tokio_util::sync::CancellationToken::new();
+    spawn_log_reload_handler(args.enable_log_reload, reload_handle, log_reload_shutdown.clone());
+
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
+
+    // gRPC has shut down (Ctrl+C). Stop the SIGHUP log-reload task, then stop the
+    // HTTP listener accepting new connections and drain any in-flight `/sign`
+    // (bounded inside serve_https).
+    log_reload_shutdown.cancel();
+    http_shutdown.cancel();
+    if let Some(handle) = http_handle {
+        let _ = handle.await;
+    }
+
+    Ok(())
+}
+
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+///
+/// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
+/// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
+/// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
+/// filter, raising/lowering verbosity without a restart. The task is scoped to
+/// `shutdown_token` so it exits cleanly when the server stops. On non-Unix
+/// targets there is no `SIGHUP`; the flag is accepted but inert (logged once).
+fn spawn_log_reload_handler(
+    enabled: bool,
+    reload_handle: telemetry::LogReloadHandle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if !enabled {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGHUP handler; log reload disabled");
+                        return;
+                    }
+                };
+            info!("Runtime log-level reload enabled (send SIGHUP to re-read RUST_LOG)");
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            break;
+                        }
+                        match reload_handle.reload_from_env() {
+                            Ok(()) => info!("Reloaded log filter from RUST_LOG (SIGHUP)"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "log-filter reload failed (subscriber gone?)")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (reload_handle, shutdown_token);
+        tracing::warn!(
+            "--enable-log-reload set, but SIGHUP-based reload is only supported on Unix"
+        );
+    }
+}
+
+/// Returns the DVT signing backend AND the share map (for `PeerSignerService`).
+/// The share map is returned separately so the caller can build `PeerSignerServiceImpl`
+/// AFTER the slashing DB is opened (allowing CN-scoped slashing for DVT peers).
+///
+/// `allow_list`: the pre-loaded allow-list (hoisted from `run_serve` to avoid a
+/// double file-read).  When TLS is enabled, `build_peer_connect_infos` requires
+/// this to be `Some` and every `dvt_peers` address to have a matching entry —
+/// any gap is a startup error (ISSUE-4.1 / L-1: no silent SNI bypass).
+#[cfg(feature = "dvt")]
+async fn build_dvt_backend(
+    resolved: &config::ResolvedConfig,
+    password: &Zeroizing<String>,
+    tls_config: Option<&rvc_signer_bin::tls::TlsConfig>,
+    dvt_metrics: Arc<metrics::DvtMetrics>,
+    allow_list: Option<Arc<dvt::allow_list::AllowedPeers>>,
+) -> Result<
+    (
+        Arc<dyn backend::SigningBackend>,
+        Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let dvt_index = resolved.dvt_index.ok_or("dvt_index is required when using backend dvt")?;
+
+    let timeout = Duration::from_millis(resolved.dvt_timeout_ms);
+
+    let shares = dvt::types::load_shares(&resolved.keystore_dir, password)
+        .map_err(|e| format!("failed to load DVT shares: {}", e))?;
+
+    if shares.is_empty() {
+        return Err("no DVT shares found in keystore directory".into());
+    }
+
+    info!(
+        share_count = shares.len(),
+        dvt_index,
+        peer_count = resolved.dvt_peers.len(),
+        "Loaded DVT shares"
+    );
+
+    let share_map: HashMap<[u8; 48], dvt::types::ShareInfo> =
+        shares.iter().map(|s| (s.aggregate_pubkey, s.clone())).collect();
+    let share_map = Arc::new(share_map);
+
+    // ── L-1 SNI pinning: build per-peer connection info ──────────────────────
+    //
+    // `build_peer_connect_infos` enforces a hard invariant: when TLS is active,
+    // every dvt_peers address must have a matching `addr=` entry in the
+    // allow-list.  Missing entries are startup errors — there is no silent
+    // fallback to un-pinned TLS (ISSUE-4.1 / L-1 review fix).
+    let peer_infos: Vec<dvt::peer_client::PeerConnectInfo> =
+        dvt::peer_client::build_peer_connect_infos(
+            &resolved.dvt_peers,
+            allow_list.as_deref(),
+            tls_config.is_some(),
+        )
+        .map_err(|e| format!("DVT peer SNI configuration error: {e}"))?;
+
+    let peer_requester = if !peer_infos.is_empty() {
+        let requester =
+            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout)
+                .await
+                .map_err(|e| format!("failed to connect to DVT peers: {}", e))?;
+
+        info!(peers = ?requester.peer_addrs(), "Connected to DVT peers");
+        Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
+    } else {
+        info!("No DVT peers configured; running in standalone mode");
+        None
+    };
+
+    let dvt_signer = backend::dvt::DvtSigner::new(
+        shares,
+        dvt_index,
+        resolved.dvt_peers.clone(),
+        peer_requester,
+        timeout,
+    )
+    .with_metrics(dvt_metrics);
+
+    Ok((Arc::new(dvt_signer), share_map))
+}
+
+fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn std::error::Error>> {
+    let file_config = if let Some(ref path) = args.config {
+        config::load_config(path)?
+    } else {
+        config::SignerConfig::default()
+    };
+
+    let has_config = args.config.is_some();
+    let listen_address_is_default = has_config && args.listen_address == DEFAULT_LISTEN_ADDRESS;
+    let backend_is_default = has_config && matches!(args.backend, Backend::Basic);
+    let reload_interval_is_default = has_config && args.reload_interval == 30;
+    let http_listen_address_is_default =
+        has_config && args.http_listen_address == config::DEFAULT_HTTP_LISTEN_ADDRESS;
+    let http_tls_mode_is_default =
+        has_config && args.http_tls_mode == config::DEFAULT_HTTP_TLS_MODE;
+
+    #[cfg(feature = "dvt")]
+    let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
+    #[cfg(not(feature = "dvt"))]
+    let dvt_timeout_is_default = true;
+
+    #[cfg(feature = "dvt")]
+    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout) =
+        (&args.dvt_peers[..], args.dvt_threshold, args.dvt_index, args.dvt_timeout);
+    #[cfg(not(feature = "dvt"))]
+    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout): (
+        &[String],
+        Option<u64>,
+        Option<u64>,
+        u64,
+    ) = (&[], None, None, 2000);
+
+    let cli = config::CliOverrides {
+        listen_address: &args.listen_address,
+        listen_address_is_default,
+        keystore_dir: args.keystore_dir.as_deref(),
+        password_file: args.password_file.as_deref(),
+        backend: &args.backend.to_string(),
+        backend_is_default,
+        dry_run: args.dry_run,
+        tls_cert: args.tls_cert.as_deref(),
+        tls_key: args.tls_key.as_deref(),
+        tls_ca_cert: args.tls_ca_cert.as_deref(),
+        reload_interval: args.reload_interval,
+        reload_interval_is_default,
+        enable_hot_reload: args.enable_hot_reload,
+        dvt_peers,
+        dvt_threshold,
+        dvt_index,
+        dvt_timeout,
+        dvt_timeout_is_default,
+        http_enabled: args.http_enabled,
+        http_listen_address: &args.http_listen_address,
+        http_listen_address_is_default,
+        http_tls_mode: &args.http_tls_mode,
+        http_tls_mode_is_default,
+        http_tls_cert: args.http_tls_cert.as_deref(),
+        http_tls_key: args.http_tls_key.as_deref(),
+        http_tls_ca_cert: args.http_tls_ca_cert.as_deref(),
+    };
+
+    config::merge_with_cli(file_config, &cli)
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    info!("Shutdown signal received");
+}
+
+/// Parse the backend string into a `Backend` enum.
+#[cfg(feature = "dvt")]
+fn parse_backend(backend: &str) -> Result<Backend, Box<dyn std::error::Error>> {
+    match backend {
+        "basic" => Ok(Backend::Basic),
+        "dvt" => Ok(Backend::Dvt),
+        other => Err(format!("unknown backend: {other}; expected 'basic' or 'dvt'").into()),
+    }
+}
+
+/// Run the split-key subcommand.
+#[cfg(feature = "dvt")]
+fn run_split_key(args: SplitKeyCliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use rvc_signer_bin::commands::split_key::{execute, SplitKeyArgs};
+    use zeroize::Zeroizing;
+
+    let password = if let Some(ref pw) = args.password {
+        Zeroizing::new(pw.clone())
+    } else if let Some(ref file) = args.password_file {
+        let content = std::fs::read_to_string(file)?;
+        Zeroizing::new(content.trim_end_matches('\n').to_string())
+    } else {
+        Zeroizing::new(String::new())
+    };
+
+    let output_password = if let Some(ref pw) = args.output_password {
+        Zeroizing::new(pw.clone())
+    } else if let Some(ref file) = args.output_password_file {
+        let content = std::fs::read_to_string(file)?;
+        Zeroizing::new(content.trim_end_matches('\n').to_string())
+    } else {
+        Zeroizing::new(String::new())
+    };
+
+    execute(SplitKeyArgs {
+        keystore: args.keystore,
+        password,
+        threshold: args.threshold,
+        shares: args.shares,
+        output_dir: args.output_dir,
+        output_password,
+    })?;
+    info!("Split key successfully");
+    Ok(())
+}
+
+#[cfg(test)]
+// RF1-12: unit tests mutate env via unsafe set_var/remove_var.
+#[allow(unsafe_code)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Serialize RUST_LOG mutation (process-global). nextest runs each test in
+    // its own process, but guard anyway so the suite stays correct under any
+    // runner that threads tests in one process.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// With `RUST_LOG` unset, rvc-signer's reconciled init must default to
+    /// `info` and emit `info!` events — the P0-5 cross-binary parity fix. Before
+    /// the reconciliation it used `EnvFilter::from_default_env()`, which drops
+    /// `info` to `ERROR` when `RUST_LOG` is unset (the silent-by-default footgun
+    /// this issue closes). Mirrors `bin/rvc`'s `test_init_logging_no_extras_emits_events`.
+    ///
+    /// This builds the ACTUAL shipped composition that `init_logging()` uses:
+    /// `registry().with(fmt::layer()).with(reloadable_env_filter("info"))`, i.e.
+    /// the reload-wrapped reconciled filter via the same shared helper, capturing
+    /// output through `.with_writer()` and `with_default` instead of `.init()`.
+    /// It guards the real composition, not the removed `fmt()` builder.
+    #[test]
+    fn test_init_logging_emits_info_by_default() {
+        use tracing_subscriber::prelude::*;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        unsafe { std::env::remove_var("RUST_LOG") };
+
+        let buf = SharedBuf::default();
+        // Same shape as production `init_logging`: the reload-wrapped reconciled
+        // filter is the outer global layer over a single `fmt::layer`.
+        let (filter, _handle) = telemetry::reloadable_env_filter("info");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("rvc-signer init regression marker");
+        });
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("rvc-signer init regression marker"),
+            "reconciled init dropped an info event with RUST_LOG unset; captured: {captured:?}"
+        );
+    }
+
+    // ── Issue 5.5: opt-in JSON console log output profile ─────────────────────
+
+    /// `serve --log-format json` parses and resolves to `LogFormat::Json`; the
+    /// default (flag omitted) stays `Pretty`. Same flag/semantics as `bin/rvc`.
+    /// Pull the `ServeArgs` out of a parsed `Cli`, panicking on any other
+    /// subcommand. Written as a `match` (not `let…else`) so it is warning-free
+    /// whether or not the `dvt` feature adds a second `Command` variant.
+    fn serve_args(cli: super::Cli) -> super::ServeArgs {
+        match cli.command {
+            super::Command::Serve(args) => args,
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_log_format_flag_parses_and_defaults_to_pretty() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from(["rvc-signer", "serve", "--log-format", "json"])
+            .expect("serve --log-format json should parse");
+        let args = serve_args(cli);
+        assert_eq!(
+            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::Json
+        );
+
+        let cli = super::Cli::try_parse_from(["rvc-signer", "serve"])
+            .expect("serve default should parse");
+        let args = serve_args(cli);
+        assert_eq!(args.log_format, "pretty", "default --log-format must be pretty");
+        assert_eq!(
+            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::Pretty
+        );
+    }
+
+    /// The JSON arm of `init_logging`'s composition — `console_fmt_layer(Json, …)`
+    /// under the reload-wrapped reconciled filter — emits one parseable JSON
+    /// object per event with canonical fields as top-level keys. Mirrors the
+    /// shipped `init_logging` shape (rvc-signer wires no extra layers, so there is
+    /// no `boxed_layers`/`Identity` padding here, matching production).
+    #[test]
+    fn test_init_logging_json_arm_emits_parseable_json() {
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let (filter, _handle) = telemetry::reloadable_env_filter("info");
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+        let subscriber = tracing_subscriber::registry().with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = "abc-123", "rvc-signer json arm marker");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out.lines().find(|l| l.contains("rvc-signer json arm marker")).expect("present");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
+        assert_eq!(v["request_id"], "abc-123", "canonical field must be a top-level JSON key");
+        assert_eq!(v["message"], "rvc-signer json arm marker");
+    }
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        out
+    }
+
+    // Cross-binary init parity (P0-5 / M3): rvc-signer must exhibit the SAME
+    // default level (`info`) and RUST_LOG precedence as bin/rvc — both route
+    // their filter through `telemetry::env_filter_or("info")`. These mirror the
+    // bin/rvc parity tests so an operator learns one behavior, not two.
+    #[test]
+    fn test_rvc_signer_unset_rust_log_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
+        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_signer_rust_log_overrides_default() {
+        let rendered =
+            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
+        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_signer_per_module_directive_preserved() {
+        let rendered = with_rust_log(Some("warn,rvc_signer_bin::http_api=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        // Assert the joined target=level token, not three independent substrings:
+        // the latter green-lights a filter where the target binds to a *different*
+        // level (e.g. http_api=info,foo=trace).
+        assert!(
+            rendered.contains("rvc_signer_bin::http_api=trace"),
+            "per-module directive not preserved verbatim (target must bind to trace): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_signer_malformed_rust_log_falls_back_to_info() {
+        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_signer_whitespace_padded_rust_log_honored() {
+        let rendered = with_rust_log(Some("warn, rvc_signer_bin::http_api=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(
+            rendered.contains("rvc_signer_bin::http_api=trace"),
+            "padded per-module directive not preserved verbatim (target must bind to trace): {rendered}"
+        );
+    }
+}
