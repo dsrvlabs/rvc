@@ -103,8 +103,8 @@ for anything but ARCH-2b/2c.
 - [ ] Every registered task has a name visible in a metric label (`rvc_tasks_running{task}`), and a
       panicking task produces a reasoned shutdown (`ShutdownReason::Failure`) rather than a silent
       leak.
-- [ ] ADR-002's **probe verdict is recorded either way** — removal, or a named blocking type plus the
-      alternative taken (A-6). Phase 2 cannot stall on it.
+- [x] ADR-002's **probe verdict is recorded either way** — removal, or a named blocking type plus the
+      alternative taken (A-6). Phase 2 cannot stall on it. *(ARCH-2a: clean — see `probe-adr002-verdict.md`)*
 - [ ] `rg 'arc_with_non_send_sync' crates/rvc/src bin/` returns nothing outside the orphan trees
       (VD-2b: **four** tracked sites, not three).
 - [ ] All §2 standing invariants green; no new `unbounded_channel` anywhere in the diff (C9 anchor 6).
@@ -273,13 +273,15 @@ is the checked-in comment asserting so (*"`DutyOrchestrator::run()` is `!Send` b
 `BeaconBlockClient` uses `#[async_trait(?Send)]`"*). No test is added or changed by this issue.
 
 **Acceptance criteria.**
-- [ ] `cargo check --workspace --all-targets --all-features` was run on a worktree with all seven
+- [x] `cargo check --workspace --all-targets --all-features` was run on a worktree with all seven
       attributes removed and the supertrait added, and its **full output** is recorded.
-- [ ] The verdict file states one of: (a) *clean — proceed with ARCH-2b*, or (b) *blocked by
+- [x] The verdict file states one of: (a) *clean — proceed with ARCH-2b*, or (b) *blocked by
       `<fully-qualified type>` at `<file:line>`, alternative taken: `<Route B / owned handle / …>`*.
-- [ ] The working tree is byte-identical before and after (`git status --porcelain` empty).
-- [ ] **No file under `crates/rvc-signer/`, `crates/rvc-keygen/`, `crates/rvc/src/main.rs` or
+- [x] The working tree is byte-identical before and after (`git status --porcelain` empty).
+- [x] **No file under `crates/rvc-signer/`, `crates/rvc-keygen/`, `crates/rvc/src/main.rs` or
       `crates/rvc/src/commands/` is opened, `sed`ed or listed** (C10).
+
+**Done:** verdict at [`../probe-adr002-verdict.md`](../probe-adr002-verdict.md) — **clean, proceed with ARCH-2b**. HEAD delta: 8th `?Send` site at `proposal_under_duty_stall.rs:368` (include in ARCH-2b).
 
 **Risk.** Project-plan R3, downgraded to Low × Low by the audit but **not discharged** until this
 runs. If it fails, project-plan RP6 applies: Phase 3's harness keeps the `LocalSet` scaffold at a
