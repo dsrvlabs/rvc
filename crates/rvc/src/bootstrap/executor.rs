@@ -4,6 +4,9 @@
 //! A per-task monitor joins the work handle so a panic surfaces immediately as
 //! [`ShutdownReason::Failure`] rather than as a silent leak.
 //!
+//! Task lifecycle metrics (A-A5): exactly two series —
+//! `rvc_tasks_running{task}` and `rvc_task_exits_total{task,outcome}`.
+//!
 //! Shutdown drains tiers in order (Ingress → Orchestrator → Background → Telemetry)
 //! under per-tier budgets ([`TierBudget`]). Process metrics land in ARCH-2f.
 
@@ -11,6 +14,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use metrics::definitions::{task_exit_outcome, RVC_TASKS_RUNNING, RVC_TASK_EXITS_TOTAL};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -188,17 +192,18 @@ impl TaskExecutor {
         let work = handle.abort_handle();
         let tx = self.shutdown_tx.clone();
         let exits = Arc::clone(&self.exits);
+        RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
         let monitor = tokio::spawn(async move {
             let outcome = match handle.await {
-                Ok(_) => "ok",
+                Ok(_) => task_exit_outcome::OK,
                 Err(e) if e.is_panic() => {
-                    // try_send only: a full channel means shutdown is already in
-                    // flight; awaiting would make panic reporting itself blockable.
                     let _ = tx.try_send(ShutdownReason::Failure(name));
-                    "panic"
+                    task_exit_outcome::PANIC
                 }
-                Err(_) => "cancelled",
+                Err(_) => task_exit_outcome::CANCELLED,
             };
+            RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
+            RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
             exits.lock().push((name, outcome));
         });
         self.registry.lock().push(Registered { name, tier, work, monitor });
@@ -356,7 +361,6 @@ impl TaskExecutor {
         self.registry.lock().iter().map(|r| (r.name, r.tier)).collect()
     }
 
-    #[cfg(test)]
     async fn wait_exits(&self, n: usize) {
         loop {
             if self.exits.lock().len() >= n {
@@ -377,6 +381,33 @@ mod tests {
     use super::*;
     use std::io;
     use std::time::Duration;
+
+    fn running_gauge(name: &str) -> i64 {
+        RVC_TASKS_RUNNING.with_label_values(&[name]).get()
+    }
+
+    fn exit_count(name: &str, outcome: &str) -> u64 {
+        RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).get()
+    }
+
+    fn running_series_exists(task: &str) -> bool {
+        metrics::REGISTRY
+            .gather()
+            .iter()
+            .filter(|mf| mf.name() == "rvc_tasks_running")
+            .flat_map(|mf| mf.get_metric())
+            .any(|m| m.get_label().iter().any(|l| l.name() == "task" && l.value() == task))
+    }
+
+    fn exits_series_exists(task: &str) -> bool {
+        metrics::REGISTRY
+            .gather()
+            .iter()
+            .filter(|mf| mf.name() == "rvc_task_exits_total")
+            .flat_map(|mf| mf.get_metric())
+            .any(|m| m.get_label().iter().any(|l| l.name() == "task" && l.value() == task))
+    }
+
 
     #[tokio::test]
     async fn test_panicking_task_reports_failure_reason() {
@@ -669,4 +700,136 @@ mod tests {
             "cooperative join took {elapsed:?}, expected well inside budget"
         );
     }
+
+    #[tokio::test]
+    async fn test_running_gauge_returns_to_zero_after_drain() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+
+        // Three long-running tasks across tiers so the gauge is observable before drain.
+        exec.spawn("gauge_drain_ingress", ShutdownTier::Ingress, async {
+            std::future::pending::<()>().await;
+        });
+        exec.spawn("gauge_drain_orch", ShutdownTier::Orchestrator, async {
+            std::future::pending::<()>().await;
+        });
+        exec.spawn("gauge_drain_telem", ShutdownTier::Telemetry, async {
+            std::future::pending::<()>().await;
+        });
+
+        // Let the register-side gauge incs become visible.
+        tokio::task::yield_now().await;
+
+        let names = ["gauge_drain_ingress", "gauge_drain_orch", "gauge_drain_telem"];
+        let sum: i64 = names.iter().map(|n| running_gauge(n)).sum();
+        assert_eq!(sum, 3, "gauge must read 3 while tasks are registered and running");
+
+        let outcome = exec.shutdown(TierBudget::default()).await;
+        // pending::<()> tasks ignore the token, so they hit tier budget → abort.
+        assert_eq!(
+            outcome.joined.len() + outcome.aborted.len(),
+            3,
+            "every registered task must be accounted for in ShutdownOutcome"
+        );
+
+        for n in names {
+            assert_eq!(
+                running_gauge(n),
+                0,
+                "gauge for {n} must return to 0 after drain (abort path dec)"
+            );
+            assert!(
+                exit_count(n, task_exit_outcome::CANCELLED) >= 1,
+                "aborted task {n} must record outcome=cancelled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_running_gauge_returns_to_zero_after_panic() {
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+
+        exec.spawn("gauge_panic_task", ShutdownTier::Background, async {
+            panic!("boom for gauge");
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), exec.wait_exits(1))
+            .await
+            .expect("panicking task monitor must complete");
+
+        assert_eq!(running_gauge("gauge_panic_task"), 0, "panic path must dec rvc_tasks_running");
+        let _ = rx.recv().await;
+        let _ = exec.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_panic_exit_is_labelled_panic_not_ok() {
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+        let before_panic = exit_count("panic_label_task", task_exit_outcome::PANIC);
+        let before_ok = exit_count("panic_label_task", task_exit_outcome::OK);
+
+        exec.spawn("panic_label_task", ShutdownTier::Background, async {
+            panic!("labelled panic");
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), exec.wait_exits(1))
+            .await
+            .expect("panic monitor must complete");
+
+        assert_eq!(exit_count("panic_label_task", task_exit_outcome::PANIC), before_panic + 1);
+        assert_eq!(
+            exit_count("panic_label_task", task_exit_outcome::OK),
+            before_ok,
+            "panic must not be labelled ok"
+        );
+        assert_eq!(exec.recorded_outcomes(), vec![("panic_label_task", "panic")]);
+
+        let reason = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("reason");
+        assert_eq!(reason, ShutdownReason::Failure("panic_label_task"));
+        let _ = exec.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_abort_exit_is_labelled_cancelled() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        let before = exit_count("abort_label_task", task_exit_outcome::CANCELLED);
+
+        exec.spawn("abort_label_task", ShutdownTier::Background, async {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(running_gauge("abort_label_task"), 1);
+
+        let _ = exec.shutdown(TierBudget::default()).await;
+
+        assert_eq!(running_gauge("abort_label_task"), 0);
+        assert_eq!(exit_count("abort_label_task", task_exit_outcome::CANCELLED), before + 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_opt_none_creates_no_series() {
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+        const NAME: &str = "arch2f_opt_none_disabled";
+
+        // Ensure a clean slate for this unique label (other tests use different names).
+        assert!(!running_series_exists(NAME), "precondition: no running series for {NAME}");
+        assert!(!exits_series_exists(NAME), "precondition: no exits series for {NAME}");
+
+        exec.register_opt::<()>(NAME, ShutdownTier::Background, None);
+        assert_eq!(exec.registry_len(), 0);
+
+        assert!(
+            !running_series_exists(NAME),
+            "register_opt(None) must not create rvc_tasks_running{{task={NAME}}}"
+        );
+        assert!(
+            !exits_series_exists(NAME),
+            "register_opt(None) must not create rvc_task_exits_total series for {NAME}"
+        );
+
+        let _ = exec.shutdown(TierBudget::default()).await;
+    }
+
 }

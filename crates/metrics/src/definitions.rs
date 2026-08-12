@@ -349,6 +349,39 @@ lazy_static! {
         histogram
     };
 
+    /// Gauge for currently running registered tasks (TaskExecutor).
+    ///
+    /// Labels: `task` — static name passed to `register` / `spawn`.
+    /// Incremented at register; decremented on every exit path (ok / panic / cancelled).
+    /// Exactly two task-lifecycle series exist (A-A5); no lifetime histogram.
+    pub static ref RVC_TASKS_RUNNING: prometheus::IntGaugeVec = {
+        let opts = Opts::new(
+            "rvc_tasks_running",
+            "Number of currently running registered tasks"
+        );
+        let gauge = prometheus::IntGaugeVec::new(opts, &["task"])
+            .expect("Failed to create rvc_tasks_running metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_tasks_running metric");
+        gauge
+    };
+
+    /// Counter for registered task exits by outcome (TaskExecutor).
+    ///
+    /// Labels: `task` (static name), `outcome` ∈ {ok, panic, cancelled}.
+    /// No third task-lifecycle series; no lifetime histogram (A-A5).
+    pub static ref RVC_TASK_EXITS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_task_exits_total",
+            "Total number of registered task exits by outcome"
+        );
+        let counter = IntCounterVec::new(opts, &["task", "outcome"])
+            .expect("Failed to create rvc_task_exits_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_task_exits_total metric");
+        counter
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -379,6 +412,8 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
     lazy_static::initialize(&RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
+    lazy_static::initialize(&RVC_TASKS_RUNNING);
+    lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
 }
 
 /// Attestation status label values.
@@ -417,6 +452,13 @@ pub mod tx_hold_kind {
 pub mod slot_phase_cache {
     pub const WARM: &str = "warm";
     pub const COLD: &str = "cold";
+}
+
+/// `outcome` label values for `rvc_task_exits_total`.
+pub mod task_exit_outcome {
+    pub const OK: &str = "ok";
+    pub const PANIC: &str = "panic";
+    pub const CANCELLED: &str = "cancelled";
 }
 
 #[cfg(test)]
