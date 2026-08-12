@@ -1005,15 +1005,15 @@ collapse (Phase 4) deletes seam α, at which point clauses (i)/(ii) are deleted 
 - **GREEN:** the gate passes against HEAD.
 
 **Acceptance criteria.**
-- [ ] `crates/architecture-tests/tests/config_drift.rs` exists; no existing gate file and no
+- [x] `crates/architecture-tests/tests/config_drift.rs` exists; no existing gate file and no
       `architecture-tests/src/lib.rs` line is modified.
-- [ ] Clause (ii) implemented; **clause (i) is explicitly documented as dropped with its rustc-enforcement
+- [x] Clause (ii) implemented; **clause (i) is explicitly documented as dropped with its rustc-enforcement
       reason** in the module doc (a reader who does not know this will read it as an oversight).
-- [ ] `BYPASS` has exactly 8 entries, each with a reason; `ALIASES` has exactly 2.
-- [ ] Both non-vacuity assertions present.
-- [ ] Four synthetic matcher tests present, including the mandatory RED.
-- [ ] The module doc states the gate's interim lifetime and what ADR-008 deletes.
-- [ ] Green in the `arch-gates` CI job.
+- [x] `BYPASS` has exactly 8 entries, each with a reason; `ALIASES` has exactly 2.
+- [x] Both non-vacuity assertions present.
+- [x] Four synthetic matcher tests present, including the mandatory RED.
+- [x] The module doc states the gate's interim lifetime and what ADR-008 deletes.
+- [x] Green in the `arch-gates` CI job.
 
 ---
 
