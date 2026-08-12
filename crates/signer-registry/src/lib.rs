@@ -142,8 +142,6 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         gate_routing: GateRouting::Gated,
         gate_method: Some("sign_attestation"),
     },
-    // TODO(SS-2/SS-3, Phase 4): reclassify aggregate as non-slashable once the
-    // SignAggregateAndProof path is fixed to not stage attestation slashing records.
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignAggregateAndProof",

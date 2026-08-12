@@ -131,7 +131,7 @@ mod tests {
     use tree_hash::MerkleHasher;
 
     /// Pins `subcommittee_index` to the legacy expression that used to live in
-    /// both `sync-service` and the orchestrator (F99 / RF3-20).
+    /// the orchestrator (F99 / RF3-20).
     #[test]
     fn test_subcommittee_index_matches_both_legacy_closures() {
         for pos in 0..SYNC_COMMITTEE_SIZE {
