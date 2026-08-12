@@ -1062,11 +1062,11 @@ explicitly, and `test_start_help_lists_every_flag` (`:1005-1015`) compares a han
 - **GREEN:** the whole gate passes against HEAD, with the nine-entry list.
 
 **Acceptance criteria.**
-- [ ] `CLAP_DEFAULT_CLOBBERS` contains exactly the nine verified fields, each with a reason.
-- [ ] A synthetic tenth instance is flagged (the mandatory RED).
-- [ ] `UNVALIDATED` exists, is shrinking-only, and every `CliOverrides` field is validated or listed.
-- [ ] The module doc names the two existing tests that *look* like precedence tests and are not.
-- [ ] Green in the `arch-gates` CI job, **before** ARCH-6b lands.
+- [x] `CLAP_DEFAULT_CLOBBERS` contains exactly the nine verified fields, each with a reason.
+- [x] A synthetic tenth instance is flagged (the mandatory RED).
+- [x] `UNVALIDATED` exists, is shrinking-only, and every `CliOverrides` field is validated or listed.
+- [x] The module doc names the two existing tests that *look* like precedence tests and are not.
+- [x] Green in the `arch-gates` CI job, **before** ARCH-6b lands.
 
 ---
 

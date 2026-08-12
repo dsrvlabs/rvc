@@ -1,4 +1,4 @@
-//! G-2 / ARCH-P1-1 clause (ii): config-drift gate — seam-α scanner.
+//! G-2 / ARCH-P1-1 config-drift gate — clauses (ii), (iii), (iv).
 //!
 //! Seam α (`bin/rvc/src/cli.rs` group `Args` structs → `impl From<StartArgs> for CliOverrides`)
 //! is the **one** seam in the five-site config pipeline that rustc does not guard: the destructure
@@ -12,12 +12,40 @@
 //! (`crates/rvc/src/config/types.rs`). A scanner for it can only ever be green. Readers who do not
 //! know this will think it was overlooked — hence this paragraph.
 //!
+//! ## Clause (ii) — seam α
+//!
+//! Every group-arg field must be read as `<binding>.<field>` in `From<StartArgs>`, unless listed
+//! on the shrinking-only `BYPASS` table. `ALIASES` documents rename / 2:1 collapse only; sources
+//! must still be read under the clap field name.
+//!
+//! ## Clause (iii) — validation coverage (descoped)
+//!
+//! Not "every `Config` field has a marker" (65 lines of noise). Instead: every `CliOverrides`
+//! field name appears in `Config::validate`'s body (`types.rs`) **or** on the shrinking-only
+//! [`UNVALIDATED`] list. Adding a knob without a check or a list entry fails CI.
+//!
+//! ## Clause (iv) — `CLAP_DEFAULT_CLOBBERS` (ADR-009 / F9)
+//!
+//! Nine `CliOverrides` fields are populated with unconditional `Some(<clap field with
+//! default_value>)` in `From<StartArgs>`. Clap's default is indistinguishable from an operator
+//! flag, so `merge_with_cli`'s `set` arm overwrites a TOML value even when the flag was absent
+//! (e.g. TOML `metrics_port = 9090` silently becomes 8080). [`CLAP_DEFAULT_CLOBBERS`] seeds those
+//! nine; **shrinking-only** — a tenth instance is a new live defect (flagged until ARCH-6b
+//! empties the list). The detector still flags a synthetic reintroduction when the list is empty.
+//!
+//! ## Tests that *look* like precedence tests and are not
+//!
+//! No existing test catches the clap-default clobber:
+//! - `test_start_args_convert_to_equivalent_cli_overrides` (`bin/rvc/src/cli.rs`) passes every flag
+//!   **explicitly**, so it only exercises the operator-supplied branch.
+//! - `test_start_help_lists_every_flag` compares a hand-maintained `START_FLAGS` array against
+//!   `--help` text — a surface inventory, not a file-vs-CLI precedence check.
+//!
 //! ## Interim lifetime
 //!
 //! This gate is **interim by construction**. ADR-008 Phase 4 collapses seam α (group `Args` →
 //! direct `Config` paths), at which point clauses (i)/(ii) and the `BYPASS` / `ALIASES` tables are
-//! deleted with it; only clauses (iii)/(iv) (ARCH-5b) survive. Until then, this file is the CI
-//! fence on unread clap args.
+//! deleted with it; only clauses (iii)/(iv) survive (iv with an empty list after ARCH-6b).
 //!
 //! ## Non-vacuity
 //!
@@ -35,8 +63,6 @@
 //! deliberate greenwash of that form.
 //!
 //! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as `kat_policy.rs`.
-//!
-//! ARCH-5a only: clauses (iii) `UNVALIDATED` and (iv) `CLAP_DEFAULT_CLOBBERS` land in ARCH-5b.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -103,6 +129,125 @@ const ALIASES: &[(&str, &str, &str, &str)] = &[
         "doppelganger_detection",
         "1:1 negated rename: flag sets doppelganger_detection=Some(false) (cli.rs From impl)",
     ),
+];
+
+/// Clause (iv) / ADR-009 / F9: `CliOverrides` fields populated with unconditional
+/// `Some(<binding>.<field>)` from a non-`Option` clap field that carries `default_value` /
+/// `default_value_t`. Clap's default then clobbers a TOML value when the flag is absent.
+///
+/// **Shrinking-only.** Seeded with the nine verified HEAD instances. Entries may be **removed**
+/// (ARCH-6b converts the clap fields to `Option<T>` without defaults); a **tenth** entry is a
+/// new instance of a known live defect. An empty list after the fix must still flag a synthetic
+/// reintroduction — empty alone is not a dead gate.
+///
+/// Tuple: `(cli_overrides_field, reason)`. Sorted by field name.
+const CLAP_DEFAULT_CLOBBERS: &[(&str, &str)] = &[
+    (
+        "beacon_max_body_bytes",
+        "Some(beacon.beacon_max_body_bytes) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "grpc_address",
+        "Some(server.grpc_address) from default_value; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "grpc_port",
+        "Some(server.grpc_port) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "keymanager_body_limit",
+        "Some(keymanager.keymanager_body_limit) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "log_level",
+        "Some(logging.log_level) from default_value; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "metrics_address",
+        "Some(server.metrics_address) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "metrics_port",
+        "Some(server.metrics_port) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "slashed_validators_action",
+        "Some(safety.slashed_validators_action) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+    (
+        "tracing_exporter",
+        "Some(tracing.tracing_exporter) from default_value_t; clobbers TOML (ADR-009/F9)",
+    ),
+];
+
+/// Clause (iii): `CliOverrides` fields whose names do **not** appear (identifier-bounded) in
+/// `Config::validate`'s body. Most knobs legitimately have nothing to check at startup.
+///
+/// **Shrinking-only.** Entries may be **removed** (by adding a field-name check to `validate`),
+/// never **added** without acknowledging a new unvalidated knob. A new `CliOverrides` field that
+/// is neither mentioned in `validate` nor listed here fails the gate.
+///
+/// Tuple: `(cli_overrides_field, reason)`. Sorted by field name.
+const UNVALIDATED: &[(&str, &str)] = &[
+    ("allow_unsupported_fork", "no field-name check in Config::validate"),
+    ("beacon_max_body_bytes", "no field-name check in Config::validate"),
+    ("block_selection_mode", "no field-name check in Config::validate"),
+    ("builder_circuit_breaker_consecutive_limit", "no field-name check in Config::validate"),
+    ("builder_circuit_breaker_epoch_limit", "no field-name check in Config::validate"),
+    ("disable_attesting", "no field-name check in Config::validate"),
+    ("disable_keystore_locking", "no field-name check in Config::validate"),
+    ("doppelganger_detection", "no field-name check in Config::validate"),
+    ("gcp_secret_prefix", "no field-name check in Config::validate"),
+    (
+        "genesis_time",
+        "checked via effective_genesis_time(); name not in validate body",
+    ),
+    (
+        "genesis_validators_root",
+        "checked via effective_genesis_validators_root(); name not in validate body",
+    ),
+    ("grpc_address", "no field-name check in Config::validate"),
+    ("grpc_signer_tls_ca_cert", "no field-name check in Config::validate"),
+    ("grpc_signer_tls_cert", "no field-name check in Config::validate"),
+    ("grpc_signer_tls_key", "no field-name check in Config::validate"),
+    ("grpc_signer_url", "no field-name check in Config::validate"),
+    ("init_slashing_db", "no field-name check in Config::validate"),
+    ("key_decrypt_threads", "no field-name check in Config::validate"),
+    ("keymanager_address", "no field-name check in Config::validate"),
+    ("keymanager_body_limit", "no field-name check in Config::validate"),
+    ("keymanager_cors_origins", "no field-name check in Config::validate"),
+    ("keymanager_enabled", "no field-name check in Config::validate"),
+    ("keymanager_token_file", "no field-name check in Config::validate"),
+    ("keystore_path", "no field-name check in Config::validate"),
+    ("log_level", "no field-name check in Config::validate"),
+    ("logfile", "no field-name check in Config::validate"),
+    ("logfile_compress", "no field-name check in Config::validate"),
+    ("logfile_level", "no field-name check in Config::validate"),
+    ("logfile_max_number", "no field-name check in Config::validate"),
+    ("logfile_max_size", "no field-name check in Config::validate"),
+    ("metrics_address", "no field-name check in Config::validate"),
+    ("monitoring_endpoint", "no field-name check in Config::validate"),
+    ("monitoring_endpoint_insecure", "no field-name check in Config::validate"),
+    ("monitoring_interval", "no field-name check in Config::validate"),
+    ("network", "no field-name check in Config::validate"),
+    ("password_file", "no field-name check in Config::validate"),
+    ("proposer_config_refresh_interval", "no field-name check in Config::validate"),
+    ("proposer_config_url_insecure", "no field-name check in Config::validate"),
+    ("proposer_config_url_token", "no field-name check in Config::validate"),
+    ("remote_signer_allowed_hosts", "no field-name check in Config::validate"),
+    ("remote_signer_url", "no field-name check in Config::validate"),
+    ("secret_provider_strict", "no field-name check in Config::validate"),
+    ("secret_refresh_interval", "no field-name check in Config::validate"),
+    ("slashed_validators_action", "no field-name check in Config::validate"),
+    ("slashing_db_path", "no field-name check in Config::validate"),
+    ("tracing_endpoint", "no field-name check in Config::validate"),
+    ("tracing_exporter", "no field-name check in Config::validate"),
+    ("tracing_max_export_batch_size", "no field-name check in Config::validate"),
+    ("tracing_max_queue_size", "no field-name check in Config::validate"),
+    ("tracing_sample_rate", "no field-name check in Config::validate"),
+    ("validator_registration_batch_delay", "no field-name check in Config::validate"),
+    ("validator_registration_batch_size", "no field-name check in Config::validate"),
+    ("validators_config", "no field-name check in Config::validate"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -485,6 +630,293 @@ fn aliases_set() -> HashSet<(&'static str, &'static str)> {
 }
 
 // ---------------------------------------------------------------------------
+// Clause (iv) — clap default clobber detector
+// ---------------------------------------------------------------------------
+
+/// Unconditional `field: Some(binding.source)` rows in a From-impl / struct-literal body.
+///
+/// Returns `(override_field, binding, source_field)`. Whitespace-tolerant; ignores comments
+/// and string literals via [`scan_text`].
+fn find_some_binding_wrappers(from_body: &str) -> Vec<(String, String, String)> {
+    let compact = scan_text(from_body);
+    let bytes = compact.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Identify a potential field name start.
+        if !is_ident_start(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let name_start = i;
+        i += 1;
+        while i < bytes.len() && is_ident_char(bytes[i]) {
+            i += 1;
+        }
+        let field = &compact[name_start..i];
+        // Skip whitespace already collapsed to single spaces.
+        let mut j = i;
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            continue;
+        }
+        j += 1;
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        // Some(
+        if j + 5 > bytes.len() || &compact[j..j + 5] != "Some(" {
+            continue;
+        }
+        j += 5;
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if j >= bytes.len() || !is_ident_start(bytes[j]) {
+            continue;
+        }
+        let bind_start = j;
+        j += 1;
+        while j < bytes.len() && is_ident_char(bytes[j]) {
+            j += 1;
+        }
+        let binding = &compact[bind_start..j];
+        if j >= bytes.len() || bytes[j] != b'.' {
+            continue;
+        }
+        j += 1;
+        if j >= bytes.len() || !is_ident_start(bytes[j]) {
+            continue;
+        }
+        let src_start = j;
+        j += 1;
+        while j < bytes.len() && is_ident_char(bytes[j]) {
+            j += 1;
+        }
+        let source = &compact[src_start..j];
+        if j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b')' {
+            continue;
+        }
+        // Only count when override field name equals the clap source field (the F9 shape).
+        if field == source {
+            out.push((field.to_string(), binding.to_string(), source.to_string()));
+        }
+        i = j;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+/// Attributes text (joined) and type text for `pub field: Type` inside `struct_name`, if found.
+fn field_attrs_and_type(src: &str, struct_name: &str, field: &str) -> Option<(String, String)> {
+    let body = struct_body(src, struct_name)?;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut pending_attrs: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    for line in lines {
+        let t = line.trim();
+        for ch in t.chars() {
+            match ch {
+                '{' | '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("///") || t.starts_with("//") {
+            continue;
+        }
+        if t.starts_with("#[") {
+            pending_attrs.push(t.to_string());
+            continue;
+        }
+        let mut rest = t;
+        if let Some(r) = rest.strip_prefix("pub") {
+            rest = r.trim_start();
+            if let Some(r) = rest.strip_prefix('(') {
+                let close = r.find(')')?;
+                rest = r[close + 1..].trim_start();
+            }
+        } else {
+            pending_attrs.clear();
+            continue;
+        }
+        let name: String =
+            rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        if name.is_empty() {
+            pending_attrs.clear();
+            continue;
+        }
+        let after_name = rest[name.len()..].trim_start();
+        if !after_name.starts_with(':') {
+            pending_attrs.clear();
+            continue;
+        }
+        let ty = after_name[1..].trim().trim_end_matches(',').trim().to_string();
+        if name == field {
+            return Some((pending_attrs.join(" "), ty));
+        }
+        pending_attrs.clear();
+    }
+    None
+}
+
+/// True when the clap field declaration is non-`Option` and carries `default_value` /
+/// `default_value_t` (the ADR-009 clobber precondition).
+fn clap_field_is_defaulted_non_option(src: &str, struct_name: &str, field: &str) -> bool {
+    let Some((attrs, ty)) = field_attrs_and_type(src, struct_name, field) else {
+        return false;
+    };
+    let is_option = ty.starts_with("Option<") || ty.starts_with("Option <");
+    if is_option {
+        return false;
+    }
+    attrs.contains("default_value")
+}
+
+/// Detect clap-default clobbers in a From-impl body.
+///
+/// A hit is `field: Some(binding.field)` where the clap field on `bindings[binding]` is
+/// non-`Option` with a `default_value`. Returns sorted unique override field names.
+fn detect_clap_default_clobbers(
+    from_body: &str,
+    cli_src: &str,
+    bindings: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (field, binding, source) in find_some_binding_wrappers(from_body) {
+        if field != source {
+            continue;
+        }
+        let Some(ty) = bindings.get(&binding) else {
+            continue;
+        };
+        if clap_field_is_defaulted_non_option(cli_src, ty, &field) {
+            hits.push(field);
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+/// Clobber field names found by the detector that are **not** on the allow-list (growth).
+fn clobber_growth(found: &[String], allowed: &HashSet<&str>) -> Vec<String> {
+    found.iter().filter(|f| !allowed.contains(f.as_str())).cloned().collect()
+}
+
+/// Allow-list entries not present in the detector output (stale list / source drift).
+fn clobber_stale(found: &[String], allowed: &[&str]) -> Vec<String> {
+    let found_set: HashSet<&str> = found.iter().map(String::as_str).collect();
+    allowed
+        .iter()
+        .filter(|f| !found_set.contains(*f))
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Clause (iii) — validation coverage
+// ---------------------------------------------------------------------------
+
+/// Body of `pub fn validate(&self) -> Result<(), ConfigError>` (first match in `src`).
+fn config_validate_body(src: &str) -> String {
+    let markers = [
+        "pub fn validate(&self) -> Result<(), ConfigError>",
+        "fn validate(&self) -> Result<(), ConfigError>",
+    ];
+    let mut start = None;
+    for m in markers {
+        if let Some(at) = src.find(m) {
+            start = Some(at);
+            break;
+        }
+    }
+    let Some(start) = start else {
+        return String::new();
+    };
+    let rest = &src[start..];
+    let Some(brace_rel) = rest.find('{') else {
+        return String::new();
+    };
+    let open = start + brace_rel;
+    let mut depth = 0i32;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return src[open + 1..open + i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
+/// Identifier-bounded presence of `name` in `text` (comments/strings kept — string error
+/// messages and doc comments inside the method body are intentional signals).
+fn has_ident(text: &str, name: &str) -> bool {
+    let n_bytes = name.as_bytes();
+    let hay = text.as_bytes();
+    let mut from = 0;
+    while from + n_bytes.len() <= hay.len() {
+        let Some(rel) = text[from..].find(name) else {
+            return false;
+        };
+        let at = from + rel;
+        let after = at + n_bytes.len();
+        let before_ok = at == 0 || !is_ident_char(hay[at - 1]);
+        let after_ok = after >= hay.len() || !is_ident_char(hay[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// `CliOverrides` fields absent from both the validate body and the unvalidated allow-list.
+fn unvalidated_violations(
+    override_fields: &[String],
+    validate_body: &str,
+    unvalidated: &HashSet<&str>,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for f in override_fields {
+        if has_ident(validate_body, f) {
+            continue;
+        }
+        if unvalidated.contains(f.as_str()) {
+            continue;
+        }
+        missing.push(format!(
+            "CliOverrides::{f} is neither mentioned in Config::validate nor listed in UNVALIDATED; \
+             add a validation check or a shrinking-only UNVALIDATED entry with a reason"
+        ));
+    }
+    missing.sort();
+    missing
+}
+
+// ---------------------------------------------------------------------------
 // Live gate (clause ii)
 // ---------------------------------------------------------------------------
 
@@ -826,4 +1258,225 @@ fn from_impl_body_extracts_live_cli_rs() {
     assert!(!body.is_empty());
     assert!(body.contains("beacon"));
     assert!(has_field_access(&scan_text(&body), "beacon", "beacon_url"));
+}
+
+// ---------------------------------------------------------------------------
+// Live gate — clause (iv) CLAP_DEFAULT_CLOBBERS
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clap_default_clobbers_list_matches_the_source() {
+    let root = workspace_root();
+    let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs");
+    let bindings = flatten_bindings(&cli);
+    let body = from_impl_body(&cli);
+    let found = detect_clap_default_clobbers(&body, &cli, &bindings);
+
+    let allowed: Vec<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
+    let allowed_set: HashSet<&str> = allowed.iter().copied().collect();
+
+    assert_eq!(
+        CLAP_DEFAULT_CLOBBERS.len(),
+        9,
+        "CLAP_DEFAULT_CLOBBERS must seed exactly the nine F9 fields; got {}",
+        CLAP_DEFAULT_CLOBBERS.len()
+    );
+    assert_eq!(
+        found.len(),
+        9,
+        "detector must find exactly nine clap-default clobbers at HEAD; got {found:?}"
+    );
+
+    let growth = clobber_growth(&found, &allowed_set);
+    assert!(
+        growth.is_empty(),
+        "CLAP_DEFAULT_CLOBBERS is shrinking-only; new clobber(s) not on the list (ADR-009):\n  {}",
+        growth.join("\n  ")
+    );
+
+    let stale = clobber_stale(&found, &allowed);
+    assert!(
+        stale.is_empty(),
+        "CLAP_DEFAULT_CLOBBERS lists fields the detector no longer finds (list/source drift):\n  {}",
+        stale.join("\n  ")
+    );
+
+    // Exact set equality (order independent).
+    let found_set: HashSet<&str> = found.iter().map(String::as_str).collect();
+    assert_eq!(
+        found_set, allowed_set,
+        "CLAP_DEFAULT_CLOBBERS must match detector output exactly;\n  found: {found:?}\n  list:  {allowed:?}"
+    );
+}
+
+#[test]
+fn every_clobber_entry_carries_a_reason() {
+    assert_eq!(CLAP_DEFAULT_CLOBBERS.len(), 9);
+    let mut seen = HashSet::new();
+    let mut prev: Option<&str> = None;
+    for &(field, reason) in CLAP_DEFAULT_CLOBBERS {
+        assert!(!reason.trim().is_empty(), "CLAP_DEFAULT_CLOBBERS::{field} missing reason");
+        assert!(seen.insert(field), "duplicate CLAP_DEFAULT_CLOBBERS entry: {field}");
+        if let Some(p) = prev {
+            assert!(
+                p < field,
+                "CLAP_DEFAULT_CLOBBERS must stay sorted by field; {p:?} precedes {field}"
+            );
+        }
+        prev = Some(field);
+    }
+}
+
+#[test]
+fn clap_default_clobber_detector_flags_a_tenth_instance() {
+    // Mandatory synthetic RED: a new Some(binding.field) with default_value must be flagged
+    // even when (especially when) the real list is empty after ARCH-6b.
+    let cli_src = r#"
+#[derive(Args, Debug)]
+pub struct ServerArgs {
+    #[arg(long, default_value_t = 8080)]
+    pub metrics_port: u16,
+
+    #[arg(long, default_value_t = 9999)]
+    pub some_new_flag: u16,
+}
+
+pub struct StartArgs {
+    #[command(flatten)]
+    pub server: ServerArgs,
+}
+"#;
+    let from_body = r#"
+        Self {
+            metrics_port: Some(server.metrics_port),
+            some_new_flag: Some(server.some_new_flag),
+        }
+"#;
+    let mut bindings = BTreeMap::new();
+    bindings.insert("server".into(), "ServerArgs".into());
+    let found = detect_clap_default_clobbers(from_body, cli_src, &bindings);
+    assert!(
+        found.iter().any(|f| f == "some_new_flag"),
+        "synthetic tenth clobber must be flagged, got {found:?}"
+    );
+    assert!(
+        found.iter().any(|f| f == "metrics_port"),
+        "known clobber shape must still be detected, got {found:?}"
+    );
+
+    // With only the nine-name allow-list (no some_new_flag), growth must surface the tenth.
+    let allowed: HashSet<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
+    let growth = clobber_growth(&found, &allowed);
+    assert!(
+        growth.iter().any(|f| f == "some_new_flag"),
+        "tenth instance must appear as growth against CLAP_DEFAULT_CLOBBERS: {growth:?}"
+    );
+
+    // Empty allow-list (post-ARCH-6b shape) still flags reintroduction.
+    let empty: HashSet<&str> = HashSet::new();
+    let growth_empty = clobber_growth(&found, &empty);
+    assert!(
+        growth_empty.iter().any(|f| f == "some_new_flag"),
+        "empty CLAP_DEFAULT_CLOBBERS must still flag synthetic reintroduction: {growth_empty:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live gate — clause (iii) UNVALIDATED
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_cli_override_field_is_validated_or_listed() {
+    let root = workspace_root();
+    let types =
+        std::fs::read_to_string(root.join(TYPES_RS)).expect("crates/rvc/src/config/types.rs");
+    let override_fields = struct_fields(&types, "CliOverrides");
+    assert_eq!(
+        override_fields.len(),
+        65,
+        "CliOverrides field count drifted; update UNVALIDATED / clause iii"
+    );
+
+    let validate_body = config_validate_body(&types);
+    assert!(
+        !validate_body.is_empty(),
+        "failed to extract Config::validate body from types.rs"
+    );
+    assert!(
+        has_ident(&validate_body, "metrics_port"),
+        "validate body extraction broke (missing metrics_port)"
+    );
+
+    let unvalidated: HashSet<&str> = UNVALIDATED.iter().map(|&(f, _)| f).collect();
+    assert_eq!(unvalidated.len(), UNVALIDATED.len(), "duplicate UNVALIDATED entries");
+
+    // Hygiene: every UNVALIDATED entry must exist on CliOverrides.
+    for &(field, _) in UNVALIDATED {
+        assert!(
+            override_fields.iter().any(|f| f == field),
+            "UNVALIDATED entry `{field}` is not a CliOverrides field"
+        );
+    }
+
+    // Hygiene: listed fields must NOT also appear in validate (list should shrink when checked).
+    for &(field, _) in UNVALIDATED {
+        assert!(
+            !has_ident(&validate_body, field),
+            "UNVALIDATED entry `{field}` appears in Config::validate — remove it from the list \
+             (shrinking-only)"
+        );
+    }
+
+    let violations = unvalidated_violations(&override_fields, &validate_body, &unvalidated);
+    assert!(
+        violations.is_empty(),
+        "ARCH-P1-1 / G-2 clause (iii):\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn unvalidated_list_is_shrinking_only() {
+    let mut seen = HashSet::new();
+    let mut prev: Option<&str> = None;
+    for &(field, reason) in UNVALIDATED {
+        assert!(!reason.trim().is_empty(), "UNVALIDATED::{field} missing reason");
+        assert!(seen.insert(field), "duplicate UNVALIDATED entry: {field}");
+        if let Some(p) = prev {
+            assert!(
+                p < field,
+                "UNVALIDATED must stay sorted by field; {p:?} precedes {field}"
+            );
+        }
+        prev = Some(field);
+    }
+    // Non-vacuity: HEAD has many unvalidated knobs; an empty accidental wipe is a bug.
+    assert!(
+        UNVALIDATED.len() >= 40,
+        "UNVALIDATED unexpectedly small ({}); table parse/seed failed?",
+        UNVALIDATED.len()
+    );
+}
+
+#[test]
+fn unvalidated_detector_flags_an_unlist_field() {
+    let override_fields =
+        vec!["metrics_port".into(), "brand_new_knob".into(), "graffiti".into()];
+    // metrics_port and graffiti appear; brand_new_knob does not.
+    let validate_body = "if self.metrics_port == 0 { ... } if let Some(ref graffiti) = self.graffiti";
+    let unvalidated: HashSet<&str> = HashSet::new();
+    let violations = unvalidated_violations(&override_fields, validate_body, &unvalidated);
+    assert!(
+        violations.iter().any(|v| v.contains("brand_new_knob")),
+        "unlist + unvalidated field must be flagged: {violations:?}"
+    );
+    assert!(
+        !violations.iter().any(|v| v.contains("metrics_port")),
+        "validated field must not be flagged: {violations:?}"
+    );
+
+    let mut listed = HashSet::new();
+    listed.insert("brand_new_knob");
+    let ok = unvalidated_violations(&override_fields, validate_body, &listed);
+    assert!(ok.is_empty(), "listed field must pass: {ok:?}");
 }
