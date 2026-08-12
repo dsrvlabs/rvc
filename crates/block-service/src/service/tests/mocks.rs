@@ -412,7 +412,7 @@ impl MockBeaconClient {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for MockBeaconClient {
     async fn produce_block_v3(
         &self,

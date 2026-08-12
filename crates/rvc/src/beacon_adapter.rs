@@ -15,7 +15,7 @@ use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 /// [`BeaconNodeClient`] (typically a proposer or main-pool `BnManager`).
 pub struct BeaconBlockAdapter(pub Arc<dyn BeaconNodeClient>);
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for BeaconBlockAdapter {
     async fn produce_block_v3(
         &self,

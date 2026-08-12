@@ -116,7 +116,7 @@ fn sync_test_beacon(
 
 struct NoopBlockBeacon;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for NoopBlockBeacon {
     async fn produce_block_v3(
         &self,

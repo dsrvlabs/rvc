@@ -3,7 +3,6 @@
 //! Split by topic (RF6-09 / F5). Shared mock scaffolding lives here;
 //! topic suites are sibling modules.
 
-#![allow(clippy::arc_with_non_send_sync)]
 #![allow(unused_imports)] // re-exports for topic submodules
 
 // Re-exports for topic submodules (`use super::*`) and sibling modules
@@ -124,7 +123,7 @@ impl AttestationSubmitter for MockSubmitter {
 
 pub(crate) struct MockBlockBeacon;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for MockBlockBeacon {
     async fn produce_block_v3(
         &self,
@@ -177,7 +176,7 @@ pub(crate) struct BadProposerBlockBeacon {
     pub(crate) publish_called: Arc<AtomicBool>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for BadProposerBlockBeacon {
     async fn produce_block_v3(
         &self,

@@ -156,7 +156,7 @@ impl AttestationSubmitter for RecordingSubmitter {
 
 pub struct NoopBlockBeacon;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for NoopBlockBeacon {
     async fn produce_block_v3(
         &self,

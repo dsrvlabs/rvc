@@ -365,7 +365,7 @@ impl TrackingBlockBeacon {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for TrackingBlockBeacon {
     async fn produce_block_v3(
         &self,

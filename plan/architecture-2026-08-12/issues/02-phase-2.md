@@ -347,17 +347,19 @@ together with the scaffold it explains.
   `Arc::new` plus its type goes in the PR body rather than the allow going back in.
 
 **Acceptance criteria.**
-- [ ] `rg 'async_trait\(\?Send\)' --glob '**/*.rs'` returns **only** the prose hit at
+- [x] `rg 'async_trait\(\?Send\)' --glob '**/*.rs'` returns **only** the prose hit at
       `crates/rvc/tests/sync_independent_of_attesting.rs:249` (deleted by ARCH-2c) — zero attributes.
-- [ ] `crates/block-service/src/traits.rs:14` reads `pub trait BeaconBlockClient: Send + Sync`.
-- [ ] `rg 'arc_with_non_send_sync' crates/rvc/src bin/` returns nothing outside `crates/rvc/src/main.rs`
+- [x] `crates/block-service/src/traits.rs:14` reads `pub trait BeaconBlockClient: Send + Sync`.
+- [x] `rg 'arc_with_non_send_sync' crates/rvc/src bin/` returns nothing outside `crates/rvc/src/main.rs`
       (which no longer exists after Phase 0) — satisfying architecture §7.2's secondary obligation,
       which the three-item list could not (VD-2b).
-- [ ] `test_duty_orchestrator_run_future_is_send` compiles and passes.
-- [ ] No bound site gained `+ Send + Sync` (Route B was rejected):
+- [x] `test_duty_orchestrator_run_future_is_send` compiles and passes.
+- [x] No bound site gained `+ Send + Sync` (Route B was rejected):
       `rg 'B: BeaconBlockClient \+ Send'` returns nothing.
-- [ ] `git diff --stat` shows **no** change under `crates/signer/` or `crates/slashing/`.
-- [ ] All §2 standing invariants green; the diff is net-negative in lines.
+- [x] `git diff --stat` shows **no** change under `crates/signer/` or `crates/slashing/`.
+- [x] All §2 standing invariants green; the diff is net-negative in lines.
+
+**Done:** ADR-002 applied — 8 attribute sites (`?Send` → default `#[async_trait]`), `BeaconBlockClient: Send + Sync`, 4 stale `arc_with_non_send_sync` allows removed (VD-2b), compile-time Send pin `test_duty_orchestrator_run_future_is_send`. LocalSet scaffold left for ARCH-2c.
 
 ---
 

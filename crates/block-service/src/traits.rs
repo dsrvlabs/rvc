@@ -10,8 +10,8 @@ use crate::BlockServiceError;
 ///
 /// Defined locally for testability; the real `beacon::BeaconClient`
 /// can be adapted to implement this trait.
-#[async_trait(?Send)]
-pub trait BeaconBlockClient {
+#[async_trait]
+pub trait BeaconBlockClient: Send + Sync {
     async fn produce_block_v3(
         &self,
         slot: Slot,

@@ -2,6 +2,51 @@
 
 use super::*;
 
+/// ADR-002 / ARCH-2b: `DutyOrchestrator::run()`'s future must be `Send` so the
+/// orchestrator can be `tokio::spawn`ed (ARCH-2c / ARCH-2h). Compile-time only —
+/// a runtime assertion cannot observe `!Send`.
+#[test]
+fn test_duty_orchestrator_run_future_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(100);
+
+    let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+
+    let config = create_test_config();
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+    let (mut orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        pubkey_map,
+    ));
+
+    let fut = orchestrator.run();
+    assert_send(&fut);
+    // Drop without polling; this test only proves Send.
+    drop(fut);
+}
+
 #[test]
 fn test_orchestrator_config_new() {
     let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());

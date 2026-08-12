@@ -183,7 +183,6 @@ pub async fn build_services(
         None => Arc::new(BeaconBlockAdapter(main_beacon.clone())),
     };
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let builder_service = Some(builder.build_builder_service(
         signer.clone(),
         main_beacon.clone(),

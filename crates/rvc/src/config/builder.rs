@@ -1,7 +1,5 @@
 //! Service builder for constructing all services from configuration.
 
-#![allow(clippy::arc_with_non_send_sync)]
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -662,7 +660,6 @@ impl ServiceBuilder {
                                     )
                                 })?,
                             prefix: self.config.secret_provider.gcp.secret_prefix.clone(),
-                            ..Default::default()
                         };
                         let gcp_provider =
                             GcpSecretProvider::new(gcp_config).await.map_err(|e| {
