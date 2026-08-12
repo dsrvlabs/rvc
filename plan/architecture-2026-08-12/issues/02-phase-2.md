@@ -68,19 +68,19 @@ for anything but ARCH-2b/2c.
 
 ### Entry criteria
 
-- [ ] **Phase 0 is complete and merged.** Specifically: the four orphan paths no longer exist, so
+- [x] **Phase 0 is complete and merged.** Specifically: the four orphan paths no longer exist, so
       ADR-001's migration list and G-4's scanner never have to reason about the **25** raw
       `tokio::spawn` sites inside them (project-plan §7 Phase 2 *Entry criteria*, C10). Verified at
       HEAD as still present — e.g. `crates/rvc/src/main.rs:1495`, `:1773`, `:1826`, `:1902`, `:1921`,
       `:1944`, `:2060` — which is exactly why this is a hard gate: a G-4 scanner written today over
       `crates/rvc/src/**` reports 7 extra hits it must never learn to ignore.
-- [ ] The **`arch-gates` CI job** (`cargo nextest run -p rvc-architecture-tests`, project-plan A-P1)
+- [x] The **`arch-gates` CI job** (`cargo nextest run -p rvc-architecture-tests`, project-plan A-P1)
       exists, so G-4's RED/GREEN is a fast signal instead of a coverage-job side effect.
-- [ ] Working tree green on all §2 standing invariants: `cargo fmt --all -- --check`,
+- [x] Working tree green on all §2 standing invariants: `cargo fmt --all -- --check`,
       `cargo clippy --workspace --all-targets -- -D warnings`,
       `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings`,
       `cargo build --workspace`, `cargo nextest run --workspace`.
-- [ ] **File-ownership agreed with any concurrent `plan/tracing-2026-08-06/` work** (project-plan
+- [x] **File-ownership agreed with any concurrent `plan/tracing-2026-08-06/` work** (project-plan
       RP2). Phase 2 owns `crates/rvc/src/bootstrap/run.rs`'s task lifecycle for its duration.
 
 ### Exit criteria — the milestone, as a checklist
@@ -97,19 +97,19 @@ for anything but ARCH-2b/2c.
 - [x] The **`LocalSet`/`spawn_local` scaffold at `crates/rvc/tests/sync_independent_of_attesting.rs:269-273`
       is deleted** and the orchestrator future is driven by a bare `tokio::spawn`. That compile is the
       regression pin for spawnability. The scaffold must not reappear (project-plan RP6).
-- [ ] `rg 'process::exit' crates/rvc/src` returns **no hit inside an `async fn`** (today:
+- [x] `rg 'process::exit' crates/rvc/src` returns **no hit inside an `async fn`** (today:
       `bootstrap/run.rs:83`). The named exit codes EXIT_* 10/11/13/14 are preserved and asserted for
       the keystore-lock path (NFR-3).
 - [x] No `tokio::time::sleep` stands in for a join in `bootstrap/run.rs` (today: `:319`).
       *(ARCH-2h: sleep deleted; drain is `executor.shutdown(TierBudget::default())`)*
-- [ ] Every registered task has a name visible in a metric label (`rvc_tasks_running{task}`), and a
+- [x] Every registered task has a name visible in a metric label (`rvc_tasks_running{task}`), and a
       panicking task produces a reasoned shutdown (`ShutdownReason::Failure`) rather than a silent
       leak.
 - [x] ADR-002's **probe verdict is recorded either way** — removal, or a named blocking type plus the
       alternative taken (A-6). Phase 2 cannot stall on it. *(ARCH-2a: clean — see `probe-adr002-verdict.md`)*
-- [ ] `rg 'arc_with_non_send_sync' crates/rvc/src bin/` returns nothing outside the orphan trees
+- [x] `rg 'arc_with_non_send_sync' crates/rvc/src bin/` returns nothing outside the orphan trees
       (VD-2b: **four** tracked sites, not three).
-- [ ] All §2 standing invariants green; no new `unbounded_channel` anywhere in the diff (C9 anchor 6).
+- [x] All §2 standing invariants green; no new `unbounded_channel` anywhere in the diff (C9 anchor 6).
 
 **KAT-first policy (CLAUDE.md).** No issue in this phase adds, renames or moves a test matching
 `.*(tree_hash|signing_root|_root)$`; the phase touches task lifecycle and shutdown only, never a
@@ -485,19 +485,19 @@ live. Do not invent an Infra caller to justify the generic signature, and do not
 - `test_clean_exit_reports_ok_not_panic` — a task returning normally records `outcome = ok`.
 
 **Acceptance criteria.**
-- [ ] `crates/rvc/src/bootstrap/executor.rs` exists and matches architecture §5.1's signatures
+- [x] `crates/rvc/src/bootstrap/executor.rs` exists and matches architecture §5.1's signatures
       (`new`, `token`, `spawn`, `register`, `register_opt`, `shutdown`, `ShutdownOutcome`).
-- [ ] **No new crate** was created (`cargo metadata` member count unchanged from Phase 0's 28) —
+- [x] **No new crate** was created (`cargo metadata` member count unchanged from Phase 0's 28) —
       ADR-001 rejected `rvc-task` for now.
-- [ ] `spawn` is literally implemented as `register(name, tier, tokio::spawn(fut))`; there is exactly
+- [x] `spawn` is literally implemented as `register(name, tier, tokio::spawn(fut))`; there is exactly
       one monitor implementation.
-- [ ] The shutdown-reason channel is `mpsc::channel(8)` and the monitor uses `try_send`;
+- [x] The shutdown-reason channel is `mpsc::channel(8)` and the monitor uses `try_send`;
       `rg 'unbounded_channel' crates/rvc/src/bootstrap/` returns nothing (C9 anchor 6).
-- [ ] The executor takes the **existing** `CancellationToken` (no second exit channel) — `token()`
+- [x] The executor takes the **existing** `CancellationToken` (no second exit channel) — `token()`
       returns a clone usable exactly like today's `shutdown.clone()` at `tasks.rs:97`, `:118`.
-- [ ] `spawn_blocking` appears nowhere in `executor.rs` and no API wraps it (C9 anchor 7).
-- [ ] All six unit tests above pass; the panic test is written with a `timeout`.
-- [ ] Public items carry `///` docs; `register`'s doc states VD-2d's zero-live-call-sites fact and
+- [x] `spawn_blocking` appears nowhere in `executor.rs` and no API wraps it (C9 anchor 7).
+- [x] All six unit tests above pass; the panic test is written with a `timeout`.
+- [x] Public items carry `///` docs; `register`'s doc states VD-2d's zero-live-call-sites fact and
       names Phase 3 as where it becomes live.
 
 ---
@@ -547,16 +547,16 @@ and must be stated rather than discovered.
   (documented in a `compile_fail` doctest or asserted by inspection in review).
 
 **Acceptance criteria.**
-- [ ] `TierBudget::default()` is `[2.0, 2.0, 0.5, 0.5]` seconds, summing to A-7's 5 s, with the sum
+- [x] `TierBudget::default()` is `[2.0, 2.0, 0.5, 0.5]` seconds, summing to A-7's 5 s, with the sum
       asserted by a unit test so a future edit to one tier cannot silently change the total.
-- [ ] Drain is strictly tier-ordered; each tier is fully drained or its budget expires before the
+- [x] Drain is strictly tier-ordered; each tier is fully drained or its budget expires before the
       next begins.
-- [ ] Every abort emits `warn` with the task name; `ShutdownOutcome { joined, aborted }` is returned
+- [x] Every abort emits `warn` with the task name; `ShutdownOutcome { joined, aborted }` is returned
       and logged by the caller.
-- [ ] The token is cancelled exactly **once**, at the top of `shutdown`.
-- [ ] RA-5's decision is recorded in the PR body: either Telemetry stayed 0.5 s (abort-drain) or it
+- [x] The token is cancelled exactly **once**, at the top of `shutdown`.
+- [x] RA-5's decision is recorded in the PR body: either Telemetry stayed 0.5 s (abort-drain) or it
       rose to 2.0 s with the total restated as 6.5 s.
-- [ ] No test uses `sleep` as a proxy for a join.
+- [x] No test uses `sleep` as a proxy for a join.
 
 
 
@@ -952,19 +952,19 @@ contain `spawn_blocking`**, so the prohibition is mechanical rather than a comme
   *demonstrated, not asserted*, and `develop` is never red.
 
 **Acceptance criteria.**
-- [ ] `crates/architecture-tests/tests/raw_spawn.rs` exists, uses no new dependency, and runs under
+- [x] `crates/architecture-tests/tests/raw_spawn.rs` exists, uses no new dependency, and runs under
       the Phase-0 `arch-gates` job.
 - [x] **M8 = 0**: the gate is green on `develop` after ARCH-2g lands. *(ALLOW_LIST emptied with ARCH-2g)*
-- [ ] Every failure message names the offending `path:line` (NFR-5, R10).
-- [ ] **The allow-list is empty** (VD-2f), documented as shrinking-only, with the four out-of-path
+- [x] Every failure message names the offending `path:line` (NFR-5, R10).
+- [x] **The allow-list is empty** (VD-2f), documented as shrinking-only, with the four out-of-path
       Infra sites and their reasons in the file header comment — not as exemption rows.
-- [ ] `spawn_blocking` is neither scanned nor bannable, and a test asserts it.
-- [ ] The VD-2c exclusion test passes and is commented with the reason
+- [x] `spawn_blocking` is neither scanned nor bannable, and a test asserts it.
+- [x] The VD-2c exclusion test passes and is commented with the reason
       (`coordinator/mod.rs:704`'s external `#[cfg(test)] mod tests;`).
-- [ ] A non-vacuity assertion fails the test if the workspace walk visits implausibly few files.
-- [ ] The pre-migration RED output (9 named sites) is in the PR body; no knowingly-failing test was
+- [x] A non-vacuity assertion fails the test if the workspace walk visits implausibly few files.
+- [x] The pre-migration RED output (9 named sites) is in the PR body; no knowingly-failing test was
       merged.
-- [ ] CI runtime does not regress materially (NFR-5) — scanner-style only, no compile-heavy approach.
+- [x] CI runtime does not regress materially (NFR-5) — scanner-style only, no compile-heavy approach.
 
 ---
 
