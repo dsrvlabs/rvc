@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
+use crate::TARGET_AGGREGATORS_PER_COMMITTEE;
 
 /// Determines whether a validator is an aggregator for a given committee.
 ///
@@ -23,7 +23,7 @@ mod tests {
     #[test]
     fn test_is_aggregator_modulo_committee_128() {
         // committee_length=128 → modulo = 128/16 = 8
-        use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
+        use crate::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (128u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 8);
 
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn test_is_aggregator_large_committee() {
         // committee_length=256 → 256/16 = 16
-        use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
+        use crate::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (256u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 16);
 

@@ -3,6 +3,7 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
 mod aggregation;
+mod aggregator;
 mod attestation;
 mod block;
 /// Typed BeaconBlockBody containers + SSZ decode (SEC-6b; foundation for SEC-6c wire).
@@ -64,6 +65,7 @@ pub mod fixtures {
 
 // Crate-root re-exports so existing `eth_types::external_vector_*` / `EXTERNAL_*`
 // paths keep working when the feature is on (dev builds / tests).
+pub use aggregator::is_aggregator;
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
 pub use domains::{

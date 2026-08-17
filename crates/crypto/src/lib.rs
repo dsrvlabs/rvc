@@ -29,7 +29,6 @@
 
 #![deny(rustdoc::broken_intra_doc_links)]
 
-mod aggregation_signing;
 mod bls;
 mod composite_signer;
 pub mod eip2333;
@@ -46,7 +45,6 @@ pub mod test_utils;
 pub mod typed_signer;
 mod voluntary_exit_signing;
 
-pub use aggregation_signing::is_aggregator;
 pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
     SIGNATURE_BYTES_LEN,

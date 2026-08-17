@@ -794,19 +794,19 @@ independent of the function (`:96`). Losing or weakening it in the move is the f
 
 **Acceptance criteria.**
 
-- [ ] `is_aggregator` lives in `eth-types`; `rg 'fn is_aggregator' crates` returns one definition.
-- [ ] `signer::is_aggregator` still resolves; `crates/rvc/src/orchestrator/duty_management.rs` and
+- [x] `is_aggregator` lives in `eth-types`; `rg 'fn is_aggregator' crates` returns one definition.
+- [x] `signer::is_aggregator` still resolves; `crates/rvc/src/orchestrator/duty_management.rs` and
       `aggregation.rs` are **byte-unchanged**.
-- [ ] All ten `test_is_aggregator_*` tests, including the golden-digest KAT, exist in the new location
+- [x] All ten `test_is_aggregator_*` tests, including the golden-digest KAT, exist in the new location
       and pass unmodified.
-- [ ] `crates/eth-types/Cargo.toml` gains **no** dependency; `rvc-eth-types` still satisfies
+- [x] `crates/eth-types/Cargo.toml` gains **no** dependency; `rvc-eth-types` still satisfies
       `ZERO_OUT_EDGE_IF_PRESENT`.
-- [ ] `cargo machete -p rvc-crypto` re-run and clean: removing `is_aggregator` may strand `sha2`
+- [x] `cargo machete -p rvc-crypto` re-run and clean: removing `is_aggregator` may strand `sha2`
       (`crypto/Cargo.toml:34`). ARCH-6f's `cargo machete` pass lands **before** this issue, so nothing
       else catches it.
-- [ ] `crates/crypto/tests/signing_root_kat.rs:28`'s now-stale note is corrected; the file otherwise
+- [x] `crates/crypto/tests/signing_root_kat.rs:28`'s now-stale note is corrected; the file otherwise
       green.
-- [ ] §2 standing commands green.
+- [x] §2 standing commands green.
 
 ### ARCH-6h — Decentralize `metrics::definitions`, and build the acceptance gate that does not exist
 

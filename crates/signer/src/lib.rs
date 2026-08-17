@@ -21,7 +21,7 @@ mod traits;
 #[cfg(any(test, feature = "test-utils"))]
 mod test_utils;
 
-pub use crypto::is_aggregator;
+pub use eth_types::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 #[allow(deprecated)]
@@ -2126,6 +2126,11 @@ mod tests {
     fn test_is_aggregator_reexported() {
         assert!(is_aggregator(0, &[0xaa; 96]));
         assert!(is_aggregator(1, &[0xaa; 96]));
+    }
+
+    #[test]
+    fn signer_reexports_is_aggregator_from_eth_types() {
+        assert!(eth_types::is_aggregator(1, &[0x00; 96]));
     }
 
     fn create_test_electra_aggregate_and_proof(slot: Slot) -> eth_types::ElectraAggregateAndProof {

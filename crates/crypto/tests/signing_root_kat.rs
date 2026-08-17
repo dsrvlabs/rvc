@@ -25,7 +25,8 @@
 //! - **(b) full-signature KATs** — none existed (no 96-byte reference vectors).
 //! - **(c) self-consistency only** — not ported (H5 forbids); listed for RF2-08.
 //!
-//! `is_aggregator` tests are intentionally untouched (function survives RF2-08).
+//! `is_aggregator` (and its tests) live in `eth-types` after ARCH-6g; they are
+//! duty-selection, not signing-root KATs.
 
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, Checkpoint, ContributionAndProof, Domain,
