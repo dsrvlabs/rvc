@@ -713,13 +713,13 @@ green before any behaviour moves.
    behaviour-neutrality proof for this refactor).
 
 **Acceptance criteria.**
-- [ ] A `&self` wait variant exists and compiles alongside concurrent use of `self.duty_management`
+- [x] A `&self` wait variant exists and compiles alongside concurrent use of `self.duty_management`
       (demonstrated by test 1, which borrows both).
-- [ ] The two wait branches at `:549-594` collapse into one hosting structure; builder registration
+- [x] The two wait branches at `:549-594` collapse into one hosting structure; builder registration
       is now a hosted future with unchanged behaviour.
-- [ ] Shutdown still short-circuits the window; named exit paths unchanged.
-- [ ] No new channel, task or `tokio::spawn`; G-4 stays green.
-- [ ] Workspace green with no assertion changes to existing coordinator tests.
+- [x] Shutdown still short-circuits the window; named exit paths unchanged.
+- [x] No new channel, task or `tokio::spawn`; G-4 stays green.
+- [x] Workspace green with no assertion changes to existing coordinator tests.
 
 ---
 

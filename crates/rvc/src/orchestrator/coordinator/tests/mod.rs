@@ -410,3 +410,4 @@ mod slashing_protection;
 mod spans;
 mod sync_gating;
 mod timeouts;
+mod wait_window;

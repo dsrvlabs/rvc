@@ -1,6 +1,7 @@
 //! Main duty orchestrator implementation.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -548,58 +549,50 @@ where
                 }
             }
 
-            // === Post-duty: builder registration (epoch boundary only) ===
-            // Runs concurrently with the next-slot wait via select! so it
-            // doesn't block slot processing. If the next slot arrives before
-            // registration completes, registration is abandoned (non-critical).
+            // === Post-duty: host work in the next-slot wait ===
+            // Occupants (builder registration first) race the wait via
+            // `run_post_duty_window`. Incomplete work is abandoned when the
+            // next slot arrives. Non-occupants stay pending so the wait owns
+            // the window (epoch-boundary + no builder still completes
+            // immediately, matching the previous `if let Some(bs)` body).
             let next_slot = current_slot + 1;
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
             let should_register = current_slot % SLOTS_PER_EPOCH == 0;
-
-            if should_register && !time_until_next_slot.is_zero() {
-                // Clone builder_service before borrowing self for wait_for
-                let builder_service = self.builder_service.clone();
-                let builder_fut = async {
-                    if let Some(bs) = builder_service {
-                        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-                        debug!(
-                            jitter_secs = jitter.as_secs(),
-                            "Delaying builder registration with jitter"
-                        );
-                        tokio::time::sleep(jitter).await;
-                        match tokio::time::timeout(
-                            BUILDER_REGISTRATION_TIMEOUT,
-                            bs.register_validators(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => info!("Builder registration completed"),
-                            Ok(Err(e)) => {
-                                warn!(error = %e, "Builder registration failed (non-fatal)")
-                            }
-                            Err(_) => warn!(
-                                "Builder registration timed out after {}s (non-fatal)",
-                                BUILDER_REGISTRATION_TIMEOUT.as_secs()
-                            ),
-                        }
-                    }
-                };
-                tokio::pin!(builder_fut);
-
-                // Race next-slot wait (incl. shutdown) against registration so a
-                // long registration cannot block the slot loop; registration is
-                // abandoned if the next slot arrives first.
-                tokio::select! {
-                    outcome = self.wait_for(time_until_next_slot) => {
-                        if matches!(outcome, WaitOutcome::Shutdown) {
-                            return Ok(());
-                        }
-                    }
-                    _ = &mut builder_fut => {}
+            let builder_service = self.builder_service.clone();
+            let post_duty_work = async {
+                if !should_register {
+                    std::future::pending::<()>().await;
+                    return;
                 }
-            } else if !time_until_next_slot.is_zero()
-                && matches!(self.wait_for(time_until_next_slot).await, WaitOutcome::Shutdown)
-            {
+                if let Some(bs) = builder_service {
+                    let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+                    debug!(
+                        jitter_secs = jitter.as_secs(),
+                        "Delaying builder registration with jitter"
+                    );
+                    tokio::time::sleep(jitter).await;
+                    match tokio::time::timeout(
+                        BUILDER_REGISTRATION_TIMEOUT,
+                        bs.register_validators(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => info!("Builder registration completed"),
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "Builder registration failed (non-fatal)")
+                        }
+                        Err(_) => warn!(
+                            "Builder registration timed out after {}s (non-fatal)",
+                            BUILDER_REGISTRATION_TIMEOUT.as_secs()
+                        ),
+                    }
+                }
+            };
+
+            if matches!(
+                self.run_post_duty_window(time_until_next_slot, post_duty_work).await,
+                WaitOutcome::Shutdown
+            ) {
                 return Ok(());
             }
         }
@@ -651,20 +644,44 @@ where
 
     /// Wait up to `duration`, returning early if shutdown is requested.
     ///
-    /// Single implementation of the sleep / shutdown-watch race used by every
-    /// phase of the slot loop. Callers must handle [`WaitOutcome::Shutdown`]
-    /// explicitly (the enum forces it).
+    /// Thin `&mut self` delegate around [`Self::wait_for_shared`]. Remove once
+    /// ARCH-3i migrates remaining call sites.
     async fn wait_for(&mut self, duration: Duration) -> WaitOutcome {
+        self.wait_for_shared(duration).await
+    }
+
+    /// `&self` wait: clone the shutdown receiver so the slot-loop wait can
+    /// race owned fields (e.g. `duty_management`) without a double borrow.
+    async fn wait_for_shared(&self, duration: Duration) -> WaitOutcome {
         if !duration.is_zero() {
+            let mut rx = self.shutdown_rx.clone();
             tokio::select! {
                 _ = tokio::time::sleep(duration) => {}
-                _ = self.shutdown_rx.changed() => {}
+                _ = rx.changed() => {}
             }
         }
         if self.check_shutdown() {
             WaitOutcome::Shutdown
         } else {
             WaitOutcome::Continue
+        }
+    }
+
+    /// Race `work` against the next-slot wait. Work that is still pending when
+    /// the slot arrives is abandoned; a ready occupant (or zero duration)
+    /// returns without sleeping, matching the previous builder-registration
+    /// `select!` / skip-wait branches.
+    async fn run_post_duty_window(
+        &self,
+        duration: Duration,
+        work: impl Future<Output = ()>,
+    ) -> WaitOutcome {
+        if duration.is_zero() {
+            return WaitOutcome::Continue;
+        }
+        tokio::select! {
+            outcome = self.wait_for_shared(duration) => outcome,
+            _ = work => WaitOutcome::Continue,
         }
     }
 
