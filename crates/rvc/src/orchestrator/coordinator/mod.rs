@@ -26,6 +26,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
+use super::head_events::HeadEventGate;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
@@ -38,6 +39,11 @@ use crate::pubkey_index::SharedPubkeyIndexRegistry;
 /// each slot.
 pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<[u8; 48], PublicKey>>>;
 
+/// Aggregate pre-proposal budget (A-5 warm default): parent-root capture
+/// including the ARCH-3d walk-back. Cold-cache duty fetch (ARCH-3j) will
+/// share this envelope.
+pub const DEFAULT_PRE_PROPOSAL_DEADLINE: Duration = Duration::from_millis(1000);
+
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
 pub struct OrchestratorConfig {
@@ -45,6 +51,8 @@ pub struct OrchestratorConfig {
     pub fork_schedule: Arc<ForkSchedule>,
     pub shutdown_timeout: Duration,
     pub timeouts: OperationTimeouts,
+    /// Single timeout around pre-proposal capture (not per-request).
+    pub pre_proposal_deadline: Duration,
 }
 
 impl OrchestratorConfig {
@@ -54,6 +62,7 @@ impl OrchestratorConfig {
             fork_schedule,
             shutdown_timeout: Duration::from_secs(30),
             timeouts: OperationTimeouts::default(),
+            pre_proposal_deadline: DEFAULT_PRE_PROPOSAL_DEADLINE,
         }
     }
 
@@ -64,6 +73,11 @@ impl OrchestratorConfig {
 
     pub fn with_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    pub fn with_pre_proposal_deadline(mut self, deadline: Duration) -> Self {
+        self.pre_proposal_deadline = deadline;
         self
     }
 }
@@ -149,6 +163,8 @@ where
     /// Global attesting gate. When false, attestation duties are skipped.
     /// Independent of sync-committee processing (`sync_enabled`, H-7).
     pub attesting_enabled: Arc<AtomicBool>,
+    /// Phase-2 wait seam (ARCH-3l timer-only; ARCH-3m races the head event).
+    pub head_gate: HeadEventGate,
 }
 
 impl<C, S, B> OrchestratorDeps<C, S, B>
@@ -182,6 +198,7 @@ where
         pubkey_map: PubkeyMap,
     ) -> Self {
         let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        let (_bridge, head_gate) = HeadEventGate::pair();
         Self {
             clock,
             duty_tracker,
@@ -197,6 +214,7 @@ where
             key_gen_rx,
             circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            head_gate,
         }
     }
 }
@@ -239,6 +257,8 @@ where
     /// Next slot's phase-0 offset is labelled `cache=cold` when true (post-boot
     /// or post-key_gen invalidation). Cleared after the offset is recorded.
     phase_block_cache_cold: bool,
+    /// Phase-2 wait: timer-only until ARCH-3m races the SSE head event.
+    head_gate: HeadEventGate,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -268,6 +288,7 @@ where
             key_gen_rx,
             circuit_breaker,
             attesting_enabled,
+            head_gate,
         } = deps;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -342,6 +363,7 @@ where
             sync_enabled,
             validator_store,
             phase_block_cache_cold: true,
+            head_gate,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -350,9 +372,10 @@ where
     }
 
     /// Runs the orchestrator main loop with three-phase slot processing:
-    /// - t=0: epoch boundary duty fetch + block proposal
-    /// - t=slot/3: attestations + sync committee messages
+    /// - t=0: bounded parent capture + block proposal
+    /// - t=slot/3: attestations + sync committee messages (HeadEventGate wait)
     /// - t=2*slot/3: sync committee contributions
+    /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
 
@@ -380,38 +403,33 @@ where
             // subsequent slots do not clear forever after a single notify (S1).
             self.apply_key_gen_cache_invalidation().await;
 
-            // === Epoch boundary: fetch all duty types ===
-            self.duty_management
-                .fetch_epoch_duties(current_epoch)
-                .instrument(slot_span.clone())
-                .await;
-            self.duty_management
-                .fetch_epoch_duties(current_epoch + 1)
-                .instrument(slot_span.clone())
-                .await;
-
-            // Proposer preparation and committee subscriptions (non-fatal)
-            if current_slot % SLOTS_PER_EPOCH == 0 {
-                self.circuit_breaker.reset_epoch(current_epoch);
-                self.update_circuit_breaker_metrics();
-                info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
-
-                let epoch_span =
-                    info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                self.duty_management
-                    .on_epoch_boundary(current_epoch, current_slot)
-                    .instrument(epoch_span)
-                    .await;
-            }
-
             // === Phase 1: t=0 — Block proposal ===
-            // Parent from slot-1 at t=0. Head is captured at phase 2 and
-            // reused at phase 3 (H-5). Both queries are slot-qualified (L-5).
-            let mut ctx =
-                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await;
+            // Parent from slot-1 at t=0, bounded by the aggregate pre-proposal
+            // deadline (covers the 3d walk-back). Head is captured at phase 2
+            // and reused at phase 3 (H-5).
+            let mut ctx = match tokio::time::timeout(
+                self.config.pre_proposal_deadline,
+                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch),
+            )
+            .await
+            {
+                Ok(ctx) => ctx,
+                Err(_) => {
+                    warn!(
+                        slot = current_slot,
+                        deadline_ms = self.config.pre_proposal_deadline.as_millis() as u64,
+                        "Pre-proposal parent capture timed out"
+                    );
+                    SlotContext {
+                        slot: current_slot,
+                        epoch: current_epoch,
+                        parent_root: None,
+                        head_root: None,
+                    }
+                }
+            };
             {
                 // M2: offset from slot start to entry of maybe_propose_block.
-                // Recorded after duty fetches / epoch-boundary work (not a reorder).
                 self.record_phase_block_start_offset(current_slot);
                 let phase_span = info_span!(parent: &slot_span, "slot.phase.block");
                 self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
@@ -436,7 +454,7 @@ where
                     drop(_guard);
 
                     if matches!(
-                        self.wait_for(time_until_attestation)
+                        self.wait_for_attestation_or_head(current_slot, time_until_attestation)
                             .instrument(att_phase_span.clone())
                             .await,
                         WaitOutcome::Shutdown
@@ -554,43 +572,64 @@ where
             }
 
             // === Post-duty: host work in the next-slot wait ===
-            // Occupants (builder registration first) race the wait via
-            // `run_post_duty_window`. Incomplete work is abandoned when the
-            // next slot arrives. Non-occupants stay pending so the wait owns
-            // the window (epoch-boundary + no builder still completes
-            // immediately, matching the previous `if let Some(bs)` body).
+            // Occupants race the wait via `run_post_duty_window`. Incomplete
+            // work is abandoned when the next slot arrives. The future stays
+            // pending after occupants so a warm-cache fetch cannot skip the
+            // remainder of the slot.
             let next_slot = current_slot + 1;
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
             let should_register = current_slot % SLOTS_PER_EPOCH == 0;
             let builder_service = self.builder_service.clone();
             let post_duty_work = async {
-                if !should_register {
-                    std::future::pending::<()>().await;
-                    return;
-                }
-                if let Some(bs) = builder_service {
-                    let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-                    debug!(
-                        jitter_secs = jitter.as_secs(),
-                        "Delaying builder registration with jitter"
-                    );
-                    tokio::time::sleep(jitter).await;
-                    match tokio::time::timeout(
-                        BUILDER_REGISTRATION_TIMEOUT,
-                        bs.register_validators(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => info!("Builder registration completed"),
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "Builder registration failed (non-fatal)")
+                self.duty_management
+                    .fetch_epoch_duties(current_epoch)
+                    .instrument(slot_span.clone())
+                    .await;
+                self.duty_management
+                    .fetch_epoch_duties(current_epoch + 1)
+                    .instrument(slot_span.clone())
+                    .await;
+
+                if should_register {
+                    self.circuit_breaker.reset_epoch(current_epoch);
+                    self.update_circuit_breaker_metrics();
+                    info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
+
+                    let epoch_span =
+                        info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
+                    self.duty_management
+                        .on_epoch_boundary(current_epoch, current_slot)
+                        .instrument(epoch_span)
+                        .await;
+
+                    if let Some(bs) = builder_service {
+                        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+                        debug!(
+                            jitter_secs = jitter.as_secs(),
+                            "Delaying builder registration with jitter"
+                        );
+                        tokio::time::sleep(jitter).await;
+                        match tokio::time::timeout(
+                            BUILDER_REGISTRATION_TIMEOUT,
+                            bs.register_validators(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => info!("Builder registration completed"),
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "Builder registration failed (non-fatal)")
+                            }
+                            Err(_) => warn!(
+                                "Builder registration timed out after {}s (non-fatal)",
+                                BUILDER_REGISTRATION_TIMEOUT.as_secs()
+                            ),
                         }
-                        Err(_) => warn!(
-                            "Builder registration timed out after {}s (non-fatal)",
-                            BUILDER_REGISTRATION_TIMEOUT.as_secs()
-                        ),
                     }
                 }
+
+                // Why: fetches return immediately on a warm cache. Completing
+                // this future would take the ready work arm and busy-spin.
+                std::future::pending::<()>().await;
             };
 
             if matches!(
@@ -648,10 +687,32 @@ where
 
     /// Wait up to `duration`, returning early if shutdown is requested.
     ///
-    /// Thin `&mut self` delegate around [`Self::wait_for_shared`]. Remove once
-    /// ARCH-3i migrates remaining call sites.
+    /// Thin `&mut self` delegate around [`Self::wait_for_shared`]. Phase 2
+    /// uses [`Self::wait_for_attestation_or_head`].
     async fn wait_for(&mut self, duration: Duration) -> WaitOutcome {
         self.wait_for_shared(duration).await
+    }
+
+    /// Phase-2 wait: [`HeadEventGate::wait_for_head_or`] (timer-only today)
+    /// raced with shutdown. ARCH-3m implements the head-event arm in the gate.
+    async fn wait_for_attestation_or_head(&self, slot: Slot, timer: Duration) -> WaitOutcome {
+        if timer.is_zero() {
+            return if self.check_shutdown() {
+                WaitOutcome::Shutdown
+            } else {
+                WaitOutcome::Continue
+            };
+        }
+        let mut rx = self.shutdown_rx.clone();
+        tokio::select! {
+            _ = self.head_gate.wait_for_head_or(slot, timer) => {}
+            _ = rx.changed() => {}
+        }
+        if self.check_shutdown() {
+            WaitOutcome::Shutdown
+        } else {
+            WaitOutcome::Continue
+        }
     }
 
     /// `&self` wait: clone the shutdown receiver so the slot-loop wait can

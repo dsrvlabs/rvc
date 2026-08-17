@@ -260,6 +260,9 @@ pub async fn run(
 
     let validator_count = pubkey_map.read().len();
     let bn_count = config.effective_beacon_nodes().len();
+    // ARCH-3l/3i: register bn.sse (Background) and hand the gate to the slot loop.
+    let head_gate = spawn_sse_subscriber(Some(Arc::clone(&bn_manager)), &executor)
+        .unwrap_or_else(|| crate::orchestrator::HeadEventGate::pair().1);
     let (mut orchestrator, orchestrator_handle) =
         crate::orchestrator::DutyOrchestrator::new(crate::orchestrator::OrchestratorDeps {
             clock: slot_clock,
@@ -276,6 +279,7 @@ pub async fn run(
             key_gen_rx,
             circuit_breaker,
             attesting_enabled: attesting_enabled.clone(),
+            head_gate,
         });
 
     // Step 8b: slashing monitor (P1-8/P1-9 via register_opt / spawn).
@@ -326,10 +330,6 @@ pub async fn run(
         pubkey_map.clone(),
         validator_store.clone(),
     )?;
-
-    // ARCH-3l: register the start_sse JoinHandle as Background "bn.sse".
-    // Gate is held so the watch receiver stays alive for ARCH-3m.
-    let _head_event_gate = spawn_sse_subscriber(Some(Arc::clone(&bn_manager)), &executor);
 
     // Log broadcast topics if non-default (T3.4)
     {

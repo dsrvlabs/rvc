@@ -170,6 +170,13 @@ fn test_builder_registration_timeout_is_reasonable() {
     assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
 }
 
+#[test]
+fn test_pre_proposal_deadline_default_is_one_second() {
+    assert_eq!(DEFAULT_PRE_PROPOSAL_DEADLINE, Duration::from_millis(1000));
+    let config = create_test_config();
+    assert_eq!(config.pre_proposal_deadline, DEFAULT_PRE_PROPOSAL_DEADLINE);
+}
+
 // `as_secs() * 2 / 3`), now exact for non-12 s / Gloas slots (report §4.3).
 #[test]
 fn test_aggregation_waits_until_two_thirds_8000ms_mainnet() {

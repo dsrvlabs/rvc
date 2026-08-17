@@ -31,7 +31,11 @@ fn block_root_body() -> serde_json::Value {
 }
 
 /// Mount empty attester/proposer duty responses and a block-root for `SlotContext`.
-async fn mount_slot_loop_mocks(mock_server: &MockServer, duty_delay: Option<Duration>) {
+async fn mount_slot_loop_mocks(
+    mock_server: &MockServer,
+    duty_delay: Option<Duration>,
+    root_delay: Option<Duration>,
+) {
     let mut attester = ResponseTemplate::new(200).set_body_json(empty_duty_body());
     let mut proposer = ResponseTemplate::new(200).set_body_json(empty_duty_body());
     if let Some(d) = duty_delay {
@@ -58,9 +62,13 @@ async fn mount_slot_loop_mocks(mock_server: &MockServer, duty_delay: Option<Dura
         .mount(mock_server)
         .await;
 
+    let mut root = ResponseTemplate::new(200).set_body_json(block_root_body());
+    if let Some(d) = root_delay {
+        root = root.set_delay(d);
+    }
     Mock::given(method("GET"))
         .and(path_regex(r"/eth/v1/beacon/blocks/.*/root"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(block_root_body()))
+        .respond_with(root)
         .mount(mock_server)
         .await;
 }
@@ -79,7 +87,7 @@ async fn test_slot_phase_block_start_offset_is_recorded_each_slot() {
     let _guard = m2_metric_lock().await;
 
     let mock_server = MockServer::start().await;
-    mount_slot_loop_mocks(&mock_server, None).await;
+    mount_slot_loop_mocks(&mock_server, None, None).await;
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     // Non-boundary slot; past 2/3 so phase waits are zero.
@@ -145,7 +153,7 @@ async fn test_slot_phase_block_start_offset_is_recorded_each_slot() {
     assert!(observed >= 0.0, "offset must be >= 0, got {observed}");
 }
 
-/// Mock BN duty-fetch delay must appear in the recorded offset (instrument credibility).
+/// Mock BN parent-root delay must appear in the recorded offset (instrument credibility).
 #[tokio::test(flavor = "current_thread")]
 async fn test_offset_reflects_pre_proposal_work() {
     let _guard = m2_metric_lock().await;
@@ -153,7 +161,7 @@ async fn test_offset_reflects_pre_proposal_work() {
     let mock_server = MockServer::start().await;
     // Wall-clock delay large enough for second-resolution SystemSlotClock.
     let delay = Duration::from_secs(2);
-    mount_slot_loop_mocks(&mock_server, Some(delay)).await;
+    mount_slot_loop_mocks(&mock_server, None, Some(delay)).await;
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let slot = 1_000u64;
@@ -167,7 +175,6 @@ async fn test_offset_reflects_pre_proposal_work() {
         .with_timeout(Duration::from_secs(30))
         .with_max_retries(0);
     let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-    // Non-empty pubkey list so duty fetches are attempted (and delayed).
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["0x01".to_string()]));
 
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
@@ -176,7 +183,7 @@ async fn test_offset_reflects_pre_proposal_work() {
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
     let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
 
-    // Allow delayed responses to complete (do not trip duty_fetch timeout first).
+    // Deadline must exceed the injected parent-root delay so capture completes.
     let timeouts = OperationTimeouts { duty_fetch: Duration::from_secs(10), ..fast_timeouts() };
 
     let cold_sum_before = histogram_sum(slot_phase_cache::COLD);
@@ -192,11 +199,13 @@ async fn test_offset_reflects_pre_proposal_work() {
         create_mock_block_beacon(),
         None,
         create_mock_validator_store(),
-        create_test_config().with_timeouts(timeouts),
+        create_test_config()
+            .with_timeouts(timeouts)
+            .with_pre_proposal_deadline(Duration::from_secs(10)),
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    // Duty delay can be multi-second; allow headroom then shut down mid-wait.
+    // Parent-root delay can be multi-second; allow headroom then shut down.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(15)).await;
         handle.shutdown();
@@ -220,7 +229,7 @@ async fn test_offset_reflects_pre_proposal_work() {
     let min_per_sample = sum_delta / cold_added as f64;
     assert!(
         min_per_sample >= delay.as_millis() as f64,
-        "offset must reflect pre-proposal duty delay D={}ms; got avg cold offset {min_per_sample}ms \
+        "offset must reflect pre-proposal parent-root delay D={}ms; got avg cold offset {min_per_sample}ms \
          (sum_delta={sum_delta}, cold_added={cold_added})",
         delay.as_millis()
     );
@@ -232,7 +241,7 @@ async fn test_offset_labels_cold_after_key_gen_invalidation() {
     let _guard = m2_metric_lock().await;
 
     let mock_server = MockServer::start().await;
-    mount_slot_loop_mocks(&mock_server, None).await;
+    mount_slot_loop_mocks(&mock_server, None, None).await;
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(65);

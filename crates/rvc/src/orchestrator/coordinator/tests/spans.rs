@@ -157,7 +157,7 @@ async fn test_epoch_boundary_creates_epoch_span() {
     clock.set_slot(32); // slot 32 = epoch 1, IS at epoch boundary (32 % 32 == 0)
     clock.advance_time(9);
 
-    let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+    let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
     let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
@@ -444,7 +444,7 @@ async fn test_epoch_boundary_span_is_child_of_slot_process() {
     clock.set_slot(32); // epoch boundary
     clock.advance_time(9);
 
-    let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+    let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
     let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));

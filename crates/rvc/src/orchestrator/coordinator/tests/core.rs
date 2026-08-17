@@ -366,6 +366,7 @@ fn test_orchestrator_deps_requires_key_gen_receiver() {
         "key_gen_rx",
         "circuit_breaker",
         "attesting_enabled",
+        "head_gate",
     ];
     assert!(field_names.contains(&"key_gen_rx"), "OrchestratorDeps must require key_gen_rx");
     // Constructing via for_test yields a usable receiver field (type-checked).

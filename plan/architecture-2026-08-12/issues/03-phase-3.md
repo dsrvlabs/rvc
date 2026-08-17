@@ -781,16 +781,16 @@ four things that must move or be bounded, and all four are verified at HEAD:
    `LocalSet` scaffold may be reintroduced (Phase 2 entry criterion).
 
 **Acceptance criteria.**
-- [ ] All four enumerated items are moved or bounded; nothing else moves.
-- [ ] `maybe_propose_block` is entered before any epoch duty fetch on every slot.
-- [ ] An aggregate pre-proposal deadline exists and covers the `parent_root` capture including 3d's
+- [x] All four enumerated items are moved or bounded; nothing else moves.
+- [x] `maybe_propose_block` is entered before any epoch duty fetch on every slot.
+- [x] An aggregate pre-proposal deadline exists and covers the `parent_root` capture including 3d's
       walk-back.
-- [ ] An epoch-boundary / dependent-root trigger still fetches duties in time; no epoch's duties are
+- [x] An epoch-boundary / dependent-root trigger still fetches duties in time; no epoch's duties are
       fetched later than today relative to their first use.
-- [ ] The `head_events` seam exists as a behaviour-neutral no-op (Stream B's scaffold).
-- [ ] Behaviour-contract test shows **which** duties are performed is unchanged and only **when**
+- [x] The `head_events` seam exists as a behaviour-neutral no-op (Stream B's scaffold).
+- [x] Behaviour-contract test shows **which** duties are performed is unchanged and only **when**
       changed.
-- [ ] No new `unbounded_channel`; no new raw `tokio::spawn` (G-4 green).
+- [x] No new `unbounded_channel`; no new raw `tokio::spawn` (G-4 green).
 
 ---
 

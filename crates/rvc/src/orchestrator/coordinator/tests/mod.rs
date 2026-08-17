@@ -401,6 +401,7 @@ mod duty_management;
 mod fork_transition;
 mod phase_block_offset;
 mod proposal;
+mod proposal_first;
 mod slashing_protection;
 mod spans;
 mod sync_gating;

@@ -327,7 +327,7 @@ lazy_static! {
     /// Histogram for slot phase-0 start offset in milliseconds (M2).
     ///
     /// Measures the slot-clock offset from nominal slot start to entry of
-    /// `maybe_propose_block` (after duty fetches and epoch-boundary work).
+    /// `maybe_propose_block` (after bounded parent-root capture).
     /// This is an offset observation, not a success/failure signal — large
     /// values indicate pre-proposal work ran long, not a protocol error.
     ///
