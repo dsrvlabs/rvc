@@ -10,14 +10,14 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
+    BlockRootData, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
     ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration, Slot,
 };
 
 use crate::traits::{
@@ -26,6 +26,11 @@ use crate::traits::{
 };
 
 type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
+
+/// Same variant `BeaconClient` surfaces for HTTP 404 (`GET .../blocks/{block_id}/root`).
+fn block_root_not_found() -> BeaconError {
+    BeaconError::ApiError { status: 404, message: "Block not found".to_string() }
+}
 
 struct MethodHook<A, R> {
     handler: Mutex<Option<Handler<A, R>>>,
@@ -152,6 +157,32 @@ impl MockBeaconNodeClient {
         f: impl Fn(String) -> Result<BlockRootResponse, BeaconError> + Send + Sync + 'static,
     ) -> Self {
         self.get_block_root.set_handler(Arc::new(f));
+        self
+    }
+
+    /// Spec-honest block-root stub: `block_id` values that name a slot at or after
+    /// `head_slot` answer `404` the way a conformant BN does (beacon-APIs
+    /// `blocks/{block_id}/root`); `"head"`, `"finalized"` and slots <= head resolve
+    /// to `root_for(slot)`. Skipped slots named in `skipped` also 404.
+    pub fn with_slot_aware_block_root(
+        self,
+        head_slot: Slot,
+        skipped: &[Slot],
+        root_for: impl Fn(Option<Slot>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        let skipped = skipped.to_vec();
+        self.get_block_root.set_handler(Arc::new(move |block_id: String| {
+            let slot = if block_id == "head" || block_id == "finalized" {
+                None
+            } else {
+                let parsed = block_id.parse::<Slot>().map_err(|_| block_root_not_found())?;
+                if parsed >= head_slot || skipped.contains(&parsed) {
+                    return Err(block_root_not_found());
+                }
+                Some(parsed)
+            };
+            Ok(BlockRootResponse { data: BlockRootData { root: root_for(slot) } })
+        }));
         self
     }
 
@@ -674,5 +705,52 @@ mod tests {
         assert_eq!(mock.get_node_version().await.unwrap(), "MockBeacon/v0.0.0");
         let err = mock.get_genesis().await.unwrap_err();
         assert!(matches!(err, BeaconError::HttpError(_)));
+    }
+
+    fn slot_aware_mock(head_slot: Slot, skipped: &[Slot]) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_slot_aware_block_root(
+            head_slot,
+            skipped,
+            |slot| match slot {
+                Some(s) => format!("0xslot{s}"),
+                None => "0xnamed".to_string(),
+            },
+        )
+    }
+
+    fn assert_block_not_found(err: BeaconError) {
+        match err {
+            BeaconError::ApiError { status: 404, .. } => {}
+            other => panic!("expected ApiError 404, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_slot_aware_stub_404s_a_slot_at_head() {
+        let mock = slot_aware_mock(100, &[]);
+        assert_block_not_found(mock.get_block_root("100").await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn test_slot_aware_stub_resolves_a_past_slot() {
+        let mock = slot_aware_mock(100, &[]);
+        let resp = mock.get_block_root("99").await.expect("past slot must resolve");
+        assert_eq!(resp.data.root, "0xslot99");
+    }
+
+    #[tokio::test]
+    async fn test_slot_aware_stub_404s_a_skipped_slot() {
+        let mock = slot_aware_mock(100, &[99]);
+        assert_block_not_found(mock.get_block_root("99").await.unwrap_err());
+        let resp = mock.get_block_root("98").await.expect("non-skipped past slot must resolve");
+        assert_eq!(resp.data.root, "0xslot98");
+    }
+
+    #[tokio::test]
+    async fn test_slot_aware_stub_resolves_head_literal() {
+        let mock = slot_aware_mock(100, &[]);
+        let head = mock.get_block_root("head").await.expect("head literal must resolve");
+        let past = mock.get_block_root("99").await.expect("past slot must resolve");
+        assert_ne!(head.data.root, past.data.root);
     }
 }

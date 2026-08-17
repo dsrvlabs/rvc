@@ -339,12 +339,12 @@ through it does not unconditionally succeed.
 `test_slot_aware_stub_returns_root` would not be.
 
 **Acceptance criteria.**
-- [ ] `with_slot_aware_block_root` exists, is documented with `///`, and names the beacon-API
+- [x] `with_slot_aware_block_root` exists, is documented with `///`, and names the beacon-API
       behaviour it emulates.
-- [ ] Slot ids `>= head_slot` and slots listed as skipped return the BN's 404 error variant; past
+- [x] Slot ids `>= head_slot` and slots listed as skipped return the BN's 404 error variant; past
       non-skipped slots and `"head"` return distinct roots.
-- [ ] Four unit tests above are green; no test name carries a scanner suffix; `EXEMPTIONS` unchanged.
-- [ ] No existing call site changes in this issue (it is additive) — `cargo nextest run --workspace`
+- [x] Four unit tests above are green; no test name carries a scanner suffix; `EXEMPTIONS` unchanged.
+- [x] No existing call site changes in this issue (it is additive) — `cargo nextest run --workspace`
       is green with zero test-behaviour changes elsewhere.
 
 ---
