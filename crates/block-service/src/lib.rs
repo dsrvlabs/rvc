@@ -9,7 +9,8 @@ mod traits;
 mod types;
 mod validation;
 
+pub use beacon::ProduceBlockResponse;
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::{BeaconBlockClient, ProduceBlockResponse};
+pub use traits::BeaconBlockClient;
 pub use types::BlockSelectionMode;

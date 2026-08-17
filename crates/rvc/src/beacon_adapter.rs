@@ -24,20 +24,10 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        let response = self
-            .0
+        self.0
             .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
             .await
-            .map_err(|e| BlockServiceError::Beacon(e.to_string()))?;
-
-        Ok(ProduceBlockResponse {
-            data: response.data,
-            is_blinded: response.is_blinded,
-            consensus_version: response.consensus_version,
-            execution_payload_value: response.execution_payload_value,
-            is_ssz: response.is_ssz,
-            ssz_bytes: response.ssz_bytes,
-        })
+            .map_err(Into::into)
     }
 
     async fn publish_block(
@@ -183,5 +173,43 @@ mod tests {
             .await
             .expect("proposer-pool produce_block_v3");
         assert_eq!(produced.execution_payload_value.as_deref(), Some("proposer-value"));
+    }
+
+    /// Pins that the adapter hop keeps all six ProduceBlockResponse fields,
+    /// including the SSZ pair that a field-copy can drop. Passes with the
+    /// current copy and after it is deleted.
+    #[tokio::test]
+    async fn beacon_adapter_preserves_all_six_fields_for_an_ssz_response() {
+        let server = MockServer::start().await;
+        let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/500"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ssz_payload.clone(), "application/octet-stream")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Value", "99999"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("ssz BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+
+        let produced = adapter
+            .produce_block_v3(500, "0xrandao", None, None)
+            .await
+            .expect("ssz produce_block_v3");
+
+        assert_eq!(produced.data, serde_json::Value::Null);
+        assert!(!produced.is_blinded);
+        assert_eq!(produced.consensus_version, "deneb");
+        assert_eq!(produced.execution_payload_value.as_deref(), Some("99999"));
+        assert!(produced.is_ssz);
+        assert_eq!(produced.ssz_bytes.as_deref(), Some(ssz_payload.as_slice()));
     }
 }

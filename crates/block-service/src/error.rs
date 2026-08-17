@@ -1,3 +1,4 @@
+use beacon::BeaconError;
 use eth_types::Root;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -34,4 +35,13 @@ pub enum BlockServiceError {
         hex::encode(got)
     )]
     ParentRootMismatch { expected: Root, got: Root },
+}
+
+impl From<BeaconError> for BlockServiceError {
+    fn from(err: BeaconError) -> Self {
+        match err {
+            BeaconError::ParseError(msg) => Self::Parse(msg),
+            other => Self::Beacon(other.to_string()),
+        }
+    }
 }

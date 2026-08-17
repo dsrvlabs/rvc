@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 
-use eth_types::{
-    BlindedBeaconBlock, BlockContents, SignedBeaconBlock, SignedBlindedBeaconBlock, Slot,
-};
+use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 
 use crate::BlockServiceError;
+
+pub use beacon::ProduceBlockResponse;
 
 /// Minimal beacon client trait for block production and publication.
 ///
@@ -41,31 +41,68 @@ pub trait BeaconBlockClient: Send + Sync {
     ) -> Result<(), BlockServiceError>;
 }
 
-/// Response from block production, mirroring beacon API metadata.
-///
-/// Supports both JSON and SSZ content types. When the BN responds with SSZ,
-/// `is_ssz` is `true` and `ssz_bytes` contains the raw SSZ-encoded block.
-/// When JSON, `data` contains the parsed JSON value.
-#[derive(Debug, Clone)]
-pub struct ProduceBlockResponse {
-    pub data: serde_json::Value,
-    pub is_blinded: bool,
-    pub consensus_version: String,
-    pub execution_payload_value: Option<String>,
-    /// Whether the response was received as SSZ (`application/octet-stream`).
-    pub is_ssz: bool,
-    /// Raw SSZ bytes when the BN responded with SSZ content type.
-    pub ssz_bytes: Option<Vec<u8>>,
-}
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
 
-impl ProduceBlockResponse {
-    pub fn parse_full_block(&self) -> Result<BlockContents, BlockServiceError> {
-        serde_json::from_value(self.data.clone())
-            .map_err(|e| BlockServiceError::Parse(format!("invalid block contents: {}", e)))
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .parent()
+            .expect("workspace root")
+            .to_path_buf()
     }
 
-    pub fn parse_blinded_block(&self) -> Result<BlindedBeaconBlock, BlockServiceError> {
-        serde_json::from_value(self.data.clone())
-            .map_err(|e| BlockServiceError::Parse(format!("invalid blinded block: {}", e)))
+    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// M9: `rg` for the ProduceBlockResponse struct over `crates/**/src` is one path.
+    /// Needle is assembled so this file cannot itself match the scan.
+    #[test]
+    fn only_one_produce_block_response_definition_exists() {
+        let root = workspace_root();
+        let crates_dir = root.join("crates");
+        let needle = ["struct ", "ProduceBlockResponse"].concat();
+        let mut hits = Vec::new();
+
+        let entries = std::fs::read_dir(&crates_dir).expect("read crates/");
+        for entry in entries.flatten() {
+            let src = entry.path().join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            let mut files = Vec::new();
+            collect_rs(&src, &mut files);
+            for file in files {
+                let Ok(contents) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                if contents.contains(&needle) {
+                    let rel = file.strip_prefix(&root).unwrap_or(&file);
+                    hits.push(rel.display().to_string());
+                }
+            }
+        }
+        hits.sort();
+
+        let expected =
+            Path::new("crates").join("beacon").join("src").join("types.rs").display().to_string();
+        assert_eq!(
+            hits.as_slice(),
+            [expected.as_str()],
+            "ProduceBlockResponse must have exactly one struct definition under crates/**/src; found: {hits:?}"
+        );
     }
 }

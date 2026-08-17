@@ -545,19 +545,19 @@ than a changed signature, so the diff stays inside the two parse call chains.
 
 **Acceptance criteria.**
 
-- [ ] `rg 'struct ProduceBlockResponse' crates/**/src` returns **exactly one** hit
+- [x] `rg 'struct ProduceBlockResponse' crates/**/src` returns **exactly one** hit
       (`crates/beacon/src/types.rs:132`). **M9 drops by one.**
-- [ ] `crates/rvc/src/beacon_adapter.rs` contains no `ProduceBlockResponse { … }` struct literal.
-- [ ] `impl From<BeaconError> for BlockServiceError` exists; no `parse_*` call site uses
+- [x] `crates/rvc/src/beacon_adapter.rs` contains no `ProduceBlockResponse { … }` struct literal.
+- [x] `impl From<BeaconError> for BlockServiceError` exists; no `parse_*` call site uses
       `.map_err(|e| …to_string())` to launder the error.
-- [ ] **No new workspace edge**: `git diff <base> -- '**/Cargo.toml'` is empty, and
+- [x] **No new workspace edge**: `git diff <base> -- '**/Cargo.toml'` is empty, and
       `cargo test -p rvc-architecture-tests --test architecture_doc_matches_graph` is green **without
       regenerating** `ARCHITECTURE.md`.
-- [ ] `crates/rvc/src/beacon_adapter.rs:18`'s `#[async_trait(?Send)]` and `traits.rs:13` are
+- [x] `crates/rvc/src/beacon_adapter.rs:18`'s `#[async_trait(?Send)]` and `traits.rs:13` are
       **byte-unchanged** (Phase 2 owns them): `git diff <base> -- crates/block-service/src/traits.rs`
       shows only the struct/impl deletion and the re-export.
-- [ ] The three existing adapter wiremock tests pass unmodified.
-- [ ] §2 standing commands green.
+- [x] The three existing adapter wiremock tests pass unmodified.
+- [x] §2 standing commands green.
 
 ---
 
