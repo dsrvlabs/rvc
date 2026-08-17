@@ -478,12 +478,12 @@ is not permitted to grow the t=0 critical path without a ceiling.
 — none ends in a scanner suffix (A-3.8).
 
 **Acceptance criteria.**
-- [ ] Up to four slot-qualified attempts (`slot-1 … slot-4`), first success wins.
-- [ ] Terminal `"head"` fallback is `warn!`-logged **and** counted with a dedicated metric, so its
+- [x] Up to four slot-qualified attempts (`slot-1 … slot-4`), first success wins.
+- [x] Terminal `"head"` fallback is `warn!`-logged **and** counted with a dedicated metric, so its
       real-world frequency is observable rather than assumed.
-- [ ] A transport-level failure does not consume all four attempts.
+- [x] A transport-level failure does not consume all four attempts.
 - [ ] The walk-back is inside whatever pre-proposal deadline 3i establishes (cross-checked in 3k).
-- [ ] `EXEMPTIONS` unchanged; workspace green.
+- [x] `EXEMPTIONS` unchanged; workspace green.
 
 ---
 

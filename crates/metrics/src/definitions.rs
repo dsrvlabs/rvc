@@ -399,6 +399,21 @@ lazy_static! {
         counter
     };
 
+    /// Parent-root walk-back fallbacks at t=0 (ARCH-3d).
+    ///
+    /// Labels: `reason` — `walk_back_exhausted` after four slot-qualified misses.
+    pub static ref RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_slot_context_parent_fallback_total",
+            "Total number of SlotContext parent_root fallbacks after walk-back"
+        );
+        let counter = IntCounterVec::new(opts, &["reason"])
+            .expect("Failed to create rvc_slot_context_parent_fallback_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_slot_context_parent_fallback_total metric");
+        counter
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -432,6 +447,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_TASKS_RUNNING);
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
+    lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
 }
 
 /// Attestation status label values.
@@ -477,6 +493,11 @@ pub mod task_exit_outcome {
     pub const OK: &str = "ok";
     pub const PANIC: &str = "panic";
     pub const CANCELLED: &str = "cancelled";
+}
+
+/// `reason` label values for `rvc_slot_context_parent_fallback_total`.
+pub mod slot_context_parent_fallback {
+    pub const WALK_BACK_EXHAUSTED: &str = "walk_back_exhausted";
 }
 
 #[cfg(test)]
@@ -580,6 +601,17 @@ mod tests {
         RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
         let value = RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.get();
         assert!(value >= 1, "Circuit breaker trips counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn test_slot_context_parent_fallback_total_increments() {
+        RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
+            .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
+            .inc();
+        let value = RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
+            .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
+            .get();
+        assert!(value >= 1, "Parent fallback counter should be at least 1 after increment");
     }
 
     #[test]
