@@ -63,8 +63,16 @@
 //! No external dependency (Phase-1 rule P6): hand-rolled walk, same idiom as
 //! `kat_policy.rs`.
 //!
+//! ## 3. M4 wording — VD-4.3 (done)
+//!
+//! Project-plan milestone M4 writes `rg 'figment'` returns nothing. Unscoped,
+//! that is false at HEAD and after a flawless execution (planning documents name
+//! the crate). The corrected guard is source-scoped to `crates/`, `bin/`, root
+//! `Cargo.toml`, and `Cargo.lock`, and matches a **dependency** signal, not the
+//! English word.
+//!
 //! Cross-ref: architecture §6 G-3; ADR-008; ADR-010; plan ARCH-4a / ARCH-4b /
-//! VD-4.4 / VD-4.5 / C3.
+//! ARCH-4c; VD-4.3 / VD-4.4 / VD-4.5 / C3.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1527,4 +1535,368 @@ fn grandfathered_table_is_documented_shrinking_only() {
         window.contains("figment") && window.contains("ADR-008"),
         "C3: class 3 must say a figment Env layer would violate this gate and ADR-008 avoids the dep; window={window}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Figment absence (ARCH-4c / VD-4.3)
+// ---------------------------------------------------------------------------
+
+/// Why the dependency is forbidden. Failure copy must include this sentence.
+const FIGMENT_ABSENCE_WHY: &str = "ADR-008 rejects figment outright; C3 forbids an env layer, and this repo honours it by not taking the dependency.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FigmentHit {
+    file: String,
+    line: usize,
+}
+
+impl FigmentHit {
+    fn diagnostic(&self) -> String {
+        format!("{}:{}: figment dependency", self.file, self.line)
+    }
+}
+
+fn figment_absence_message(hits: &[FigmentHit]) -> String {
+    let listed = hits.iter().map(FigmentHit::diagnostic).collect::<Vec<_>>().join("\n  ");
+    format!("{listed}\n{FIGMENT_ABSENCE_WHY}")
+}
+
+/// Source-scoped roots: `crates/`, `bin/`, workspace `Cargo.toml`, `Cargo.lock`.
+fn is_figment_source_path(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    rel == "Cargo.toml"
+        || rel == "Cargo.lock"
+        || rel.starts_with("crates/")
+        || rel.starts_with("bin/")
+}
+
+enum FigmentFile {
+    Toml,
+    Lock,
+    Rust,
+    Other,
+}
+
+fn figment_file_kind(rel: &str) -> FigmentFile {
+    let rel = rel.replace('\\', "/");
+    let base = rel.rsplit('/').next().unwrap_or(rel.as_str());
+    if base == "Cargo.lock" {
+        FigmentFile::Lock
+    } else if base == "Cargo.toml" || base.ends_with(".toml") {
+        FigmentFile::Toml
+    } else if base.ends_with(".rs") {
+        FigmentFile::Rust
+    } else {
+        FigmentFile::Other
+    }
+}
+
+fn figment_hits_in(rel: &str, src: &str) -> Vec<FigmentHit> {
+    if !is_figment_source_path(rel) {
+        return Vec::new();
+    }
+    match figment_file_kind(rel) {
+        FigmentFile::Toml => figment_line_hits(rel, src, toml_line_is_figment_dep),
+        FigmentFile::Lock => figment_line_hits(rel, src, lock_line_is_figment),
+        FigmentFile::Rust => figment_line_hits(rel, src, rust_line_is_figment_crate_use),
+        FigmentFile::Other => Vec::new(),
+    }
+}
+
+fn figment_line_hits(file: &str, src: &str, pred: fn(&str) -> bool) -> Vec<FigmentHit> {
+    src.lines()
+        .enumerate()
+        .filter(|(_, line)| pred(line))
+        .map(|(i, _)| FigmentHit { file: file.to_string(), line: i + 1 })
+        .collect()
+}
+
+fn hash_comment_code(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_str = !in_str;
+        } else if !in_str && b == b'#' {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
+fn strip_toml_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+fn toml_key_is_figment(key: &str) -> bool {
+    let key = strip_toml_quotes(key);
+    key == "figment" || key.starts_with("figment.")
+}
+
+fn toml_table_names_figment(inner: &str) -> bool {
+    inner.split('.').any(|seg| strip_toml_quotes(seg.trim()) == "figment")
+}
+
+fn toml_has_package_figment(code: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = code[from..].find("package") {
+        let at = from + rel;
+        from = at + "package".len();
+        if at > 0 && is_ident_char(code.as_bytes()[at - 1]) {
+            continue;
+        }
+        if from < code.len() && is_ident_char(code.as_bytes()[from]) {
+            continue;
+        }
+        let rest = code[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if rest.starts_with("\"figment\"") || rest.starts_with("'figment'") {
+            return true;
+        }
+    }
+    false
+}
+
+fn toml_line_is_figment_dep(line: &str) -> bool {
+    let code = hash_comment_code(line).trim();
+    if code.is_empty() {
+        return false;
+    }
+    if let Some(inner) = code.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return toml_table_names_figment(inner);
+    }
+    if let Some(eq) = code.find('=') {
+        let key = code[..eq].trim();
+        if !key.is_empty() && !key.contains('[') && toml_key_is_figment(key) {
+            return true;
+        }
+    }
+    toml_has_package_figment(code)
+}
+
+fn lock_line_is_figment(line: &str) -> bool {
+    let t = line.trim();
+    if t == "name = \"figment\"" {
+        return true;
+    }
+    let item = t.trim_end_matches(',').trim();
+    item == "\"figment\"" || item.starts_with("\"figment ")
+}
+
+fn ident_is_figment_at(src: &str, at: usize) -> bool {
+    const NEEDLE: &str = "figment";
+    if !src[at..].starts_with(NEEDLE) {
+        return false;
+    }
+    let bytes = src.as_bytes();
+    if at > 0 && is_ident_char(bytes[at - 1]) {
+        return false;
+    }
+    let end = at + NEEDLE.len();
+    end >= bytes.len() || !is_ident_char(bytes[end])
+}
+
+fn keyword_at_end(s: &str, kw: &str) -> bool {
+    if !s.ends_with(kw) {
+        return false;
+    }
+    let start = s.len() - kw.len();
+    start == 0 || !is_ident_char(s.as_bytes()[start - 1])
+}
+
+fn span_is_in_double_quotes(code: &str, at: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < at && i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_str = !in_str;
+        }
+        i += 1;
+    }
+    in_str
+}
+
+fn rust_is_crate_use(code: &str, at: usize) -> bool {
+    let after = &code[at + "figment".len()..];
+    if after.starts_with("::") {
+        return true;
+    }
+    let before = code[..at].trim_end();
+    let before = before.strip_suffix("::").map(str::trim_end).unwrap_or(before);
+    if keyword_at_end(before, "use") {
+        return true;
+    }
+    if keyword_at_end(before, "crate") {
+        let rest = before[..before.len() - "crate".len()].trim_end();
+        return keyword_at_end(rest, "extern");
+    }
+    false
+}
+
+fn rust_line_is_figment_crate_use(line: &str) -> bool {
+    if is_comment_only_line(line) {
+        return false;
+    }
+    let code = code_portion(line);
+    let mut from = 0;
+    while let Some(rel) = code[from..].find("figment") {
+        let at = from + rel;
+        from = at + "figment".len();
+        if !ident_is_figment_at(code, at) || span_is_in_double_quotes(code, at) {
+            continue;
+        }
+        if rust_is_crate_use(code, at) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_figment_scan_filename(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name == "Cargo.toml"
+        || name == "Cargo.lock"
+        || path.extension().is_some_and(|e| e == "rs" || e == "toml")
+}
+
+fn collect_figment_tree(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            collect_figment_tree(&path, out);
+        } else if is_figment_scan_filename(&path) {
+            out.push(path);
+        }
+    }
+}
+
+fn collect_figment_scan_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![root.join("Cargo.toml"), root.join("Cargo.lock")];
+    collect_figment_tree(&root.join("crates"), &mut out);
+    collect_figment_tree(&root.join("bin"), &mut out);
+    out
+}
+
+fn scan_figment_workspace() -> (Vec<PathBuf>, Vec<FigmentHit>) {
+    let root = workspace_root();
+    let files = collect_figment_scan_files(&root);
+    let mut hits = Vec::new();
+    for file in &files {
+        let rel = file.strip_prefix(&root).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let src = std::fs::read_to_string(file).unwrap_or_default();
+        hits.extend(figment_hits_in(&rel, &src));
+    }
+    (files, hits)
+}
+
+fn assert_figment_hit_names_file(file: &str, src: &str) {
+    let hits = figment_hits_in(file, src);
+    assert!(!hits.is_empty(), "expected a figment hit in {file}; src={src:?}");
+    assert!(hits.iter().all(|h| h.file == file), "hit must name the file; got {hits:?}");
+    let msg = figment_absence_message(&hits);
+    assert!(msg.contains(file), "failure must name the file; got {msg}");
+    assert!(msg.contains(FIGMENT_ABSENCE_WHY), "failure must say why; got {msg}");
+}
+
+#[test]
+fn figment_manifest_dep_line_names_the_file() {
+    assert_figment_hit_names_file("crates/rvc/Cargo.toml", "figment = \"0.10\"\n");
+}
+
+#[test]
+fn figment_toml_table_and_rename_and_git_name_the_file() {
+    assert_figment_hit_names_file(
+        "crates/rvc/Cargo.toml",
+        "[dependencies.figment]\nversion = \"0.10\"\n",
+    );
+    assert_figment_hit_names_file(
+        "crates/rvc/Cargo.toml",
+        "cfg = { package = \"figment\", version = \"0.10\" }\n",
+    );
+    assert_figment_hit_names_file(
+        "crates/rvc/Cargo.toml",
+        "figment = { git = \"https://github.com/SergioBenitez/Figment\" }\n",
+    );
+}
+
+#[test]
+fn figment_lock_lines_name_the_file() {
+    assert_figment_hit_names_file("Cargo.lock", "name = \"figment\"\n");
+    assert_figment_hit_names_file("Cargo.lock", " \"figment 0.10.19\",\n");
+}
+
+#[test]
+fn figment_rust_crate_use_names_the_file() {
+    assert_figment_hit_names_file("crates/rvc/src/lib.rs", "extern crate figment;\n");
+    assert_figment_hit_names_file("crates/rvc/src/lib.rs", "let _ = figment::Figment::new();\n");
+}
+
+#[test]
+fn figment_scan_ignores_plan_documents() {
+    let src = "use figment::providers::Env;\nfigment = \"0.10\"\n";
+    let plan = "plan/architecture-2026-08-12/project-plan.md";
+    assert!(!is_figment_source_path(plan), "plan/ is outside crates/ bin/ Cargo.toml Cargo.lock");
+    assert!(
+        figment_hits_in(plan, src).is_empty(),
+        "a plan/ path containing figment must not trip the gate"
+    );
+    let rust_hits = figment_hits_in("crates/rvc/src/lib.rs", "use figment::providers::Env;\n");
+    assert!(!rust_hits.is_empty(), "the same crate-use under crates/ must be in scope");
+}
+
+#[test]
+fn figment_dependency_is_absent_from_source() {
+    let root = workspace_root();
+    let lock = root.join("Cargo.lock");
+    assert!(lock.is_file(), "workspace Cargo.lock must exist; lock backstop otherwise vacuous");
+    let lock_src = std::fs::read_to_string(&lock).expect("workspace Cargo.lock must be readable");
+    assert!(
+        !lock_src.is_empty() && lock_src.contains("[[package]]"),
+        "workspace Cargo.lock is empty or not a lockfile; lock backstop did not run"
+    );
+
+    let (files, hits) = scan_figment_workspace();
+    assert!(files.len() > 100, "figment scan walked only {} files; walk likely broke", files.len());
+    assert!(
+        files.iter().any(|f| f.file_name().is_some_and(|n| n == "Cargo.toml")),
+        "figment scan must include Cargo.toml"
+    );
+    assert!(
+        files.iter().any(|f| f == &lock),
+        "figment scan must include the workspace-root Cargo.lock path"
+    );
+    let files_norm: Vec<String> =
+        files.iter().map(|f| f.to_string_lossy().replace('\\', "/")).collect();
+    assert!(
+        files_norm.iter().any(|s| s.contains("/crates/") && s.ends_with(".rs")),
+        "figment scan must walk crates/"
+    );
+    assert!(
+        files_norm.iter().any(|s| s.contains("/bin/") && s.ends_with(".rs")),
+        "figment scan must walk bin/"
+    );
+    assert!(hits.is_empty(), "{}", figment_absence_message(&hits));
 }

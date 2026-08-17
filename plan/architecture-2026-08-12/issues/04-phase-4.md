@@ -452,10 +452,10 @@ figment check from **VD-4.3**.
 
 **Acceptance criteria.**
 
-- [ ] `arch-gates` runs `env_allowlist.rs`; a red gate fails CI in the fast job, not in `coverage`.
-- [ ] `figment_dependency_is_absent_from_source` green at HEAD, RED-demonstrated against a scratch
+- [x] `arch-gates` runs `env_allowlist.rs`; a red gate fails CI in the fast job, not in `coverage`.
+- [x] `figment_dependency_is_absent_from_source` green at HEAD, RED-demonstrated against a scratch
       manifest, and scoped to `crates/ bin/ Cargo.toml Cargo.lock`.
-- [ ] The project plan's M4 wording is annotated in this file's §3 as VD-4.3 (done) — **no edit is
+- [x] The project plan's M4 wording is annotated in this file's §3 as VD-4.3 (done) — **no edit is
       made to `project-plan.md`** (output confinement).
 
 ---

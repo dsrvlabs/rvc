@@ -233,5 +233,6 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # G-3 (`tests/env_allowlist.rs`: env allow-list + figment absence) is in this package.
       - name: Run architecture tests
         run: cargo nextest run -p rvc-architecture-tests
