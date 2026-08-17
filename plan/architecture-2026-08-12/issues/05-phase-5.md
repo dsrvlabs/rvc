@@ -1345,11 +1345,11 @@ change, and keeps this issue at 2 points and this file single-owner.
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] The map is bounded under churn, asserted by a test.
-- [ ] No held lock is ever evicted — asserted via `Arc::ptr_eq`, not via timing.
-- [ ] No `.await` inside the map lock; no public signature change; no caller edited.
-- [ ] The capacity default carries a written rationale.
-- [ ] **No hook into key admission or removal** (C4 / NFR-4): `git diff --stat` touches only
+- [x] The map is bounded under churn, asserted by a test.
+- [x] No held lock is ever evicted — asserted via `Arc::ptr_eq`, not via timing.
+- [x] No `.await` inside the map lock; no public signature change; no caller edited.
+- [x] The capacity default carries a written rationale.
+- [x] **No hook into key admission or removal** (C4 / NFR-4): `git diff --stat` touches only
       `crates/signer/src/locks.rs` and the new test file.
 
 ---
