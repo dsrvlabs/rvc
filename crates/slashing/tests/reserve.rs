@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use metrics::definitions::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
+use rvc_slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
     BlockSlashingViolation, CommittedReservation, InterchangeAttestation, InterchangeBlock,
     InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome, ReservationKind,

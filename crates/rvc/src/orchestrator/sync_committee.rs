@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::metrics::{
+    sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
+};
 use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
     is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
-};
-use metrics::definitions::{
-    sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
 };
 use observability::logging::TruncatedRoot;
 use signer::{SignerService, ValidatorSigner};
@@ -350,14 +350,14 @@ mod tests {
         },
     };
 
+    use crate::metrics::{
+        sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
+    };
     use beacon::{DataResponse, ExecutionOptimisticResponse};
     use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{ForkSchedule, Root, SyncCommitteeDuty};
-    use metrics::definitions::{
-        sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
-    };
     use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use validator_store::{ValidatorConfig, ValidatorStore};

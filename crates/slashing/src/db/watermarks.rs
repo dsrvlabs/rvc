@@ -13,9 +13,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use super::{normalize_pubkey, SlashingDb};
 use crate::error::SlashingError;
+use crate::metrics;
 use crate::types::PruneStats;
 use eth_types::{Epoch, Slot};
-use metrics::definitions as metrics;
 
 /// Discriminant for a row in the `watermarks` table.
 ///

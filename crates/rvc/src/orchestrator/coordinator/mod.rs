@@ -15,10 +15,11 @@ use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root, Slot};
-use metrics::definitions::{
-    attestation_status, pre_proposal_cold_fetch, slot_phase_cache, RVC_ATTESTATIONS_TOTAL,
+use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
+
+use crate::metrics::{
+    attestation_status, pre_proposal_cold_fetch, RVC_ATTESTATIONS_TOTAL,
     RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
-    RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
 };
 use signer::{CircuitBreakerState, SignerService};
 use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};

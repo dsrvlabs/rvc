@@ -20,8 +20,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crypto::{PublicKey, SecretKey, Signature, Signer, SigningError};
 use eth_types::Root;
-use metrics::definitions::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_signer::{NoopSignHooks, SigningGateError, SlashableSignSession, TimeoutPolicy};
+use slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use slashing::{BlockSlashingViolation, CommittedReservation, SlashingDb, SlashingError};
 
 use common::{

@@ -14,6 +14,7 @@ mod error;
 mod fail_closed;
 mod gate;
 mod locks;
+pub mod metrics;
 mod service_util;
 mod traits;
 
@@ -3848,7 +3849,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_all_signer_metrics_still_recorded_after_core_delegation() {
-        use metrics::definitions::{
+        use crate::metrics::{
             attestation_status, slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL,
             RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SIGNING_DURATION_SECONDS,
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL,

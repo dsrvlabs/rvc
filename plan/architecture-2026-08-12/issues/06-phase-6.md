@@ -882,18 +882,18 @@ does.
 
 **Acceptance criteria.**
 
-- [ ] `crates/metrics/src/definitions.rs` contains no domain-named `pub static ref`; each domain metric
+- [x] `crates/metrics/src/definitions.rs` contains no domain-named `pub static ref`; each domain metric
       is declared by its owning crate.
-- [ ] `crates/metrics/tests/metric_name_stability.rs` exists, pins **24** names, and its RED (one
+- [x] `crates/metrics/tests/metric_name_stability.rs` exists, pins **24** names, and its RED (one
       metric removed) is pasted in the PR. **This is the "metrics-conformance gate" ARCH-P2-3 is
       accepted against — it did not exist before this issue (VD-6-6).**
-- [ ] The domain-vocabulary scanner exists and is green.
-- [ ] `crates/metrics/Cargo.toml` still declares **zero** workspace dependencies (so `rvc-metrics`
+- [x] The domain-vocabulary scanner exists and is green.
+- [x] `crates/metrics/Cargo.toml` still declares **zero** workspace dependencies (so `rvc-metrics`
       remains `Base`-eligible under A-6-3 and G-5a stays green over it).
-- [ ] `crates/signer/tests/tx_hold_metric.rs` green unmodified; the double-registration guard passes.
-- [ ] The `/metrics` endpoint's exposed name set is byte-identical before and after — no operator
+- [x] `crates/signer/tests/tx_hold_metric.rs` green unmodified; the double-registration guard passes.
+- [x] The `/metrics` endpoint's exposed name set is byte-identical before and after — no operator
       dashboard breaks.
-- [ ] §2 standing commands green.
+- [x] §2 standing commands green.
 
 ---
 

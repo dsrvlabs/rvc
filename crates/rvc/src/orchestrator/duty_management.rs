@@ -5,11 +5,11 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use duty_tracker::DutyTracker;
 use eth_types::Slot;
-use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
 use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 

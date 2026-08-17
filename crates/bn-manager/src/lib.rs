@@ -4,6 +4,7 @@ mod broadcast;
 mod error;
 mod health;
 mod manager;
+pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 mod mock;
 pub mod sse;

@@ -10,6 +10,7 @@ pub mod grpc_health;
 pub mod key_admission;
 pub mod keymanager_adapters;
 pub mod liveness_loop;
+pub mod metrics;
 pub mod orchestrator;
 pub mod pubkey_index;
 pub mod slashing_monitor;

@@ -6,11 +6,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use metrics::definitions::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL;
 use rvc::background_tasks::config_url::{
     apply_proposer_config_updates, fetch_proposer_config, start_proposer_config_refresh,
     ProposerConfigUrlSettings,
 };
+use rvc::metrics::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL;
 use tokio_util::sync::CancellationToken;
 use validator_store::{ValidatorConfig, ValidatorConfigUpdate, ValidatorStore};
 use wiremock::matchers::method;

@@ -315,11 +315,11 @@ pub async fn start_proposer_config_refresh(
             let count = updates.len();
             apply_fn(updates, default_update);
             info!(count, "Initial proposer config loaded from URL");
-            metrics::definitions::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
+            crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
         }
         Err(e) => {
             warn!(error = %e, "Failed to load initial proposer config from URL");
-            metrics::definitions::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
+            crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
         }
     }
 
@@ -343,11 +343,11 @@ pub async fn start_proposer_config_refresh(
                         let count = updates.len();
                         apply_fn(updates, default_update);
                         debug!(count, "Proposer config refreshed from URL");
-                        metrics::definitions::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
+                        crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
                     }
                     Err(e) => {
                         warn!(error = %e, "Failed to refresh proposer config from URL, retaining existing config");
-                        metrics::definitions::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
+                        crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
                     }
                 }
             }

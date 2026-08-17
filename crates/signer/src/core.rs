@@ -46,14 +46,14 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crypto::{PublicKey, Signature, Signer, SigningError};
-use doppelganger::SigningEnablement;
-use eth_types::Root;
-use metrics::definitions::{
+use crate::metrics::{
     attestation_status, slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL,
     RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SIGNING_DURATION_SECONDS,
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
 };
+use crypto::{PublicKey, Signature, Signer, SigningError};
+use doppelganger::SigningEnablement;
+use eth_types::Root;
 use observability::logging::TruncatedPubkey;
 use slashing::{
     CommittedReservation, PendingAudit, PubkeyScopedDb, ReconcileOutcome, ReservationKind,

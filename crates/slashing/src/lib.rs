@@ -7,6 +7,7 @@ mod audit;
 mod db;
 mod error;
 mod history;
+pub mod metrics;
 mod reader;
 mod rules;
 mod scoped;

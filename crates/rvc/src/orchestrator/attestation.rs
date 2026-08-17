@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use tracing::{debug, info, info_span, warn, Instrument};
 
+use crate::metrics::{
+    orchestrator_result, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
+    RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
+};
 use beacon::{AttesterDuty, LegacyAttestation, SingleAttestation, VersionedAttestation};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, Propagator};
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
-use metrics::definitions::{
-    orchestrator_result, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
-    RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
-};
 use observability::logging::TruncatedPubkey;
 use signer::{SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};

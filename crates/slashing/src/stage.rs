@@ -109,13 +109,13 @@ use rusqlite::Connection;
 use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
 use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
+use crate::metrics;
 use crate::rules::{
     check_attestation, check_block, AttestationCandidate, AttestationVerdict,
     AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
 };
 use crate::SlashingDb;
 use eth_types::{Epoch, Root, Slot};
-use metrics::definitions as metrics;
 use observability::logging::TruncatedPubkey;
 
 use std::sync::atomic::Ordering;

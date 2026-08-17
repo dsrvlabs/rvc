@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
+use crate::metrics::RVC_DUTIES_FETCHED_TOTAL;
 use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty};
 use eth_types::{SyncCommitteeDuty, SLOTS_PER_EPOCH};
-use metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 
 use crate::error::DutyTrackerError;
 

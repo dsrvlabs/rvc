@@ -329,6 +329,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
                 // Ensure prune metrics are registered before the handler increments them.
                 metrics::definitions::init_metrics();
+                slashing::metrics::init();
                 commands::slashing::execute_prune(commands::slashing::PruneArgs {
                     slashing_db_path,
                     dry_run,

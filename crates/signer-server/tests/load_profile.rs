@@ -49,11 +49,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use metrics::definitions::{
-    reconcile_outcome, tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
-    RVC_SLASHING_RECONCILE_TOTAL, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
-};
 use prometheus::Histogram;
+use signer::metrics::{
+    tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
+};
+use slashing::metrics::{reconcile_outcome, RVC_SLASHING_RECONCILE_TOTAL};
 use tonic::Request;
 
 use signer_server::proto::signer_v2 as sv2;

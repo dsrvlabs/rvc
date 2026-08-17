@@ -1,14 +1,14 @@
 //! ARCH-3j: bounded cold-cache pre-proposal proposer fetch (C6).
 
 use super::*;
+use crate::metrics::{
+    pre_proposal_cold_fetch, RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS,
+    RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
+};
 use beacon::{DependentRootResponse, ExecutionOptimisticResponse, ProposerDuty};
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
 use bn_manager::MockBeaconNodeClient;
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock};
-use metrics::definitions::{
-    pre_proposal_cold_fetch, RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS,
-    RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
-};
 use parking_lot::Mutex as ParkingMutex;
 use std::time::Instant;
 use timing::SLOTS_PER_EPOCH;

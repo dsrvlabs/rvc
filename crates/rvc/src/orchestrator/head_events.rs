@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use bn_manager::{HeadEvent, SseEvent};
 use eth_types::Slot;
-use metrics::definitions::{
-    attestation_trigger_source, RVC_ATTESTATION_TRIGGER_TOTAL, RVC_SSE_EVENTS_DROPPED_TOTAL,
-};
+use metrics::definitions::RVC_SSE_EVENTS_DROPPED_TOTAL;
+
+use crate::metrics::{attestation_trigger_source, RVC_ATTESTATION_TRIGGER_TOTAL};
 use tokio::sync::watch;
 
 /// Why [`HeadEventGate::wait_for_head_or`] returned: 1/3-slot timer or head event.
@@ -136,9 +136,11 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Instant;
 
-    use metrics::definitions::{
+    use metrics::definitions::RVC_MONITORING_PUSH_FAILURES_TOTAL;
+
+    use crate::metrics::{
         attestation_status, attestation_trigger_source, RVC_ATTESTATIONS_TOTAL,
-        RVC_ATTESTATION_TRIGGER_TOTAL, RVC_MONITORING_PUSH_FAILURES_TOTAL,
+        RVC_ATTESTATION_TRIGGER_TOTAL,
     };
     use tokio::sync::{Mutex, MutexGuard};
     use tracing_test::traced_test;

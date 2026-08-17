@@ -12,7 +12,9 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use beacon::{BeaconError, SubmitAttestationResult, VersionedAttestation};
-use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use metrics::definitions::attestation_status;
+
+use crate::metrics::RVC_ATTESTATIONS_TOTAL;
 
 use crate::traits::{AttestationApi, BeaconNodeClient};
 

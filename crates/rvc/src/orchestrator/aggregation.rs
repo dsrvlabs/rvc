@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, info_span, warn, Instrument, Span};
 
+use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use beacon::{AttesterDuty, VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
 use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
@@ -10,7 +11,6 @@ use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
     SignedElectraAggregateAndProof, Slot,
 };
-use metrics::definitions::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use observability::logging::TruncatedPubkey;
 use signer::{is_aggregator, SignerService, ValidatorSigner};
 use tree_hash::TreeHash;
