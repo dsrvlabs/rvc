@@ -7,6 +7,7 @@ Recorded under **ARCH-7c** on harness commit `92d9bbde0aedec10dce43db20fd8c51bea
 |---|---|---|
 | [`m1-missed-proposals.md`](./m1-missed-proposals.md) | **M1** miss rate under duty-fetch stall | ~100 % cold×60 s miss is **expected**; ADR-004 / Phase 3 owns 0 % |
 | [`m2-slot-phase0-offset.md`](./m2-slot-phase0-offset.md) | **M2** `rvc_slot_phase_block_start_offset_ms` p99 warm/cold | Separate warm/cold p99 for A-5 targets (≤1 s / ≤2 s) |
+| [`m1-m2-post-phase3.md`](./m1-m2-post-phase3.md) | **M1/M2 after ADR-004** (ARCH-3k) | M1 = 0 at 60 s and 80 s; M2 p99 0 ms at slot start (≤1 s / ≤2 s) |
 
 Future scale baseline (not this task): `m3-scale-200keys-200ms.md` (ARCH-7m / Phase 5–7).
 

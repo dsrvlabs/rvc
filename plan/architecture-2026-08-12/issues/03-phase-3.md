@@ -907,16 +907,16 @@ the suffix matcher (A-3.8). Watch this one: dropping the trailing word would put
 test into the KAT scanner's scope.
 
 **Acceptance criteria.**
-- [ ] **M1 = 0 missed proposals** with duty fetches stalled the full 60 s — and the 80 s envelope
+- [x] **M1 = 0 missed proposals** with duty fetches stalled the full 60 s — and the 80 s envelope
       (**VD-35**) additionally covered.
-- [ ] **M2 p99 ≤ 1,000 ms warm / ≤ 2,000 ms cold**, all three scenarios, measured with Phase 0's
+- [x] **M2 p99 ≤ 1,000 ms warm / ≤ 2,000 ms cold**, all three scenarios, measured with Phase 0's
       instrument.
-- [ ] The cold-cache scenarios **propose** when a duty exists (the test fails if the check is
+- [x] The cold-cache scenarios **propose** when a duty exists (the test fails if the check is
       skipped) — C6.
-- [ ] Post-change numbers recorded as a file in `plan/architecture-2026-08-12/`, next to the
+- [x] Post-change numbers recorded as a file in `plan/architecture-2026-08-12/`, next to the
       baselines.
-- [ ] The harness uses spec-honest block-root stubs and a bare `tokio::spawn`ed orchestrator.
-- [ ] Behaviour-contract test from 3i still green.
+- [x] The harness uses spec-honest block-root stubs and a bare `tokio::spawn`ed orchestrator.
+- [x] Behaviour-contract test from 3i still green.
 
 ---
 
