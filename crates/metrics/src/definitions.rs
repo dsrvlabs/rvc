@@ -447,6 +447,22 @@ lazy_static! {
         histogram
     };
 
+    /// How phase-2 attestation wait returned (ARCH-3m).
+    ///
+    /// Labels: `source` — `timer` | `head_event`. The 1/3-slot timer stays
+    /// authoritative; `head_event` is a latency optimisation.
+    pub static ref RVC_ATTESTATION_TRIGGER_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_attestation_trigger_total",
+            "Attestation phase-2 waits completed by source (timer or head event)"
+        );
+        let counter = IntCounterVec::new(opts, &["source"])
+            .expect("Failed to create rvc_attestation_trigger_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_attestation_trigger_total metric");
+        counter
+    };
+
     /// Sync committee duties skipped because phase-2 `head_root` is missing (ARCH-3e).
     ///
     /// Labels: `phase` — `messages` | `contributions`; `reason` — `no_head_root`.
@@ -496,6 +512,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
+    lazy_static::initialize(&RVC_ATTESTATION_TRIGGER_TOTAL);
     lazy_static::initialize(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
     lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL);
     lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS);
@@ -569,6 +586,12 @@ pub mod pre_proposal_cold_fetch {
     pub const TIMEOUT: &str = "timeout";
 }
 
+/// `source` label values for `rvc_attestation_trigger_total`.
+pub mod attestation_trigger_source {
+    pub const TIMER: &str = "timer";
+    pub const HEAD_EVENT: &str = "head_event";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +662,7 @@ mod tests {
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.001);
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
         RVC_SSE_EVENTS_DROPPED_TOTAL.inc();
+        RVC_ATTESTATION_TRIGGER_TOTAL.with_label_values(&[attestation_trigger_source::TIMER]).inc();
 
         let metrics = REGISTRY.gather();
         let metric_names: Vec<&str> = metrics.iter().map(|m| m.name()).collect();
@@ -662,6 +686,10 @@ mod tests {
         assert!(
             metric_names.contains(&"rvc_sse_events_dropped_total"),
             "rvc_sse_events_dropped_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_attestation_trigger_total"),
+            "rvc_attestation_trigger_total should be registered"
         );
     }
 

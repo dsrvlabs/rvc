@@ -1045,14 +1045,14 @@ revertible (NFR-4): its worst-case regression is latency, never a duty.
    `error!` is emitted and the failure counters are untouched (C7 by construction, not by convention).
 
 **Acceptance criteria.**
-- [ ] Attestations trigger on "1/3-slot timer **or** head event, whichever first"; the timer remains
+- [x] Attestations trigger on "1/3-slot timer **or** head event, whichever first"; the timer remains
       authoritative.
-- [ ] Dropping **every** SSE event still yields every attestation on the timer.
-- [ ] An early event fires the attestation sooner, with **no duplicate**.
-- [ ] Events for other slots are ignored.
-- [ ] No `error!`, no failure metric on drop or failover; the drop counter is labelled expected.
-- [ ] Trigger source is counted with a label, so the optimisation is measurable.
-- [ ] The change touches only `head_events.rs` (no cross-stream conflict) and is revertible in one
+- [x] Dropping **every** SSE event still yields every attestation on the timer.
+- [x] An early event fires the attestation sooner, with **no duplicate**.
+- [x] Events for other slots are ignored.
+- [x] No `error!`, no failure metric on drop or failover; the drop counter is labelled expected.
+- [x] Trigger source is counted with a label, so the optimisation is measurable.
+- [x] The change touches only `head_events.rs` (no cross-stream conflict) and is revertible in one
       commit.
 
 ---
