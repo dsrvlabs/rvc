@@ -73,7 +73,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     ///
     /// Validates `proposer_index` against `expected_proposer_index` and, when
     /// `expected_parent_root` is `Some`, validates `parent_root` against the
-    /// BN-reported head before calling the signer. On validation failure the
+    /// previous-slot parent before calling the signer. On validation failure the
     /// duty is dropped with an `error!` log and no signer call is made (H-4).
     #[tracing::instrument(
         name = "block.propose",

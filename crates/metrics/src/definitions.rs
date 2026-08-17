@@ -414,6 +414,21 @@ lazy_static! {
         counter
     };
 
+    /// Sync committee duties skipped because phase-2 `head_root` is missing (ARCH-3e).
+    ///
+    /// Labels: `phase` — `messages` | `contributions`; `reason` — `no_head_root`.
+    pub static ref RVC_SYNC_COMMITTEE_SKIPPED_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_sync_committee_skipped_total",
+            "Total number of sync committee duties skipped"
+        );
+        let counter = IntCounterVec::new(opts, &["phase", "reason"])
+            .expect("Failed to create rvc_sync_committee_skipped_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_sync_committee_skipped_total metric");
+        counter
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -448,6 +463,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
+    lazy_static::initialize(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
 }
 
 /// Attestation status label values.
@@ -498,6 +514,17 @@ pub mod task_exit_outcome {
 /// `reason` label values for `rvc_slot_context_parent_fallback_total`.
 pub mod slot_context_parent_fallback {
     pub const WALK_BACK_EXHAUSTED: &str = "walk_back_exhausted";
+}
+
+/// `phase` label values for `rvc_sync_committee_skipped_total`.
+pub mod sync_committee_skip_phase {
+    pub const MESSAGES: &str = "messages";
+    pub const CONTRIBUTIONS: &str = "contributions";
+}
+
+/// `reason` label values for `rvc_sync_committee_skipped_total`.
+pub mod sync_committee_skip_reason {
+    pub const NO_HEAD_ROOT: &str = "no_head_root";
 }
 
 #[cfg(test)]
@@ -612,6 +639,40 @@ mod tests {
             .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
             .get();
         assert!(value >= 1, "Parent fallback counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn test_sync_committee_skipped_total_increments() {
+        RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[
+                sync_committee_skip_phase::MESSAGES,
+                sync_committee_skip_reason::NO_HEAD_ROOT,
+            ])
+            .inc();
+        let messages = RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[
+                sync_committee_skip_phase::MESSAGES,
+                sync_committee_skip_reason::NO_HEAD_ROOT,
+            ])
+            .get();
+        assert!(messages >= 1, "Messages skip counter should be at least 1 after increment");
+
+        RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[
+                sync_committee_skip_phase::CONTRIBUTIONS,
+                sync_committee_skip_reason::NO_HEAD_ROOT,
+            ])
+            .inc();
+        let contributions = RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[
+                sync_committee_skip_phase::CONTRIBUTIONS,
+                sync_committee_skip_reason::NO_HEAD_ROOT,
+            ])
+            .get();
+        assert!(
+            contributions >= 1,
+            "Contributions skip counter should be at least 1 after increment"
+        );
     }
 
     #[test]

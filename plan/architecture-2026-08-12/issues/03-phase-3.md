@@ -543,14 +543,14 @@ they must stay out of the scanner: no name ends in `_root`. Note the near-miss â
 a KAT anchor it cannot have. `EXEMPTIONS` must not grow.
 
 **Acceptance criteria.**
-- [ ] H-4 gains a test it never had: a wrong-ancestor block is rejected with `ParentRootMismatch`,
+- [x] H-4 gains a test it never had: a wrong-ancestor block is rejected with `ParentRootMismatch`,
       **RED demonstrated against the pre-fix tree** with the output in the PR.
-- [ ] A correct previous-slot parent is accepted (the dropped-proposal anti-regression).
-- [ ] No signer call occurs on a validation rejection.
-- [ ] A counter exists for "sync messages/contributions skipped: no head root", with **both** phases
+- [x] A correct previous-slot parent is accepted (the dropped-proposal anti-regression).
+- [x] No signer call occurs on a validation rejection.
+- [x] A counter exists for "sync messages/contributions skipped: no head root", with **both** phases
       labelled.
-- [ ] `validation.rs:9` and any sibling doc comment no longer say "head root" for a parent.
-- [ ] No new test name enters the KAT scanner's suffix scope; `EXEMPTIONS` unchanged.
+- [x] `validation.rs:9` and any sibling doc comment no longer say "head root" for a parent.
+- [x] No new test name enters the KAT scanner's suffix scope; `EXEMPTIONS` unchanged.
 
 ---
 

@@ -10,6 +10,9 @@ use eth_types::{
     is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
+use metrics::definitions::{
+    sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
+};
 use observability::logging::TruncatedRoot;
 use signer::{SignerService, ValidatorSigner};
 use validator_store::ValidatorStore;
@@ -69,6 +72,12 @@ impl SyncCommitteeService {
                     slot,
                     "Skipping sync committee messages: head_root unavailable in slot context"
                 );
+                RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+                    .with_label_values(&[
+                        sync_committee_skip_phase::MESSAGES,
+                        sync_committee_skip_reason::NO_HEAD_ROOT,
+                    ])
+                    .inc();
                 return;
             }
         };
@@ -152,6 +161,12 @@ impl SyncCommitteeService {
                     slot,
                     "Skipping sync committee contributions: head_root unavailable in slot context"
                 );
+                RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+                    .with_label_values(&[
+                        sync_committee_skip_phase::CONTRIBUTIONS,
+                        sync_committee_skip_reason::NO_HEAD_ROOT,
+                    ])
+                    .inc();
                 return;
             }
         };
@@ -340,6 +355,9 @@ mod tests {
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{ForkSchedule, Root, SyncCommitteeDuty};
+    use metrics::definitions::{
+        sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
+    };
     use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use validator_store::{ValidatorConfig, ValidatorStore};
@@ -609,6 +627,60 @@ mod tests {
                  not the BN's head root (r_from_bn=0xbb…)"
             );
         }
+    }
+
+    fn skip_count(phase: &str) -> u64 {
+        RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[phase, sync_committee_skip_reason::NO_HEAD_ROOT])
+            .get()
+    }
+
+    /// ARCH-3e: both skip sites increment the labelled skip counter when
+    /// phase-2 `head_root` is missing.
+    #[tokio::test]
+    async fn test_sync_skip_counter_increments_for_messages_and_contributions() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
+        let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
+
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            get_block_root_call_count.clone(),
+            submitted_roots.clone(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pk.to_bytes(),
+        ));
+
+        let service = setup_service(beacon, pk_hex, pk, sk).await;
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
+
+        let before_messages = skip_count(sync_committee_skip_phase::MESSAGES);
+        let before_contributions = skip_count(sync_committee_skip_phase::CONTRIBUTIONS);
+
+        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+
+        assert_eq!(
+            skip_count(sync_committee_skip_phase::MESSAGES),
+            before_messages + 1,
+            "messages skip must increment rvc_sync_committee_skipped_total{{phase=messages,reason=no_head_root}}"
+        );
+        assert_eq!(
+            skip_count(sync_committee_skip_phase::CONTRIBUTIONS),
+            before_contributions + 1,
+            "contributions skip must increment rvc_sync_committee_skipped_total{{phase=contributions,reason=no_head_root}}"
+        );
+        assert_eq!(
+            get_block_root_call_count.load(Ordering::SeqCst),
+            0,
+            "neither skip path may fall back to a BN fetch"
+        );
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "no messages must be submitted when head_root is None"
+        );
     }
 
     // -----------------------------------------------------------------------

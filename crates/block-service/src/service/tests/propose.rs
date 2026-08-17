@@ -911,6 +911,83 @@ async fn test_propose_block_parent_root_mismatch_drops_duty() {
     assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
 }
 
+/// ARCH-3e / H-4: `propose_block` with `expected_parent_root = Some(root of N-1)`
+/// rejects a BN block whose parent is a different ancestor. Signer is never called.
+#[tokio::test]
+async fn test_propose_block_rejects_a_wrong_ancestor_parent() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let previous_slot_parent: Root = [0x11; 32];
+    let wrong_ancestor: Root = [0x22; 32];
+
+    let mut block = test_block(slot);
+    block.parent_root = wrong_ancestor;
+    let beacon = MockBeaconClient::unblinded(block);
+    let signer = MockSigner::new();
+
+    let signer_arc = Arc::new(signer);
+    let beacon_arc = Arc::new(beacon);
+    let store = test_validator_store(&pubkey);
+    let service = BlockService::new(
+        signer_arc.clone(),
+        beacon_arc.clone(),
+        Arc::new(store),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+
+    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(BlockServiceError::ParentRootMismatch { expected, got })
+            if expected == previous_slot_parent && got == wrong_ancestor
+        ),
+        "wrong-ancestor parent must be ParentRootMismatch, got {result:?}"
+    );
+    assert!(
+        signer_arc.block_calls.lock().unwrap().is_empty(),
+        "signer must not be called when parent_root is a wrong ancestor"
+    );
+    assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+}
+
+/// ARCH-3e / H-4: a block whose parent is the previous-slot root is accepted.
+/// Anti-regression for treating slot N's own head as the expected parent.
+#[tokio::test]
+async fn test_propose_block_accepts_the_previous_slot_parent() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let previous_slot_parent: Root = [0x11; 32];
+
+    let mut block = test_block(slot);
+    block.parent_root = previous_slot_parent;
+    let beacon = MockBeaconClient::unblinded(block);
+    let signer = MockSigner::new();
+
+    let signer_arc = Arc::new(signer);
+    let beacon_arc = Arc::new(beacon);
+    let store = test_validator_store(&pubkey);
+    let service = BlockService::new(
+        signer_arc.clone(),
+        beacon_arc.clone(),
+        Arc::new(store),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+
+    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+
+    assert!(result.is_ok(), "previous-slot parent must be accepted, got {result:?}");
+    assert_eq!(
+        signer_arc.block_calls.lock().unwrap().len(),
+        1,
+        "signer must be called when parent is the previous-slot root"
+    );
+    beacon_arc.assert_last_published_block(slot, 42);
+}
+
 /// Correct proposer_index with None parent_root — proposal proceeds.
 #[tokio::test]
 async fn test_propose_block_correct_proposer_no_parent_root_succeeds() {
