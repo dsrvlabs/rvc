@@ -2,18 +2,9 @@
 
 use super::*;
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
-use std::sync::OnceLock;
 use timing::SystemSlotClock;
-use tokio::sync::{Mutex, MutexGuard};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// Global histogram counters are process-wide; serialize these tests so
-/// sample-count deltas are not raced by sibling cases.
-async fn m2_metric_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().await
-}
 
 fn empty_duty_body() -> serde_json::Value {
     serde_json::json!({

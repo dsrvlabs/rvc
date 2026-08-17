@@ -30,8 +30,16 @@ pub(crate) use std::collections::HashMap;
 pub(crate) use std::future::Future;
 pub(crate) use std::pin::Pin;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-pub(crate) use std::sync::Arc;
+pub(crate) use std::sync::{Arc, OnceLock};
 pub(crate) use std::time::Duration;
+pub(crate) use tokio::sync::{Mutex, MutexGuard};
+
+/// Process-wide M2 / slot-loop histogram counters; serialize tests that
+/// wait on or delta those samples (ARCH-7a + ARCH-3j C6).
+pub(super) async fn m2_metric_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
 
 // ── Shared helpers / mocks ─────────────────────────────────────────────
 
@@ -396,6 +404,7 @@ pub(super) async fn setup_proposer_duty(
 
 mod aggregation;
 mod circuit_breaker;
+mod cold_cache;
 mod core;
 mod duty_management;
 mod fork_transition;

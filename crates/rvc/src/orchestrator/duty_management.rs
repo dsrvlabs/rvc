@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -130,6 +131,23 @@ impl DutyManagementService {
 
         // Prefetch next-period sync committee duties when approaching period boundary.
         self.maybe_prefetch_next_sync_period(epoch).await;
+    }
+
+    /// Proposer-duties-only fetch under a caller-supplied deadline.
+    ///
+    /// Used on the pre-proposal path when the epoch cache is cold. Does not
+    /// fetch attester or sync duties — those stay in the post-duty window.
+    pub(crate) async fn fetch_proposer_duties_only(
+        &self,
+        epoch: u64,
+        deadline: Duration,
+    ) -> TimedOutcome<Vec<beacon::ProposerDuty>, duty_tracker::DutyTrackerError> {
+        utils::timed(
+            "cold_proposer_duty_fetch",
+            deadline,
+            self.duty_tracker.fetch_proposer_duties(epoch),
+        )
+        .await
     }
 
     /// Prefetches sync committee duties for the next period when within the last

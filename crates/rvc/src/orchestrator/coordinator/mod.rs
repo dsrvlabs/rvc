@@ -16,7 +16,8 @@ use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root, Slot};
 use metrics::definitions::{
-    attestation_status, slot_phase_cache, RVC_ATTESTATIONS_TOTAL,
+    attestation_status, pre_proposal_cold_fetch, slot_phase_cache, RVC_ATTESTATIONS_TOTAL,
+    RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
     RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
 };
 use signer::{CircuitBreakerState, SignerService};
@@ -29,6 +30,7 @@ use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
+use super::utils::TimedOutcome;
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
 
 /// Shared, dynamically-updatable public key map.
@@ -40,9 +42,12 @@ use crate::pubkey_index::SharedPubkeyIndexRegistry;
 pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<[u8; 48], PublicKey>>>;
 
 /// Aggregate pre-proposal budget (A-5 warm default): parent-root capture
-/// including the ARCH-3d walk-back. Cold-cache duty fetch (ARCH-3j) will
-/// share this envelope.
+/// including the ARCH-3d walk-back. Cold-cache duty fetch (ARCH-3j) shares
+/// this envelope.
 pub const DEFAULT_PRE_PROPOSAL_DEADLINE: Duration = Duration::from_millis(1000);
+
+/// Hard cap for a proposer-only fetch when the duty cache is cold (A-5 / C6).
+pub const COLD_PROPOSER_FETCH_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -53,6 +58,8 @@ pub struct OrchestratorConfig {
     pub timeouts: OperationTimeouts,
     /// Single timeout around pre-proposal capture (not per-request).
     pub pre_proposal_deadline: Duration,
+    /// Proposer-only fetch deadline when the epoch cache is cold (ARCH-3j).
+    pub cold_proposer_fetch_deadline: Duration,
 }
 
 impl OrchestratorConfig {
@@ -63,6 +70,7 @@ impl OrchestratorConfig {
             shutdown_timeout: Duration::from_secs(30),
             timeouts: OperationTimeouts::default(),
             pre_proposal_deadline: DEFAULT_PRE_PROPOSAL_DEADLINE,
+            cold_proposer_fetch_deadline: COLD_PROPOSER_FETCH_DEADLINE,
         }
     }
 
@@ -78,6 +86,11 @@ impl OrchestratorConfig {
 
     pub fn with_pre_proposal_deadline(mut self, deadline: Duration) -> Self {
         self.pre_proposal_deadline = deadline;
+        self
+    }
+
+    pub fn with_cold_proposer_fetch_deadline(mut self, deadline: Duration) -> Self {
+        self.cold_proposer_fetch_deadline = deadline;
         self
     }
 }
@@ -405,12 +418,12 @@ where
 
             // === Phase 1: t=0 — Block proposal ===
             // Parent from slot-1 at t=0, bounded by the aggregate pre-proposal
-            // deadline (covers the 3d walk-back). Head is captured at phase 2
-            // and reused at phase 3 (H-5).
-            let mut ctx = match tokio::time::timeout(
-                self.config.pre_proposal_deadline,
-                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch),
-            )
+            // deadline (covers the 3d walk-back and the 3j cold-cache fetch).
+            // Head is captured at phase 2 and reused at phase 3 (H-5).
+            let mut ctx = match tokio::time::timeout(self.config.pre_proposal_deadline, async {
+                self.maybe_cold_fetch_proposer_duties(current_slot, current_epoch).await;
+                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await
+            })
             .await
             {
                 Ok(ctx) => ctx,
@@ -637,6 +650,53 @@ where
                 WaitOutcome::Shutdown
             ) {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Bounded proposer-only fetch when the current epoch cache is empty.
+    ///
+    /// Coldness is `!is_proposer_epoch_cached` — not a boot flag — so a
+    /// `key_gen` invalidation takes the same path. Timeout proceeds to the
+    /// proposal decision with whatever was learned.
+    async fn maybe_cold_fetch_proposer_duties(&self, slot: Slot, epoch: u64) {
+        if self.duty_tracker.is_proposer_epoch_cached(epoch).await {
+            return;
+        }
+        let deadline =
+            self.config.cold_proposer_fetch_deadline.min(self.config.pre_proposal_deadline);
+        let started = std::time::Instant::now();
+        let outcome = self.duty_management.fetch_proposer_duties_only(epoch, deadline).await;
+        let elapsed_secs = started.elapsed().as_secs_f64();
+        let label = match &outcome {
+            TimedOutcome::Timeout => pre_proposal_cold_fetch::TIMEOUT,
+            TimedOutcome::Err(_) => pre_proposal_cold_fetch::MISS,
+            TimedOutcome::Ok(_) => {
+                if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
+                    pre_proposal_cold_fetch::HIT
+                } else {
+                    pre_proposal_cold_fetch::MISS
+                }
+            }
+        };
+        RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL.with_label_values(&[label]).inc();
+        RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS
+            .with_label_values(&[label])
+            .observe(elapsed_secs);
+        match outcome {
+            TimedOutcome::Timeout => {
+                warn!(
+                    slot,
+                    epoch,
+                    deadline_ms = deadline.as_millis() as u64,
+                    "Pre-proposal cold-cache proposer fetch timed out"
+                );
+            }
+            TimedOutcome::Err(e) => {
+                warn!(slot, epoch, error = %e, "Pre-proposal cold-cache proposer fetch failed");
+            }
+            TimedOutcome::Ok(_) => {
+                info!(slot, epoch, outcome = label, "Pre-proposal cold-cache proposer fetch");
             }
         }
     }

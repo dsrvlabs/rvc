@@ -867,8 +867,8 @@ async fn test_no_missed_proposal_without_stall() {
 
     // Same sample size as the recording matrix so the control is a rate, not a coin-flip.
     let proposal_slots = proposal_slots_sample(MATRIX_SAMPLE_SLOTS);
-    // Warm cache: 3i proposes from cache and fetches after. A cold 0s-stall
-    // first slot misses until ARCH-3j's bounded pre-proposal fetch.
+    // Warm cache: propose from cache and fetch after. Cold 0s-stall slots
+    // use the bounded pre-proposal fetch (ARCH-3j).
     let report =
         measure_miss_rate_under_stalled_duty_fetch(Duration::ZERO, true, &proposal_slots).await;
 
@@ -971,7 +971,9 @@ async fn test_cold_cache_slot_is_measured_separately() {
         "cold condition label must be distinct from warm"
     );
     assert_ne!(cold_report.cache_condition, warm_report.cache_condition);
-    // ARCH-3i proposes from cache only; cold slots miss until ARCH-3j.
-    assert_eq!(cold_report.published, 0, "3i without 3j: cold slots have no cached proposer duty");
+    assert_eq!(
+        cold_report.published, 2,
+        "cold boot and post-key_gen slots must still propose via the bounded fetch"
+    );
     assert_eq!(warm_report.missed(), 0, "warm slot at 0s stall must not miss");
 }

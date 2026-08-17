@@ -414,6 +414,39 @@ lazy_static! {
         counter
     };
 
+    /// Cold-cache pre-proposal proposer-duty fetches (ARCH-3j / C6).
+    ///
+    /// Incremented only when the proposer epoch cache is empty at t=0.
+    /// Labels: `outcome` — `hit` (slot duty cached after fetch), `miss`
+    /// (fetch finished with no duty for this slot), `timeout`.
+    pub static ref RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_pre_proposal_cold_fetch_total",
+            "Total pre-proposal cold-cache proposer-duty fetches by outcome"
+        );
+        let counter = IntCounterVec::new(opts, &["outcome"])
+            .expect("Failed to create rvc_pre_proposal_cold_fetch_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_pre_proposal_cold_fetch_total metric");
+        counter
+    };
+
+    /// Duration of a cold-cache pre-proposal proposer-duty fetch (ARCH-3j).
+    ///
+    /// Labels: `outcome` — same as [`RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL`].
+    /// Buckets cover the 500 ms deadline and the 2 s cold-cache M2 envelope.
+    pub static ref RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_pre_proposal_cold_fetch_duration_seconds",
+            "Duration of pre-proposal cold-cache proposer-duty fetches in seconds"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0]);
+        let histogram = HistogramVec::new(opts, &["outcome"])
+            .expect("Failed to create rvc_pre_proposal_cold_fetch_duration_seconds metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_pre_proposal_cold_fetch_duration_seconds metric");
+        histogram
+    };
+
     /// Sync committee duties skipped because phase-2 `head_root` is missing (ARCH-3e).
     ///
     /// Labels: `phase` — `messages` | `contributions`; `reason` — `no_head_root`.
@@ -464,6 +497,8 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
     lazy_static::initialize(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
+    lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL);
+    lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS);
 }
 
 /// Attestation status label values.
@@ -525,6 +560,13 @@ pub mod sync_committee_skip_phase {
 /// `reason` label values for `rvc_sync_committee_skipped_total`.
 pub mod sync_committee_skip_reason {
     pub const NO_HEAD_ROOT: &str = "no_head_root";
+}
+
+/// `outcome` label values for `rvc_pre_proposal_cold_fetch_*`.
+pub mod pre_proposal_cold_fetch {
+    pub const HIT: &str = "hit";
+    pub const MISS: &str = "miss";
+    pub const TIMEOUT: &str = "timeout";
 }
 
 #[cfg(test)]
@@ -639,6 +681,31 @@ mod tests {
             .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
             .get();
         assert!(value >= 1, "Parent fallback counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn test_pre_proposal_cold_fetch_total_increments() {
+        RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL.with_label_values(&[pre_proposal_cold_fetch::HIT]).inc();
+        let hit = RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL
+            .with_label_values(&[pre_proposal_cold_fetch::HIT])
+            .get();
+        assert!(hit >= 1, "hit counter should be at least 1 after increment");
+
+        RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL
+            .with_label_values(&[pre_proposal_cold_fetch::TIMEOUT])
+            .inc();
+        let timeout = RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL
+            .with_label_values(&[pre_proposal_cold_fetch::TIMEOUT])
+            .get();
+        assert!(timeout >= 1, "timeout counter should be at least 1 after increment");
+
+        RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS
+            .with_label_values(&[pre_proposal_cold_fetch::HIT])
+            .observe(0.1);
+        let samples = RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS
+            .with_label_values(&[pre_proposal_cold_fetch::HIT])
+            .get_sample_count();
+        assert!(samples >= 1, "duration histogram should have at least 1 observation");
     }
 
     #[test]

@@ -846,14 +846,14 @@ import into a guaranteed missed proposal on the following slot. The required beh
    warm cache = zero round trips today).
 
 **Acceptance criteria.**
-- [ ] Cold cache triggers a bounded proposer-duty fetch; the proposal check is **never** silently
+- [x] Cold cache triggers a bounded proposer-duty fetch; the proposal check is **never** silently
       skipped (C6).
-- [ ] Both cold-cache origins are covered: first slot after boot **and** the slot after a `key_gen`
+- [x] Both cold-cache origins are covered: first slot after boot **and** the slot after a `key_gen`
       bump.
-- [ ] The fetch has its own metric **and** its own log line (PRD wording).
-- [ ] The deadline is a named constant with a stated default of 500 ms.
-- [ ] A warm slot issues no pre-proposal duty fetch.
-- [ ] The cold path stays inside 3i's aggregate pre-proposal budget.
+- [x] The fetch has its own metric **and** its own log line (PRD wording).
+- [x] The deadline is a named constant with a stated default of 500 ms.
+- [x] A warm slot issues no pre-proposal duty fetch.
+- [x] The cold path stays inside 3i's aggregate pre-proposal budget.
 
 ---
 
