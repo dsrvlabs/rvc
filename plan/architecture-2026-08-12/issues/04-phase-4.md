@@ -322,14 +322,14 @@ constant** scan. This issue builds the extraction half only; classification is `
 
 **Acceptance criteria.**
 
-- [ ] `crates/architecture-tests/tests/env_allowlist.rs` exists and compiles with **no new dependency**.
-- [ ] The extractor returns all three shapes; a dynamic call site is a record, never a skip.
-- [ ] `#[cfg(test)]` regions are partitioned out by line number, matching G-4's idiom.
-- [ ] Both non-vacuity assertions present with explanatory messages.
-- [ ] Every emitted diagnostic names file, line and variable (or, for a dynamic read, the expression).
-- [ ] The five matcher unit tests above pass; `dynamic_env_read_is_captured_not_skipped` was
+- [x] `crates/architecture-tests/tests/env_allowlist.rs` exists and compiles with **no new dependency**.
+- [x] The extractor returns all three shapes; a dynamic call site is a record, never a skip.
+- [x] `#[cfg(test)]` regions are partitioned out by line number, matching G-4's idiom.
+- [x] Both non-vacuity assertions present with explanatory messages.
+- [x] Every emitted diagnostic names file, line and variable (or, for a dynamic read, the expression).
+- [x] The five matcher unit tests above pass; `dynamic_env_read_is_captured_not_skipped` was
       demonstrated RED against a literal-only matcher and the output is pasted into the PR.
-- [ ] Module doc states the mechanism and **why the `RVC_` prefix scan was rejected**, citing the 438/57
+- [x] Module doc states the mechanism and **why the `RVC_` prefix scan was rejected**, citing the 438/57
       measurement — so no one "simplifies" it back.
 
 ---
