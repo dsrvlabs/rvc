@@ -102,7 +102,7 @@ impl SlashingDb {
                 .map(|a| InterchangeAttestation {
                     source_epoch: a.source_epoch.to_string(),
                     target_epoch: a.target_epoch.to_string(),
-                    signing_root: a.signing_root,
+                    signing_root: a.signing_root.map(String::from),
                 })
                 .collect();
 
@@ -110,7 +110,7 @@ impl SlashingDb {
                 .into_iter()
                 .map(|b| InterchangeBlock {
                     slot: b.slot.to_string(),
-                    signing_root: b.signing_root,
+                    signing_root: b.signing_root.map(String::from),
                 })
                 .collect();
 
@@ -196,7 +196,7 @@ impl SlashingDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         for validator in &interchange.data {
-            let pubkey = normalize_pubkey(&validator.pubkey);
+            let pubkey = normalize_pubkey(&validator.pubkey)?;
             let mut max_slot: Option<Slot> = None;
             let mut max_source: Option<Epoch> = None;
             let mut max_target: Option<Epoch> = None;
@@ -227,7 +227,7 @@ impl SlashingDb {
                          SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
                      )",
                     (
-                        &pubkey,
+                        pubkey.as_ref(),
                         source_epoch as i64,
                         target_epoch as i64,
                         &attestation.signing_root,
@@ -250,18 +250,28 @@ impl SlashingDb {
                      WHERE NOT EXISTS (
                          SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
                      )",
-                    (&pubkey, slot as i64, &block.signing_root, &gvr_hex),
+                    (pubkey.as_ref(), slot as i64, &block.signing_root, &gvr_hex),
                 )?;
             }
 
             // Raise watermarks from this interchange's maxima (same transaction).
             // Raise-only SQL: re-import of older maxima is a silent no-op.
             if let Some(slot) = max_slot {
-                raise_watermark_max(&tx, &pubkey, WatermarkKind::Block, slot)?;
+                raise_watermark_max(&tx, pubkey.as_ref(), WatermarkKind::Block, slot)?;
             }
             if let (Some(source), Some(target)) = (max_source, max_target) {
-                raise_watermark_max(&tx, &pubkey, WatermarkKind::AttestationSource, source)?;
-                raise_watermark_max(&tx, &pubkey, WatermarkKind::AttestationTarget, target)?;
+                raise_watermark_max(
+                    &tx,
+                    pubkey.as_ref(),
+                    WatermarkKind::AttestationSource,
+                    source,
+                )?;
+                raise_watermark_max(
+                    &tx,
+                    pubkey.as_ref(),
+                    WatermarkKind::AttestationTarget,
+                    target,
+                )?;
             }
         }
 
@@ -415,11 +425,7 @@ mod tests {
         let genesis_root_bytes = chain_gvr();
 
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
-        let block = SignedBlock {
-            pubkey: pubkey.to_string(),
-            slot: 1000,
-            signing_root: Some("0xefgh".to_string()),
-        };
+        let block = SignedBlock::new(pubkey, 1000, Some("0xefgh")).expect("valid hex pubkey");
         db.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
         let interchange = db.export(&genesis_root_bytes).expect("export should succeed");
@@ -529,7 +535,7 @@ mod tests {
         assert_eq!(attestations.len(), 2);
         assert_eq!(attestations[0].source_epoch, 100);
         assert_eq!(attestations[0].target_epoch, 101);
-        assert_eq!(attestations[0].signing_root, Some("0xabcd".to_string()));
+        assert_eq!(attestations[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xabcd"));
         assert_eq!(attestations[1].source_epoch, 101);
         assert_eq!(attestations[1].target_epoch, 102);
         assert!(attestations[1].signing_root.is_none());
@@ -562,7 +568,7 @@ mod tests {
         let blocks = db.get_blocks(pubkey).expect("get should succeed");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 1000);
-        assert_eq!(blocks[0].signing_root, Some("0xefgh".to_string()));
+        assert_eq!(blocks[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xefgh"));
     }
 
     #[test]
@@ -575,11 +581,7 @@ mod tests {
             .expect("record should succeed");
         db1.seed_attestation(pubkey, 101, 102, None, &TEST_GVR).expect("record should succeed");
 
-        let block = SignedBlock {
-            pubkey: pubkey.to_string(),
-            slot: 1000,
-            signing_root: Some("0xefgh".to_string()),
-        };
+        let block = SignedBlock::new(pubkey, 1000, Some("0xefgh")).expect("valid hex pubkey");
         db1.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
         let interchange = db1.export(&genesis_root_bytes).expect("export should succeed");
@@ -1235,7 +1237,7 @@ mod tests {
             let conn = db.conn.lock();
             conn.query_row(
                 "SELECT genesis_validators_root FROM attestations WHERE pubkey = ?1 AND target_epoch = ?2",
-                (normalize_pubkey(pubkey), target_epoch as i64),
+                (normalize_pubkey(pubkey).expect("valid hex pubkey").as_ref(), target_epoch as i64),
                 |row| row.get(0),
             )
             .expect("import row must exist")
@@ -1249,12 +1251,8 @@ mod tests {
         // Runtime path uses the same root_to_hex encoding; plain INSERT must hit the
         // v3 unique index (pubkey, gvr, target_epoch). insert_attestation bypasses
         // EIP-3076 checks so the unique-index backstop is what we measure.
-        let dup = SignedAttestation {
-            pubkey: pubkey.to_string(),
-            source_epoch: 41,
-            target_epoch,
-            signing_root: Some("0xruntime_root".to_string()),
-        };
+        let dup = SignedAttestation::new(pubkey, 41, target_epoch, Some("0xruntime_root"))
+            .expect("valid hex pubkey");
         let err = db
             .insert_attestation(&dup, &gvr)
             .expect_err("runtime insert of same (pubkey, target) must collide on unique index");
@@ -1298,7 +1296,8 @@ mod tests {
         let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = normalize_pubkey(
             "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed",
-        );
+        )
+        .expect("valid hex pubkey");
 
         // Simulate a pre-RF3-18 import that wrote the bare wire form into the row.
         {
@@ -1307,14 +1306,14 @@ mod tests {
                 "INSERT INTO attestations \
                  (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
                  VALUES ('local-vc', ?1, 1, 5, '0xlegacy', ?2)",
-                (&pubkey, bare),
+                (pubkey.as_ref(), bare),
             )
             .expect("insert legacy bare-gvr row");
         }
 
         // Stage path must still find the row and reject a double-vote at target 5.
         let err = db
-            .check_and_record_attestation(&pubkey, 2, 5, Some("0xnew".into()), &gvr)
+            .check_and_record_attestation(pubkey.as_ref(), 2, 5, Some("0xnew".into()), &gvr)
             .expect_err("legacy bare-gvr row must still block double vote");
         assert!(
             matches!(err, SlashingError::SlashableAttestation(_)),

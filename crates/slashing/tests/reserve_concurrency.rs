@@ -39,7 +39,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 use rvc_slashing::{
     eip3076_allows_attestation, eip3076_allows_block, first_eip3076_history_violation,
-    CommittedReservation, SignedAttestation, SignedBlock, SlashingDb,
+    CanonicalPubkey, CommittedReservation, SignedAttestation, SignedBlock, SigningRoot, SlashingDb,
 };
 
 /// Documented default; `PROPTEST_CASES` wins when set.
@@ -107,15 +107,19 @@ enum Identity {
 
 impl Identity {
     fn from_block(row: &SignedBlock) -> Self {
-        Self::Block { pk: row.pubkey.clone(), slot: row.slot, root: row.signing_root.clone() }
+        Self::Block {
+            pk: row.pubkey.to_string(),
+            slot: row.slot,
+            root: row.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+        }
     }
 
     fn from_att(row: &SignedAttestation) -> Self {
         Self::Att {
-            pk: row.pubkey.clone(),
+            pk: row.pubkey.to_string(),
             source: row.source_epoch,
             target: row.target_epoch,
-            root: row.signing_root.clone(),
+            root: row.signing_root.as_ref().map(|r| r.as_hex().to_string()),
         }
     }
 }
@@ -228,10 +232,10 @@ fn assert_oracle(pubkeys: &[String], blocks: &[SignedBlock], atts: &[SignedAttes
     let mut by_pk_blocks: HashMap<&str, Vec<SignedBlock>> = HashMap::new();
     let mut by_pk_atts: HashMap<&str, Vec<SignedAttestation>> = HashMap::new();
     for b in blocks {
-        by_pk_blocks.entry(b.pubkey.as_str()).or_default().push(b.clone());
+        by_pk_blocks.entry(b.pubkey.as_ref()).or_default().push(b.clone());
     }
     for a in atts {
-        by_pk_atts.entry(a.pubkey.as_str()).or_default().push(a.clone());
+        by_pk_atts.entry(a.pubkey.as_ref()).or_default().push(a.clone());
     }
     for pk in pubkeys {
         let b = by_pk_blocks.get(pk.as_str()).cloned().unwrap_or_default();
@@ -317,11 +321,20 @@ fn run_concurrent(ops: &[Op]) -> ConcurrentRun {
     ConcurrentRun { accepted, remaining_blocks, remaining_atts, events }
 }
 
+fn parse_pk(s: &str) -> CanonicalPubkey {
+    match s.parse() {
+        Ok(pk) => pk,
+        Err(never) => match never {},
+    }
+}
+
 fn signed_block(duty: &Duty) -> Option<SignedBlock> {
     match *duty {
-        Duty::Block { pk, slot, root } => {
-            Some(SignedBlock { pubkey: pk_hex(pk), slot, signing_root: Some(root_hex(root)) })
-        }
+        Duty::Block { pk, slot, root } => Some(SignedBlock {
+            pubkey: parse_pk(&pk_hex(pk)),
+            slot,
+            signing_root: Some(SigningRoot::from_hex(root_hex(root))),
+        }),
         Duty::Att { .. } => None,
     }
 }
@@ -329,10 +342,10 @@ fn signed_block(duty: &Duty) -> Option<SignedBlock> {
 fn signed_att(duty: &Duty) -> Option<SignedAttestation> {
     match *duty {
         Duty::Att { pk, source, target, root } => Some(SignedAttestation {
-            pubkey: pk_hex(pk),
+            pubkey: parse_pk(&pk_hex(pk)),
             source_epoch: source,
             target_epoch: target,
-            signing_root: Some(root_hex(root)),
+            signing_root: Some(SigningRoot::from_hex(root_hex(root))),
         }),
         Duty::Block { .. } => None,
     }

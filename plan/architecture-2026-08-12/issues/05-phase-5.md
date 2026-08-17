@@ -1419,15 +1419,15 @@ normalisation (`db/mod.rs:50-52`).
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] `SignedAttestation` / `SignedBlock` carry canonical newtypes, not `String`.
-- [ ] `.expect("infallible")` is gone from `crates/slashing/src/db/mod.rs`; no new `.expect` in
+- [x] `SignedAttestation` / `SignedBlock` carry canonical newtypes, not `String`.
+- [x] `.expect("infallible")` is gone from `crates/slashing/src/db/mod.rs`; no new `.expect` in
       production code (`CLAUDE.md`), asserted by a test.
-- [ ] The `Interchange*` DTOs are **unchanged** and a module doc comment records **why**
+- [x] The `Interchange*` DTOs are **unchanged** and a module doc comment records **why**
       (EIP-3076 string mandate, VD-5.5) — so the PRD's literal criterion is closed with a stated
       correction rather than left failing.
-- [ ] All 38 EIP-3076 conformance vectors green.
-- [ ] The existing `types.rs` round-trip tests pass with **zero** edits.
-- [ ] Landed **after** `ARCH-5l`; `git log` shows no overlap with the switchover PR.
+- [x] All 38 EIP-3076 conformance vectors green.
+- [x] The existing `types.rs` round-trip tests pass with **zero** edits.
+- [x] Landed **after** `ARCH-5l`; `git log` shows no overlap with the switchover PR.
 
 ---
 

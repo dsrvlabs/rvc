@@ -38,6 +38,15 @@ pub enum SlashingError {
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),
 
+    /// Pubkey rejected at internal-record construction ([`crate::SignedBlock::new`] /
+    /// [`crate::SignedAttestation::new`]).
+    #[error("invalid slashing-record pubkey ({0})")]
+    InvalidPubkey(&'static str),
+
+    /// A staging-path invariant that used to be `.expect` (ARCH-5o).
+    #[error("internal slashing invariant violated: {0}")]
+    InternalInvariant(&'static str),
+
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
 

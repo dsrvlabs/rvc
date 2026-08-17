@@ -264,7 +264,9 @@ impl<'db> StagedBlock<'db> {
             ));
         }
 
-        let guard = self.guard.as_mut().expect("guard is always Some before Drop");
+        let Some(guard) = self.guard.as_mut() else {
+            return Err(SlashingError::InternalInvariant("staged block guard missing at commit"));
+        };
 
         if !self.row.is_resign {
             guard.execute(
@@ -346,7 +348,11 @@ impl<'db> StagedAttestation<'db> {
             ));
         }
 
-        let guard = self.guard.as_mut().expect("guard is always Some before Drop");
+        let Some(guard) = self.guard.as_mut() else {
+            return Err(SlashingError::InternalInvariant(
+                "staged attestation guard missing at commit",
+            ));
+        };
 
         if !self.row.is_duplicate {
             guard.execute(
@@ -445,7 +451,7 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
@@ -458,12 +464,12 @@ impl SlashingDb {
         // drop the MutexGuard with the transaction still open, leaving the
         // connection in a broken "transaction within transaction" state.
         let outcome = (|| -> Result<BlockVerdict, SlashingError> {
-            let watermark = read_watermark(&guard, &pubkey, WatermarkKind::Block)?;
+            let watermark = read_watermark(&guard, pubkey.as_ref(), WatermarkKind::Block)?;
 
-            let history = TargetedSqlBlockHistory::new(&guard, &pubkey);
+            let history = TargetedSqlBlockHistory::new(&guard, pubkey.as_ref());
             let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
             let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
-            check_block(&pubkey, &history, &watermarks, &candidate, strict)
+            check_block(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
         })();
 
         let outcome = match outcome {
@@ -482,7 +488,7 @@ impl SlashingDb {
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
-                pubkey,
+                pubkey: pubkey.to_string(),
                 slot,
                 signing_root: signing_root_hex,
                 gvr_hex,
@@ -526,7 +532,7 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
@@ -536,10 +542,12 @@ impl SlashingDb {
         // funnels through a single ROLLBACK before we return.  See the
         // matching note in `stage_block`.
         let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
-            let wm_source = read_watermark(&guard, &pubkey, WatermarkKind::AttestationSource)?;
-            let wm_target = read_watermark(&guard, &pubkey, WatermarkKind::AttestationTarget)?;
+            let wm_source =
+                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
+            let wm_target =
+                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
 
-            let history = TargetedSqlAttestationHistory::new(&guard, &pubkey);
+            let history = TargetedSqlAttestationHistory::new(&guard, pubkey.as_ref());
             let watermarks = AttestationWatermarks {
                 source: wm_source.map(|w| w as Epoch),
                 target: wm_target.map(|w| w as Epoch),
@@ -549,7 +557,7 @@ impl SlashingDb {
                 target_epoch,
                 signing_root: signing_root_hex.clone(),
             };
-            check_attestation(&pubkey, &history, &watermarks, &candidate, strict)
+            check_attestation(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
         })();
 
         let verdict = match outcome {
@@ -564,7 +572,7 @@ impl SlashingDb {
         Ok(StagedAttestation {
             guard: Some(guard),
             row: AttestationRow {
-                pubkey,
+                pubkey: pubkey.to_string(),
                 source_epoch,
                 target_epoch,
                 signing_root: signing_root_hex,
@@ -618,16 +626,16 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         with_immediate_txn(&guard, |conn| {
             let strict = self.strict_semantics.load(Ordering::Relaxed);
-            let watermark = read_watermark(conn, &pubkey, WatermarkKind::Block)?;
-            let history = TargetedSqlBlockHistory::new(conn, &pubkey);
+            let watermark = read_watermark(conn, pubkey.as_ref(), WatermarkKind::Block)?;
+            let history = TargetedSqlBlockHistory::new(conn, pubkey.as_ref());
             let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
             let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
-            let outcome = check_block(&pubkey, &history, &watermarks, &candidate, strict)?;
+            let outcome = check_block(pubkey.as_ref(), &history, &watermarks, &candidate, strict)?;
             let inserted = !matches!(outcome, BlockVerdict::Resign);
 
             persist_reserved_row(self, conn, || {
@@ -636,7 +644,7 @@ impl SlashingDb {
                         "INSERT INTO blocks
                          (client_cn, pubkey, slot, signing_root, genesis_validators_root)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
-                        (AUDIT_ORIGIN, &pubkey, slot as i64, &signing_root_hex, &gvr_hex),
+                        (AUDIT_ORIGIN, pubkey.as_ref(), slot as i64, &signing_root_hex, &gvr_hex),
                     )
                     .map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))?;
                 }
@@ -644,7 +652,7 @@ impl SlashingDb {
             })?;
 
             Ok(CommittedReservation {
-                pubkey_hex: pubkey,
+                pubkey_hex: pubkey.to_string(),
                 kind: ReservationKind::Block { slot },
                 signing_root_hex,
                 inserted,
@@ -676,14 +684,16 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         with_immediate_txn(&guard, |conn| {
             let strict = self.strict_semantics.load(Ordering::Relaxed);
-            let wm_source = read_watermark(conn, &pubkey, WatermarkKind::AttestationSource)?;
-            let wm_target = read_watermark(conn, &pubkey, WatermarkKind::AttestationTarget)?;
-            let history = TargetedSqlAttestationHistory::new(conn, &pubkey);
+            let wm_source =
+                read_watermark(conn, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
+            let wm_target =
+                read_watermark(conn, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
+            let history = TargetedSqlAttestationHistory::new(conn, pubkey.as_ref());
             let watermarks = AttestationWatermarks {
                 source: wm_source.map(|w| w as Epoch),
                 target: wm_target.map(|w| w as Epoch),
@@ -693,7 +703,8 @@ impl SlashingDb {
                 target_epoch,
                 signing_root: signing_root_hex.clone(),
             };
-            let verdict = check_attestation(&pubkey, &history, &watermarks, &candidate, strict)?;
+            let verdict =
+                check_attestation(pubkey.as_ref(), &history, &watermarks, &candidate, strict)?;
             let inserted = !matches!(verdict, AttestationVerdict::Duplicate);
 
             persist_reserved_row(self, conn, || {
@@ -704,7 +715,7 @@ impl SlashingDb {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         (
                             AUDIT_ORIGIN,
-                            &pubkey,
+                            pubkey.as_ref(),
                             source_epoch as i64,
                             target_epoch as i64,
                             &signing_root_hex,
@@ -717,7 +728,7 @@ impl SlashingDb {
             })?;
 
             Ok(CommittedReservation {
-                pubkey_hex: pubkey,
+                pubkey_hex: pubkey.to_string(),
                 kind: ReservationKind::Attestation { source: source_epoch, target: target_epoch },
                 signing_root_hex,
                 inserted,
@@ -794,8 +805,8 @@ fn reconcile_delete_txn(
 
     let before = if cfg!(debug_assertions) { Some(snapshot_watermarks(conn)?) } else { None };
 
-    let pubkey = crate::db::normalize_pubkey(&reservation.pubkey_hex);
-    let changes = delete_reserved_row(conn, &pubkey, reservation)
+    let pubkey = crate::db::normalize_pubkey(&reservation.pubkey_hex)?;
+    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)
         .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))?;
     if changes > 1 {
         return Err(SlashingError::ReconcileFailed(format!(

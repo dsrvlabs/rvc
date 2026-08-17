@@ -50,8 +50,17 @@ use eth_types::{Epoch, Root, Slot};
 ///
 /// Delegates to [`observability::pubkey::CanonicalPubkey`] — the single source of
 /// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
-pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    pubkey.parse::<observability::pubkey::CanonicalPubkey>().expect("infallible").to_string()
+///
+/// `CanonicalPubkey::from_str` is [`Infallible`](std::convert::Infallible) by
+/// design (normalisation, not validation). `Result` replaces `.expect`; hex
+/// policy lives only on `SignedBlock::new` / `SignedAttestation::new`.
+pub(crate) fn normalize_pubkey(
+    pubkey: &str,
+) -> Result<observability::pubkey::CanonicalPubkey, SlashingError> {
+    match pubkey.parse::<observability::pubkey::CanonicalPubkey>() {
+        Ok(pk) => Ok(pk),
+        Err(never) => match never {},
+    }
 }
 
 /// SQLite-backed database for storing slashing protection data.
@@ -345,7 +354,7 @@ mod tests {
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 1000);
-        assert_eq!(blocks[0].signing_root, Some("0xroot1".to_string()));
+        assert_eq!(blocks[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xroot1"));
     }
 
     #[test]

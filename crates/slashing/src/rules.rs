@@ -395,11 +395,13 @@ pub fn first_eip3076_history_violation(
             .iter()
             .enumerate()
             .filter(|(j, _)| *j != i)
-            .map(|(_, b)| (b.slot, b.signing_root.clone()))
+            .map(|(_, b)| (b.slot, b.signing_root.as_ref().map(|r| r.as_hex().to_string())))
             .collect();
         let history = FullScanBlockHistory::new(others);
-        let candidate =
-            BlockCandidate { slot: block.slot, signing_root: block.signing_root.clone() };
+        let candidate = BlockCandidate {
+            slot: block.slot,
+            signing_root: block.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+        };
         match check_block(pubkey, &history, &BlockWatermarks::default(), &candidate, false) {
             Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
                 slot,
@@ -425,14 +427,14 @@ pub fn first_eip3076_history_violation(
             .map(|(_, a)| ExistingAtt {
                 source_epoch: a.source_epoch,
                 target_epoch: a.target_epoch,
-                signing_root: a.signing_root.clone(),
+                signing_root: a.signing_root.as_ref().map(|r| r.as_hex().to_string()),
             })
             .collect();
         let history = FullScanAttestationHistory::new(others);
         let candidate = AttestationCandidate {
             source_epoch: att.source_epoch,
             target_epoch: att.target_epoch,
-            signing_root: att.signing_root.clone(),
+            signing_root: att.signing_root.as_ref().map(|r| r.as_hex().to_string()),
         };
         match check_attestation(
             pubkey,
@@ -465,8 +467,10 @@ pub fn eip3076_allows_block(
     signing_root: Option<String>,
     strict: bool,
 ) -> bool {
-    let rows: Vec<(Slot, Option<String>)> =
-        history.iter().map(|b| (b.slot, b.signing_root.clone())).collect();
+    let rows: Vec<(Slot, Option<String>)> = history
+        .iter()
+        .map(|b| (b.slot, b.signing_root.as_ref().map(|r| r.as_hex().to_string())))
+        .collect();
     let hist = FullScanBlockHistory::new(rows);
     let candidate = BlockCandidate { slot, signing_root };
     check_block(pubkey, &hist, &BlockWatermarks::default(), &candidate, strict).is_ok()
@@ -488,7 +492,7 @@ pub fn eip3076_allows_attestation(
         .map(|a| ExistingAtt {
             source_epoch: a.source_epoch,
             target_epoch: a.target_epoch,
-            signing_root: a.signing_root.clone(),
+            signing_root: a.signing_root.as_ref().map(|r| r.as_hex().to_string()),
         })
         .collect();
     let hist = FullScanAttestationHistory::new(rows);

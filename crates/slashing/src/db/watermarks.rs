@@ -131,10 +131,10 @@ impl SlashingDb {
     ///
     /// Watermarks can only be raised, never lowered. Setting the same value is idempotent.
     pub fn set_block_watermark(&self, pubkey: &str, slot: Slot) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        raise_watermark(&tx, &pubkey, WatermarkKind::Block, slot)?;
+        raise_watermark(&tx, pubkey.as_ref(), WatermarkKind::Block, slot)?;
         tx.commit()?;
         Ok(())
     }
@@ -154,9 +154,9 @@ impl SlashingDb {
 
     /// Get the block watermark for a validator.
     pub fn get_block_watermark(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
-        Ok(read_watermark(&conn, &pubkey, WatermarkKind::Block)?.map(|v| v as Slot))
+        Ok(read_watermark(&conn, pubkey.as_ref(), WatermarkKind::Block)?.map(|v| v as Slot))
     }
 
     /// Set an attestation watermark for a validator.
@@ -168,11 +168,11 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        raise_watermark(&tx, &pubkey, WatermarkKind::AttestationSource, source_epoch)?;
-        raise_watermark(&tx, &pubkey, WatermarkKind::AttestationTarget, target_epoch)?;
+        raise_watermark(&tx, pubkey.as_ref(), WatermarkKind::AttestationSource, source_epoch)?;
+        raise_watermark(&tx, pubkey.as_ref(), WatermarkKind::AttestationTarget, target_epoch)?;
         tx.commit()?;
         Ok(())
     }
@@ -184,11 +184,11 @@ impl SlashingDb {
         &self,
         pubkey: &str,
     ) -> Result<Option<(Epoch, Epoch)>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
 
-        let source = read_watermark(&conn, &pubkey, WatermarkKind::AttestationSource)?;
-        let target = read_watermark(&conn, &pubkey, WatermarkKind::AttestationTarget)?;
+        let source = read_watermark(&conn, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
+        let target = read_watermark(&conn, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
 
         match (source, target) {
             (Some(s), Some(t)) => Ok(Some((s as Epoch, t as Epoch))),

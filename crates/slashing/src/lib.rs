@@ -23,8 +23,8 @@ pub use stage::{
     CommittedReservation, ReconcileOutcome, ReservationKind, StagedAttestation, StagedBlock,
 };
 pub use types::{
-    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
-    SignedAttestation, SignedBlock, ValidatorRecord,
+    CanonicalPubkey, InterchangeAttestation, InterchangeBlock, InterchangeFormat,
+    InterchangeMetadata, PruneStats, SignedAttestation, SignedBlock, SigningRoot, ValidatorRecord,
 };
 
 /// Production `rules.rs` engine as a history-validity oracle (ARCH-5h).
