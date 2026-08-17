@@ -6,7 +6,8 @@
 //!
 //! Non-vacuity is **two** checks: directory count == member count **and** both equal the
 //! absolute pin [`EXPECTED_MEMBER_COUNT`]. A bare `dirs == members` would pass on `0 == 0`.
-//! ARCH-3 lowers the pin from 29 → 28 when `sync-service` is deleted.
+//! ARCH-3 lowered the pin from 29 → 28 when `sync-service` is deleted.
+//! ARCH-4e (`rvc-config`) raises it to 29.
 //!
 //! Failure copy (VD-P1): never recommend adding to `[workspace] members` unconditionally —
 //! historical orphans collide by package name with live members.
@@ -17,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use rvc_architecture_tests::{load_cargo_metadata, load_workspace_graph, workspace_root};
 
-/// Absolute G-1 pin. Landed as 29 after ARCH-1b; ARCH-3 lowers to 28.
-const EXPECTED_MEMBER_COUNT: usize = 28;
+/// Absolute G-1 pin. ARCH-3 lowered to 28; ARCH-4e (`rvc-config`) raises to 29.
+const EXPECTED_MEMBER_COUNT: usize = 29;
 
 // ---------------------------------------------------------------------------
 // Enumeration
@@ -183,5 +184,22 @@ fn test_d1_empty_directory_set_fails_non_vacuity() {
     assert!(
         err.contains("non-vacuity") || err.contains("empty"),
         "failure must cite non-vacuity / empty set; got:\n{err}"
+    );
+}
+
+/// VD-P1: `rvc-config` must not collide with `rvc` / `rvc-bin` (or any other member).
+#[test]
+fn rvc_config_package_name_is_unique_in_the_workspace() {
+    let metadata = load_cargo_metadata();
+    let packages =
+        metadata["packages"].as_array().expect("metadata 'packages' field must be an array");
+    let names: Vec<&str> = packages
+        .iter()
+        .map(|p| p["name"].as_str().expect("package must have a string name"))
+        .collect();
+    assert_eq!(
+        names.iter().filter(|n| **n == "rvc-config").count(),
+        1,
+        "package name rvc-config must appear exactly once (not rvc / rvc-bin); got {names:?}"
     );
 }

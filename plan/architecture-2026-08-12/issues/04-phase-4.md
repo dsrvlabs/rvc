@@ -591,17 +591,17 @@ placement that dictates G-2's textual scanning, architecture §6). Hence a new c
 
 **Acceptance criteria.**
 
-- [ ] `crates/rvc-config` exists, builds, and is a workspace member; **29 members**, one new
+- [x] `crates/rvc-config` exists, builds, and is a workspace member; **29 members**, one new
       `CLASSIFICATION` row (`Domain`, with reason).
-- [ ] `ConfigSource` and `ConfigError` implemented with `thiserror`. The crate's dependency set is
+- [x] `ConfigSource` and `ConfigError` implemented with `thiserror`. The crate's dependency set is
       **exactly `clap`, `serde`, `toml`, `thiserror`** — all already workspace dependencies. **No
       config-framework dependency is added, and specifically not figment**: provenance is the ~40
       lines of `ConfigError` context, which is the one idea worth taking from it (architecture
       §5.4:1310-1324). Any addition beyond those four is a C3 discussion, not a detail.
-- [ ] `Config::load` signature exists per architecture §5.4; behaviour unchanged (scaffold).
-- [ ] `ARCHITECTURE.md` regenerates byte-identically; DAG / forbidden-edge / required-edge gates green.
-- [ ] `ARCH-4d`'s parity snapshots unchanged (this issue must not move a single value).
-- [ ] Public items carry `///` docs (`CLAUDE.md`).
+- [x] `Config::load` signature exists per architecture §5.4; behaviour unchanged (scaffold).
+- [x] `ARCHITECTURE.md` regenerates byte-identically; DAG / forbidden-edge / required-edge gates green.
+- [x] `ARCH-4d`'s parity snapshots unchanged (this issue must not move a single value).
+- [x] Public items carry `///` docs (`CLAUDE.md`).
 
 ---
 

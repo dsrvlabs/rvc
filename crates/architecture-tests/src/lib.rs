@@ -69,6 +69,9 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-signer", Layer::Domain, "signer", "safe signing"),
     ("rvc-signer-server", Layer::Domain, "signer-server", "remote signing lib"),
     ("rvc-timing", Layer::Domain, "timing", "slot clock"),
+    // Domain, not Base: Config names validator_store::BlockSelectionMode (types.rs:250).
+    // G-5a (VD-P5): a Base crate may depend only on Base — rvc-config cannot.
+    ("rvc-config", Layer::Domain, "config", "names BlockSelectionMode (G-5a)"),
     // Foundation
     ("beacon", Layer::Foundation, "beacon", "HTTP client"),
     ("rvc-bn-manager", Layer::Foundation, "bn-manager", "multi-BN"),
@@ -374,6 +377,7 @@ pub const FORBIDDEN_EDGES: &[(&str, &str)] = &[
 pub const DOMAIN_PACKAGES: &[&str] = &[
     "rvc-block-service",
     "rvc-builder",
+    "rvc-config",
     "rvc-doppelganger",
     "rvc-duty-tracker",
     "rvc-signer",

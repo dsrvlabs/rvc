@@ -1,7 +1,7 @@
 # Architecture
 
 <!-- BEGIN GENERATED -->
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 28 crates (3 binaries + 25 libraries).
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
 
 > **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
 > ```
@@ -19,6 +19,7 @@ graph TD
     RVC_BLOCK_SERVICE["block-service<br/><i>block proposals</i>"]
     RVC_BN_MANAGER["bn-manager<br/><i>multi-BN</i>"]
     RVC_BUILDER["builder<br/><i>MEV registration</i>"]
+    RVC_CONFIG["config<br/><i>names BlockSelectionMode (G-5a)</i>"]
     RVC_CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
     RVC_DOPPELGANGER["doppelganger<br/><i>duplicate detection</i>"]
     RVC_DUTY_TRACKER["duty-tracker<br/><i>duty cache</i>"]
@@ -141,6 +142,7 @@ graph TD
     style RVC_BLOCK_SERVICE fill:#ffd43b,color:#333
     style RVC_BN_MANAGER fill:#51cf66,color:#fff
     style RVC_BUILDER fill:#ffd43b,color:#333
+    style RVC_CONFIG fill:#ffd43b,color:#333
     style RVC_CRYPTO fill:#51cf66,color:#fff
     style RVC_DOPPELGANGER fill:#ffd43b,color:#333
     style RVC_DUTY_TRACKER fill:#ffd43b,color:#333

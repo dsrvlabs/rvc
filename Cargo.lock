@@ -4247,6 +4247,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-config"
+version = "0.7.0"
+dependencies = [
+ "clap",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "rvc-crypto"
 version = "0.7.0"
 dependencies = [
