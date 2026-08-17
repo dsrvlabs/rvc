@@ -458,13 +458,13 @@ than introducing a second, driftable list. Failure message names both packages, 
 
 **Acceptance criteria.**
 
-- [ ] G-5b implemented in `layer_edges.rs`; failure message names both packages.
-- [ ] Synthetic RED test present and passing; **real-tree RED output pasted in the PR**.
-- [ ] Non-vacuity assertion present, asserting a non-empty `Infra` set with real out-edges.
-- [ ] G-5b consumes `DOMAIN_PACKAGES` rather than a second hand-maintained Domain list.
-- [ ] The file header records VD-P4 — *"green at HEAD; the RED demo is why this gate is trustworthy"* —
+- [x] G-5b implemented in `layer_edges.rs`; failure message names both packages.
+- [x] Synthetic RED test present and passing; **real-tree RED output pasted in the PR**.
+- [x] Non-vacuity assertion present, asserting a non-empty `Infra` set with real out-edges.
+- [x] G-5b consumes `DOMAIN_PACKAGES` rather than a second hand-maintained Domain list.
+- [x] The file header records VD-P4 — *"green at HEAD; the RED demo is why this gate is trustworthy"* —
       so a future reader does not mistake it for dead code.
-- [ ] G-5b green on `develop`; `cargo nextest run -p rvc-architecture-tests` green.
+- [x] G-5b green on `develop`; `cargo nextest run -p rvc-architecture-tests` green.
 
 ### ARCH-6d — One `ProduceBlockResponse`: delete the twin and the adapter's field copy
 

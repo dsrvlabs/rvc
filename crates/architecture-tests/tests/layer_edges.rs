@@ -15,14 +15,23 @@
 //! `rvc-slashing` and `rvc-validator-store` pass G-5a today (out-edges are all
 //! Base) and are deliberately `Infra` because they own I/O.
 //!
-//! G-5b (Infra ↛ Domain) is ARCH-6c and is not implemented here.
+//! G-5b: no `Layer::Infra` package may declare a production workspace
+//! dependency on a `Layer::Domain` package. Domain membership is
+//! `DOMAIN_PACKAGES` (lock-step with `CLASSIFICATION` via
+//! `domain_packages_match_classification`). Failure names both packages.
+//!
+//! VD-P4: G-5b is green at HEAD; the RED demo is why this gate is
+//! trustworthy. A gate that is green the day it lands and has never been
+//! seen red is indistinguishable from a gate that scans nothing (R10).
 //!
 //! Production edges only (`kind == null`), via `load_workspace_graph` /
 //! `WorkspaceGraph` — the same filter as `build_edge_map`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rvc_architecture_tests::{classification_map, load_workspace_graph, Layer, WorkspaceGraph};
+use rvc_architecture_tests::{
+    classification_map, load_workspace_graph, Layer, WorkspaceGraph, DOMAIN_PACKAGES,
+};
 
 fn layer_name(layer: Layer) -> &'static str {
     match layer {
@@ -126,6 +135,96 @@ fn g5a_scans_a_nonempty_base_set() {
     assert!(
         has_inspectable_out_edges,
         "G-5a would be vacuous: neither rvc-web3signer-wire nor rvc-timing is a Base package \
+         with production out-edges"
+    );
+}
+
+/// G-5b: no production workspace out-edge from an `Infra` package may land
+/// on a `DOMAIN_PACKAGES` member. Failure copy names both packages.
+fn g5b_violations(graph: &WorkspaceGraph) -> Vec<String> {
+    let class = classification_map();
+    let domain: BTreeSet<&str> = DOMAIN_PACKAGES.iter().copied().collect();
+    let mut violations = Vec::new();
+    for (from, deps) in &graph.edges {
+        let Some((from_layer, _, _)) = class.get(from.as_str()) else {
+            continue;
+        };
+        if *from_layer != Layer::Infra {
+            continue;
+        }
+        for to in deps {
+            if !domain.contains(to.as_str()) {
+                continue;
+            }
+            violations.push(format!(
+                "G-5b: Infra package '{from}' depends on '{to}'; \
+                 an Infra package may not depend on a Domain package"
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn g5b_is_red_against_a_scratch_infra_to_domain_edge() {
+    // Synthetic Infra → Domain production edge. Uses real CLASSIFICATION /
+    // DOMAIN_PACKAGES names so the predicate can resolve membership.
+    // Mirrors the discarded real-tree scratch: `signer.workspace = true` on
+    // `crates/beacon/Cargo.toml`.
+    let mut edges = BTreeMap::new();
+    edges.insert("beacon".to_string(), BTreeSet::from(["rvc-signer".to_string()]));
+    edges.insert("rvc-signer".to_string(), BTreeSet::new());
+    let graph = WorkspaceGraph { edges };
+
+    let violations = g5b_violations(&graph);
+    assert!(
+        !violations.is_empty(),
+        "G-5b must report an Infra→Domain production edge (a gate never seen red is unfalsifiable)"
+    );
+    let msg = violations.join("\n");
+    assert!(
+        msg.contains("beacon") && msg.contains("rvc-signer"),
+        "G-5b failure must name both packages; got: {msg}"
+    );
+}
+
+/// Real-tree G-5b. Green on develop (VD-P4). This is the test that goes red
+/// against the discarded `crates/beacon/Cargo.toml` scratch edge.
+#[test]
+fn g5b_holds_on_the_real_workspace_graph() {
+    let graph = load_workspace_graph();
+    let violations = g5b_violations(&graph);
+    assert!(
+        violations.is_empty(),
+        "G-5b (Infra may not depend on Domain) failed:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Non-vacuity: the Infra set is non-empty, and at least one scanned
+/// member actually has production out-edges.
+#[test]
+fn g5b_scans_a_nonempty_infra_set_with_real_out_edges() {
+    let graph = load_workspace_graph();
+    let class = classification_map();
+    let infra: Vec<&String> = graph
+        .edges
+        .keys()
+        .filter(|name| class.get(name.as_str()).is_some_and(|(layer, _, _)| *layer == Layer::Infra))
+        .collect();
+    // 7 members after ARCH-6a, 8 after ARCH-6f (`rvc-crypto` is still Infra).
+    assert!(
+        infra.len() >= 7,
+        "G-5b would be vacuous: Infra set has {} members, need ≥ 7",
+        infra.len()
+    );
+    let has_inspectable_out_edges = ["beacon", "rvc-slashing"].iter().any(|name| {
+        infra.iter().any(|b| b.as_str() == *name)
+            && graph.edges.get(*name).is_some_and(|deps| !deps.is_empty())
+    });
+    assert!(
+        has_inspectable_out_edges,
+        "G-5b would be vacuous: neither beacon nor rvc-slashing is an Infra package \
          with production out-edges"
     );
 }
