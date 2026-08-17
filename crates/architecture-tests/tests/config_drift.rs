@@ -71,12 +71,17 @@ use std::path::{Path, PathBuf};
 const CLI_RS: &str = "bin/rvc/src/cli.rs";
 const TYPES_RS: &str = "crates/rvc/src/config/types.rs";
 
-/// ARCH-4f: migrated clap groups live in `rvc-config` and are re-imported by `StartArgs`.
+/// ARCH-4f/4g: migrated clap groups live in `rvc-config` and are re-imported by `StartArgs`.
 const MIGRATED_GROUP_SRCS: &[&str] = &[
     "crates/rvc-config/src/sections/tracing.rs",
     "crates/rvc-config/src/sections/keymanager.rs",
     "crates/rvc-config/src/sections/grpc_signer.rs",
     "crates/rvc-config/src/sections/monitoring.rs",
+    "crates/rvc-config/src/sections/logfile.rs",
+    "crates/rvc-config/src/sections/proposer_config.rs",
+    "crates/rvc-config/src/sections/builder_limits.rs",
+    "crates/rvc-config/src/sections/secret_provider.rs",
+    "crates/rvc-config/src/sections/keys.rs",
 ];
 
 // ---------------------------------------------------------------------------
@@ -462,6 +467,63 @@ fn struct_fields(src: &str, struct_name: &str) -> Vec<String> {
         }
     }
     fields
+}
+
+/// True when `field` on `struct_name` is a `#[command(flatten)]` nested group.
+fn field_is_command_flatten(src: &str, struct_name: &str, field: &str) -> bool {
+    field_attrs_and_type(src, struct_name, field)
+        .map(|(attrs, _)| attrs.contains("command(flatten)"))
+        .unwrap_or(false)
+}
+
+/// Leaf clap fields of `struct_name` (excludes `#[command(flatten)]` nestings).
+fn leaf_struct_fields(src: &str, struct_name: &str) -> Vec<String> {
+    struct_fields(src, struct_name)
+        .into_iter()
+        .filter(|f| !field_is_command_flatten(src, struct_name, f))
+        .collect()
+}
+
+/// `#[command(flatten)] pub name: Type` pairs declared on `struct_name`.
+fn nested_flatten_fields(src: &str, struct_name: &str) -> Vec<(String, String)> {
+    struct_fields(src, struct_name)
+        .into_iter()
+        .filter(|f| field_is_command_flatten(src, struct_name, f))
+        .filter_map(|f| {
+            let (_, ty) = field_attrs_and_type(src, struct_name, &f)?;
+            let ty_name: String =
+                ty.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if ty_name.is_empty() {
+                None
+            } else {
+                Some((f, ty_name))
+            }
+        })
+        .collect()
+}
+
+/// StartArgs flatten bindings plus nested `#[command(flatten)]` groups (ARCH-4g).
+///
+/// StartArgs still has 13 groups. Nested flatten (`KeysArgs.secret_provider`,
+/// `LoggingArgs.logfile`, …) is expanded so seam α can see the inner fields
+/// without counting a 14th StartArgs binding.
+fn expand_flatten_bindings(
+    src: &str,
+    start: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut all = start.clone();
+    let mut queue: Vec<String> = start.values().cloned().collect();
+    let mut seen = HashSet::new();
+    while let Some(ty) = queue.pop() {
+        if !seen.insert(ty.clone()) {
+            continue;
+        }
+        for (field, inner_ty) in nested_flatten_fields(src, &ty) {
+            all.entry(field).or_insert_with(|| inner_ty.clone());
+            queue.push(inner_ty);
+        }
+    }
+    all
 }
 
 /// `StartArgs`' `#[command(flatten)] pub <binding>: <XArgs>,` lines → binding → type.
@@ -903,9 +965,9 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
     let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
     let groups = group_args_source(&root);
 
-    let bindings = flatten_bindings(&cli);
+    let start_bindings = flatten_bindings(&cli);
     assert_eq!(
-        bindings.len(),
+        start_bindings.len(),
         13,
         "expected 13 flattened Args groups on StartArgs; scanner or cli.rs changed"
     );
@@ -917,11 +979,14 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
         "From-impl body extraction broke (missing beacon.beacon_url)"
     );
 
+    // Nested flatten (ARCH-4g) is expanded for field accounting; StartArgs stays at 13.
+    let bindings = expand_flatten_bindings(&groups, &start_bindings);
     let mut fields_by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for ty in bindings.values() {
-        fields_by_type.entry(ty.clone()).or_insert_with(|| struct_fields(&groups, ty));
+        fields_by_type.entry(ty.clone()).or_insert_with(|| leaf_struct_fields(&groups, ty));
     }
     // Reverse map: struct type → binding name (for BYPASS second-leg needles).
+    // Prefer the StartArgs binding when a type is both a top-level group and a nest.
     let ty_to_binding: BTreeMap<&str, &str> =
         bindings.iter().map(|(b, t)| (t.as_str(), b.as_str())).collect();
 
@@ -1066,6 +1131,46 @@ pub struct BeaconArgs {
 }
 "#;
     assert_eq!(struct_fields(src, "BeaconArgs"), vec!["beacon_url", "beacon_nodes"]);
+}
+
+#[test]
+fn expand_flatten_bindings_includes_nested_groups() {
+    let src = r#"
+pub struct StartArgs {
+    #[command(flatten)]
+    pub keys: KeysArgs,
+}
+
+pub struct KeysArgs {
+    #[arg(long)]
+    pub keystore_path: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub secret_provider: SecretProviderArgs,
+}
+
+pub struct SecretProviderArgs {
+    #[arg(long)]
+    pub providers: Option<String>,
+
+    #[command(flatten)]
+    pub gcp: GcpSecretArgs,
+}
+
+pub struct GcpSecretArgs {
+    #[arg(long)]
+    pub project_id: Option<String>,
+}
+"#;
+    let start = flatten_bindings(src);
+    assert_eq!(start.len(), 1);
+    let all = expand_flatten_bindings(src, &start);
+    assert_eq!(all.get("keys").map(String::as_str), Some("KeysArgs"));
+    assert_eq!(all.get("secret_provider").map(String::as_str), Some("SecretProviderArgs"));
+    assert_eq!(all.get("gcp").map(String::as_str), Some("GcpSecretArgs"));
+    assert_eq!(leaf_struct_fields(src, "KeysArgs"), vec!["keystore_path"]);
+    assert_eq!(leaf_struct_fields(src, "SecretProviderArgs"), vec!["providers"]);
+    assert_eq!(leaf_struct_fields(src, "GcpSecretArgs"), vec!["project_id"]);
 }
 
 #[test]

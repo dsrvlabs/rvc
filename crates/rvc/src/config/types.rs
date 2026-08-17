@@ -21,8 +21,10 @@ use super::error::ConfigError;
 use super::network::Network;
 
 pub use rvc_config::sections::{
-    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, MonitoringArgs,
-    MonitoringConfig, TracingArgs, TracingConfig, TracingExporter,
+    BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
+    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, LogfileArgs, LogfileConfig,
+    MonitoringArgs, MonitoringConfig, ProposerConfigArgs, ProposerConfigSource, SecretProviderArgs,
+    SecretProviderConfig, TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// Action taken when a managed validator is detected as slashed.
@@ -249,18 +251,6 @@ fn default_beacon_max_body_bytes() -> usize {
     ResponseCaps::DEFAULT_MAX_BODY_BYTES
 }
 
-fn default_proposer_config_refresh_interval() -> u64 {
-    384
-}
-
-fn default_logfile_max_size() -> u64 {
-    200
-}
-
-fn default_logfile_max_number() -> usize {
-    5
-}
-
 /// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeaconNodeEntry {
@@ -279,139 +269,6 @@ fn default_validator_registration_batch_size() -> usize {
 
 fn default_validator_registration_batch_delay() -> u64 {
     500
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SecretProviderConfig {
-    #[serde(default)]
-    pub providers: Vec<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_interval: Option<u64>,
-
-    /// When true, any secret-provider `list_keys` failure aborts startup (SEC-9 / M-9).
-    ///
-    /// Default `false`: a single flaky provider is logged and skipped so healthy
-    /// providers can still load keys. A failure of **all** configured providers
-    /// remains fatal regardless of this flag.
-    #[serde(default)]
-    pub strict: bool,
-
-    #[serde(default)]
-    pub gcp: GcpSecretConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GcpSecretConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-
-    #[serde(default = "default_gcp_secret_prefix")]
-    pub secret_prefix: String,
-}
-
-impl Default for GcpSecretConfig {
-    fn default() -> Self {
-        Self { project_id: None, secret_prefix: default_gcp_secret_prefix() }
-    }
-}
-
-fn default_gcp_secret_prefix() -> String {
-    "validator-key-".to_string()
-}
-
-fn default_circuit_breaker_consecutive_limit() -> u32 {
-    3
-}
-
-fn default_circuit_breaker_epoch_limit() -> u32 {
-    5
-}
-
-// ---------------------------------------------------------------------------
-// Nested config groups (RF5-12/RF5-13).
-// ---------------------------------------------------------------------------
-
-/// Log-file rotation settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LogfileConfig {
-    /// Path to the log file (`logfile` flat key).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    /// Max size in MB before rotation.
-    #[serde(default = "default_logfile_max_size")]
-    pub max_size: u64,
-    /// Max number of rotated files to keep.
-    #[serde(default = "default_logfile_max_number")]
-    pub max_number: usize,
-    /// Compress rotated files.
-    #[serde(default)]
-    pub compress: bool,
-    /// Optional override log level for the file sink.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<String>,
-}
-
-impl Default for LogfileConfig {
-    fn default() -> Self {
-        Self {
-            path: None,
-            max_size: default_logfile_max_size(),
-            max_number: default_logfile_max_number(),
-            compress: false,
-            level: None,
-        }
-    }
-}
-
-/// Proposer-config URL / file source settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProposerConfigSource {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    #[serde(default = "default_proposer_config_refresh_interval")]
-    pub refresh_interval: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url_token: Option<String>,
-    #[serde(default)]
-    pub url_insecure: bool,
-}
-
-impl Default for ProposerConfigSource {
-    fn default() -> Self {
-        Self {
-            url: None,
-            file: None,
-            refresh_interval: default_proposer_config_refresh_interval(),
-            url_token: None,
-            url_insecure: false,
-        }
-    }
-}
-
-/// Builder circuit-breaker limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BuilderLimits {
-    #[serde(default = "default_circuit_breaker_consecutive_limit")]
-    pub circuit_breaker_consecutive_limit: u32,
-    #[serde(default = "default_circuit_breaker_epoch_limit")]
-    pub circuit_breaker_epoch_limit: u32,
-}
-
-impl Default for BuilderLimits {
-    fn default() -> Self {
-        Self {
-            circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
-            circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
-        }
-    }
 }
 
 impl Default for Config {

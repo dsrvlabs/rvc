@@ -1,16 +1,29 @@
 //! Config section structs (clap `Args` groups).
 //!
-//! ARCH-4f: tracing, keymanager, grpc_signer, monitoring. Later issues add
-//! the partial and missing sections.
+//! ARCH-4f: tracing, keymanager, grpc_signer, monitoring.
+//! ARCH-4g: logfile, proposer_config, builder_limits, secret_provider (+ keys
+//! clap group that flattens `SecretProviderArgs`).
 
+mod builder_limits;
 mod grpc_signer;
 mod keymanager;
+mod keys;
+mod logfile;
 mod monitoring;
+mod proposer_config;
+mod secret_provider;
 mod tracing;
 
+pub use builder_limits::{BuilderLimits, BuilderLimitsArgs};
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};
 pub use keymanager::{KeymanagerArgs, KeymanagerConfig};
+pub use keys::KeysArgs;
+pub use logfile::{LogfileArgs, LogfileConfig};
 pub use monitoring::{MonitoringArgs, MonitoringConfig};
+pub use proposer_config::{ProposerConfigArgs, ProposerConfigSource};
+pub use secret_provider::{
+    GcpSecretArgs, GcpSecretConfig, SecretProviderArgs, SecretProviderConfig,
+};
 pub use tracing::{TracingArgs, TracingConfig, TracingExporter};
 
 #[cfg(test)]
@@ -19,8 +32,8 @@ mod tests {
 
     use super::*;
 
-    /// Pre-move `rvc start` long flags for the four migrated groups (20 knobs).
-    const PRE_MOVE_LONG_FLAGS: &[&str] = &[
+    /// Pre-move `rvc start` long flags for the four clean groups (20 knobs).
+    const PRE_MOVE_LONG_FLAGS_4F: &[&str] = &[
         "--allow-insecure-remote-signer",
         "--grpc-signer-tls-ca-cert",
         "--grpc-signer-tls-cert",
@@ -43,6 +56,29 @@ mod tests {
         "--tracing-sample-rate",
     ];
 
+    /// Pre-move longs for the 17 dotted knobs of the four partial sections.
+    /// The 6 bare knobs stay on CLI wrappers (`log_level`, `proposer_nodes`,
+    /// `broadcast`, `block_selection_mode`, `validator_registration_batch_*`).
+    const PRE_MOVE_LONG_FLAGS_4G: &[&str] = &[
+        "--builder-circuit-breaker-consecutive-limit",
+        "--builder-circuit-breaker-epoch-limit",
+        "--gcp-project-id",
+        "--gcp-secret-prefix",
+        "--logfile",
+        "--logfile-compress",
+        "--logfile-level",
+        "--logfile-max-number",
+        "--logfile-max-size",
+        "--proposer-config-file",
+        "--proposer-config-refresh-interval",
+        "--proposer-config-url",
+        "--proposer-config-url-insecure",
+        "--proposer-config-url-token",
+        "--secret-provider",
+        "--secret-provider-strict",
+        "--secret-refresh-interval",
+    ];
+
     #[derive(Parser, Debug)]
     #[command(name = "rvc-start-probe", no_binary_name = true)]
     struct MigratedSectionsProbe {
@@ -54,6 +90,14 @@ mod tests {
         grpc_signer: GrpcSignerArgs,
         #[command(flatten)]
         monitoring: MonitoringArgs,
+        #[command(flatten)]
+        logfile: LogfileArgs,
+        #[command(flatten)]
+        proposer_config: ProposerConfigArgs,
+        #[command(flatten)]
+        builder_limits: BuilderLimitsArgs,
+        #[command(flatten)]
+        keys: KeysArgs,
     }
 
     fn probe_long_flags() -> Vec<String> {
@@ -103,17 +147,50 @@ mod tests {
             .expect("flattened groups must parse with unique clap ids");
         let flags = probe_long_flags();
         let expected: Vec<&str> = {
-            let mut v = PRE_MOVE_LONG_FLAGS.to_vec();
+            let mut v = PRE_MOVE_LONG_FLAGS_4F.to_vec();
+            v.extend_from_slice(PRE_MOVE_LONG_FLAGS_4G);
             v.push("--no-keymanager");
+            v.extend_from_slice(&[
+                "--keystore-path",
+                "--password-file",
+                "--key-decrypt-threads",
+                "--disable-keystore-locking",
+                "--validators-config",
+            ]);
             v.sort();
             v
         };
         let actual: Vec<&str> = flags.iter().map(String::as_str).collect();
-        for flag in PRE_MOVE_LONG_FLAGS {
+        for flag in PRE_MOVE_LONG_FLAGS_4F {
             assert!(actual.contains(flag), "migrated section missing pre-move flag {flag}");
         }
-        assert_eq!(PRE_MOVE_LONG_FLAGS.len(), 20, "ARCH-4f migrates 20 knobs");
+        for flag in PRE_MOVE_LONG_FLAGS_4G {
+            assert!(actual.contains(flag), "ARCH-4g section missing pre-move flag {flag}");
+        }
+        assert_eq!(PRE_MOVE_LONG_FLAGS_4F.len(), 20, "ARCH-4f migrates 20 knobs");
+        assert_eq!(PRE_MOVE_LONG_FLAGS_4G.len(), 17, "ARCH-4g migrates 17 dotted knobs");
         assert_eq!(actual, expected, "unexpected extra or renamed long flags: {actual:?}");
+    }
+
+    #[test]
+    fn keys_args_flattens_secret_provider_args() {
+        let parsed = MigratedSectionsProbe::try_parse_from([
+            "--secret-provider",
+            "gcp",
+            "--gcp-project-id",
+            "X",
+            "--gcp-secret-prefix",
+            "vk-",
+            "--secret-refresh-interval",
+            "60",
+            "--secret-provider-strict",
+        ])
+        .expect("nested KeysArgs → SecretProviderArgs flatten must parse");
+        assert_eq!(parsed.keys.secret_provider.providers.as_deref(), Some("gcp"));
+        assert_eq!(parsed.keys.secret_provider.gcp.project_id.as_deref(), Some("X"));
+        assert_eq!(parsed.keys.secret_provider.gcp.secret_prefix.as_deref(), Some("vk-"));
+        assert_eq!(parsed.keys.secret_provider.refresh_interval, Some(60));
+        assert_eq!(parsed.keys.secret_provider.strict, Some(true));
     }
 
     #[test]
@@ -123,14 +200,42 @@ mod tests {
             include_str!("keymanager.rs"),
             include_str!("grpc_signer.rs"),
             include_str!("monitoring.rs"),
+            include_str!("logfile.rs"),
+            include_str!("proposer_config.rs"),
+            include_str!("builder_limits.rs"),
+            include_str!("secret_provider.rs"),
+            include_str!("keys.rs"),
         );
         for line in src.lines() {
             let t = line.trim();
             assert!(
                 !t.contains("default_value =") && !t.contains("default_value_t"),
-                "ARCH-4f section clap field must not set default_value: {t}"
+                "ARCH-4f/4g section clap field must not set default_value: {t}"
             );
         }
+    }
+
+    #[test]
+    fn a_4_4_is_recorded_on_each_partial_section() {
+        for (path, src) in [
+            ("logfile.rs", include_str!("logfile.rs")),
+            ("proposer_config.rs", include_str!("proposer_config.rs")),
+            ("builder_limits.rs", include_str!("builder_limits.rs")),
+            ("secret_provider.rs", include_str!("secret_provider.rs")),
+        ] {
+            assert!(
+                src.contains("A-4.4"),
+                "{path} module doc must record A-4.4 (existing TOML section wins)"
+            );
+        }
+        assert!(
+            include_str!("keys.rs").contains("A-4.5"),
+            "keys.rs must record A-4.5 (flatten SecretProviderArgs)"
+        );
+        assert!(
+            include_str!("secret_provider.rs").contains("A-4.5"),
+            "secret_provider.rs must record A-4.5"
+        );
     }
 
     fn otel_env_lock() -> std::sync::MutexGuard<'static, ()> {

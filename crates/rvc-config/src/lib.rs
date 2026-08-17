@@ -1,8 +1,10 @@
 //! Operator configuration crate (ADR-008).
 //!
-//! ARCH-4f: tracing / keymanager / grpc_signer / monitoring section structs
-//! live here. [`Config::load`] is still a scaffold (ARCH-4i). No figment;
-//! env is not a config layer.
+//! ARCH-4f: tracing / keymanager / grpc_signer / monitoring.
+//! ARCH-4g: logfile / proposer_config / builder_limits / secret_provider
+//! (plus the `KeysArgs` clap group that flattens `SecretProviderArgs`).
+//! [`Config::load`] is still a scaffold (ARCH-4i). No figment; env is not a
+//! config layer.
 
 mod error;
 pub mod sections;
@@ -11,8 +13,10 @@ use std::path::Path;
 
 pub use error::{ConfigError, ConfigSource};
 pub use sections::{
-    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, MonitoringArgs,
-    MonitoringConfig, TracingArgs, TracingConfig, TracingExporter,
+    BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
+    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, LogfileArgs, LogfileConfig,
+    MonitoringArgs, MonitoringConfig, ProposerConfigArgs, ProposerConfigSource, SecretProviderArgs,
+    SecretProviderConfig, TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// CLI overlay accepted by [`Config::load`].

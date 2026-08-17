@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use rvc::config::{
-    BlockSelectionMode, BroadcastTopic, CliOverrides, GrpcSignerArgs, KeymanagerArgs,
-    MonitoringArgs, Network, SlashedAction, TracingArgs,
+    BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, CliOverrides, GrpcSignerArgs,
+    KeymanagerArgs, KeysArgs, LogfileArgs, MonitoringArgs, Network, ProposerConfigArgs,
+    SlashedAction, TracingArgs,
 };
 use tracing::{error, info, warn};
 
@@ -224,58 +225,6 @@ pub struct BeaconArgs {
     pub duty_fetch_timeout: Option<u64>,
 }
 
-/// Keystore, secret-provider, and validators-config paths.
-#[derive(Args, Debug)]
-pub struct KeysArgs {
-    /// Path to the keystore directory
-    #[arg(long)]
-    pub keystore_path: Option<PathBuf>,
-
-    /// Path to the password file for keystore decryption
-    #[arg(long)]
-    pub password_file: Option<PathBuf>,
-
-    /// Number of threads for parallel keystore decryption (default: auto-detect)
-    #[arg(long)]
-    pub key_decrypt_threads: Option<usize>,
-
-    /// Disable keystore file locking (for DVT setups with shared key material)
-    #[arg(long)]
-    pub disable_keystore_locking: bool,
-
-    /// Secret provider(s) to use for loading validator keys (e.g., "gcp")
-    #[arg(long)]
-    pub secret_provider: Option<String>,
-
-    /// GCP project ID (required when --secret-provider includes "gcp")
-    #[arg(long)]
-    pub gcp_project_id: Option<String>,
-
-    /// Prefix for GCP secret names (default: "validator-key-")
-    #[arg(long)]
-    pub gcp_secret_prefix: Option<String>,
-
-    /// Interval in seconds to refresh keys from secret providers (0 = disabled)
-    #[arg(long)]
-    pub secret_refresh_interval: Option<u64>,
-
-    /// Fail startup if any secret provider fails to list keys (SEC-9 / M-9).
-    /// Default is resilient: one flaky provider is skipped; all providers
-    /// failing remains fatal regardless of this flag.
-    #[arg(long, default_value_t = false)]
-    pub secret_provider_strict: bool,
-
-    /// Path to a TOML file containing per-validator fee_recipient and gas_limit overrides.
-    /// rvc refuses to start if default_fee_recipient is the zero address (0x000…000).
-    ///
-    /// Example file:
-    ///   [defaults]
-    ///   fee_recipient = "0xYourAddress"
-    ///   gas_limit = 30000000
-    #[arg(long)]
-    pub validators_config: Option<PathBuf>,
-}
-
 /// Metrics HTTP and local gRPC bind settings.
 #[derive(Args, Debug)]
 pub struct ServerArgs {
@@ -316,7 +265,10 @@ pub struct NetworkArgs {
     pub graffiti: Option<String>,
 }
 
-/// Console logging and logfile rotation settings.
+/// Console logging plus flattened `[logfile]` knobs (ARCH-4g / A-4.4).
+///
+/// `[logfile]` keeps its TOML name/shape. `log_level` stays bare (ARCH-4h).
+/// `log_format` / `enable_log_reload` stay CLI-only (G-2 BYPASS).
 #[derive(Args, Debug)]
 pub struct LoggingArgs {
     /// Log level (trace, debug, info, warn, error). Default when unset: info.
@@ -341,25 +293,8 @@ pub struct LoggingArgs {
     #[arg(long, default_value_t = false)]
     pub enable_log_reload: bool,
 
-    /// Path to the log file (enables file logging alongside stdout)
-    #[arg(long)]
-    pub logfile: Option<PathBuf>,
-
-    /// Maximum log file size in MB before rotation (default: 200)
-    #[arg(long)]
-    pub logfile_max_size: Option<u64>,
-
-    /// Maximum number of rotated log files to keep (default: 5)
-    #[arg(long)]
-    pub logfile_max_number: Option<usize>,
-
-    /// Enable gzip compression of rotated log files
-    #[arg(long)]
-    pub logfile_compress: bool,
-
-    /// Log level for file logging (default: same as --log-level)
-    #[arg(long)]
-    pub logfile_level: Option<String>,
+    #[command(flatten)]
+    pub logfile: LogfileArgs,
 }
 
 /// Startup safety toggles (doppelganger, attesting, slashed action).
@@ -390,16 +325,14 @@ pub struct SafetyArgs {
     pub allow_unsupported_fork: bool,
 }
 
-/// Builder circuit-breaker and registration batch settings.
+/// Builder circuit-breaker plus bare registration knobs (ARCH-4g / A-4.4).
+///
+/// `[builder_limits]` keeps its TOML name/shape. The three bare knobs keep
+/// top-level TOML spelling (ARCH-4h will section them).
 #[derive(Args, Debug)]
 pub struct BuilderArgs {
-    /// Builder circuit breaker: consecutive missed slots before fallback to local block (default: 3, 0 to disable)
-    #[arg(long)]
-    pub builder_circuit_breaker_consecutive_limit: Option<u32>,
-
-    /// Builder circuit breaker: total epoch missed slots before fallback to local block (default: 5, 0 to disable)
-    #[arg(long)]
-    pub builder_circuit_breaker_epoch_limit: Option<u32>,
+    #[command(flatten)]
+    pub builder_limits: BuilderLimitsArgs,
 
     /// Block selection mode: max-profit (default), execution-only, builder-always, builder-only
     #[arg(long)]
@@ -414,7 +347,10 @@ pub struct BuilderArgs {
     pub validator_registration_batch_delay: Option<u64>,
 }
 
-/// Proposer-nodes, broadcast topics, and proposer-config source.
+/// Proposer-nodes, broadcast topics, and flattened `[proposer_config]` (ARCH-4g / A-4.4).
+///
+/// `[proposer_config]` keeps its TOML name/shape. `proposer_nodes` and
+/// `broadcast` keep top-level TOML spelling.
 #[derive(Args, Debug)]
 pub struct ProposerArgs {
     /// Comma-separated list of dedicated proposer beacon node URLs for block production
@@ -425,25 +361,8 @@ pub struct ProposerArgs {
     #[arg(long, value_delimiter = ',')]
     pub broadcast: Option<Vec<BroadcastTopic>>,
 
-    /// Remote URL for proposer configuration (mutually exclusive with --proposer-config-file)
-    #[arg(long, conflicts_with = "proposer_config_file")]
-    pub proposer_config_url: Option<String>,
-
-    /// Local file path for proposer configuration (mutually exclusive with --proposer-config-url)
-    #[arg(long, conflicts_with = "proposer_config_url")]
-    pub proposer_config_file: Option<String>,
-
-    /// Refresh interval in seconds for proposer config URL (default: 384, i.e., one epoch)
-    #[arg(long)]
-    pub proposer_config_refresh_interval: Option<u64>,
-
-    /// Bearer token for proposer config URL authentication
-    #[arg(long)]
-    pub proposer_config_url_token: Option<String>,
-
-    /// Allow HTTP (non-HTTPS) proposer config URL
-    #[arg(long)]
-    pub proposer_config_url_insecure: bool,
+    #[command(flatten)]
+    pub proposer_config: ProposerConfigArgs,
 }
 
 /// Slashing-protection database and operator safety flags.
@@ -538,11 +457,11 @@ impl From<StartArgs> for CliOverrides {
             tracing_sample_rate: tracing.sample_rate,
             tracing_max_queue_size: tracing.max_queue_size,
             tracing_max_export_batch_size: tracing.max_export_batch_size,
-            secret_provider: keys.secret_provider,
-            gcp_project_id: keys.gcp_project_id,
-            gcp_secret_prefix: keys.gcp_secret_prefix,
-            secret_refresh_interval: keys.secret_refresh_interval,
-            secret_provider_strict: flag(keys.secret_provider_strict),
+            secret_provider: keys.secret_provider.providers.clone(),
+            gcp_project_id: keys.secret_provider.gcp.project_id.clone(),
+            gcp_secret_prefix: keys.secret_provider.gcp.secret_prefix.clone(),
+            secret_refresh_interval: keys.secret_provider.refresh_interval,
+            secret_provider_strict: keys.secret_provider.strict.filter(|b| *b),
             allow_insecure_remote_signer: keymanager.allow_insecure_remote_signer.filter(|b| *b),
             keymanager_cors_origins: keymanager.cors_origins,
             keymanager_body_limit: keymanager.body_limit,
@@ -553,24 +472,25 @@ impl From<StartArgs> for CliOverrides {
             disable_attesting: flag(safety.disable_attesting),
             slashed_validators_action: safety.slashed_validators_action,
             builder_circuit_breaker_consecutive_limit: builder
-                .builder_circuit_breaker_consecutive_limit,
-            builder_circuit_breaker_epoch_limit: builder.builder_circuit_breaker_epoch_limit,
+                .builder_limits
+                .circuit_breaker_consecutive_limit,
+            builder_circuit_breaker_epoch_limit: builder.builder_limits.circuit_breaker_epoch_limit,
             disable_keystore_locking: flag(keys.disable_keystore_locking),
             proposer_nodes: proposer.proposer_nodes,
             broadcast: proposer.broadcast,
-            proposer_config_url: proposer.proposer_config_url,
-            proposer_config_file: proposer.proposer_config_file,
-            proposer_config_refresh_interval: proposer.proposer_config_refresh_interval,
-            proposer_config_url_token: proposer.proposer_config_url_token,
-            proposer_config_url_insecure: flag(proposer.proposer_config_url_insecure),
+            proposer_config_url: proposer.proposer_config.url.clone(),
+            proposer_config_file: proposer.proposer_config.file.clone(),
+            proposer_config_refresh_interval: proposer.proposer_config.refresh_interval,
+            proposer_config_url_token: proposer.proposer_config.url_token.clone(),
+            proposer_config_url_insecure: proposer.proposer_config.url_insecure.filter(|b| *b),
             monitoring_endpoint: monitoring.endpoint,
             monitoring_interval: monitoring.interval,
             monitoring_endpoint_insecure: monitoring.endpoint_insecure.filter(|b| *b),
-            logfile: logging.logfile,
-            logfile_max_size: logging.logfile_max_size,
-            logfile_max_number: logging.logfile_max_number,
-            logfile_compress: flag(logging.logfile_compress),
-            logfile_level: logging.logfile_level,
+            logfile: logging.logfile.path.clone(),
+            logfile_max_size: logging.logfile.max_size,
+            logfile_max_number: logging.logfile.max_number,
+            logfile_compress: logging.logfile.compress.filter(|b| *b),
+            logfile_level: logging.logfile.level.clone(),
             block_selection_mode: builder.block_selection_mode,
             validator_registration_batch_size: builder.validator_registration_batch_size,
             validator_registration_batch_delay: builder.validator_registration_batch_delay,
@@ -1147,6 +1067,72 @@ mod tests {
         assert_eq!(ov.beacon_max_body_bytes, None);
     }
 
+    #[test]
+    fn secret_provider_knobs_reachable_from_both_cli_and_nested_table() {
+        use rvc::config::Config;
+        use std::io::Write;
+
+        let cli = Cli::try_parse_from([
+            "rvc",
+            "start",
+            "--secret-provider",
+            "gcp",
+            "--gcp-project-id",
+            "X",
+            "--gcp-secret-prefix",
+            "vk-",
+            "--secret-refresh-interval",
+            "60",
+            "--secret-provider-strict",
+        ])
+        .expect("secret-provider CLI flags must parse through KeysArgs flatten");
+        let Commands::Start(args) = cli.command else {
+            panic!("expected Start");
+        };
+        let mut from_cli = Config::default();
+        from_cli.merge_with_cli(&CliOverrides::from(*args));
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+[secret_provider]
+providers = ["gcp"]
+refresh_interval = 60
+strict = true
+
+[secret_provider.gcp]
+project_id = "X"
+secret_prefix = "vk-"
+"#
+        )
+        .unwrap();
+        let from_toml = Config::from_file(file.path()).unwrap();
+
+        assert_eq!(from_cli.secret_provider.providers, from_toml.secret_provider.providers);
+        assert_eq!(
+            from_cli.secret_provider.refresh_interval,
+            from_toml.secret_provider.refresh_interval
+        );
+        assert_eq!(from_cli.secret_provider.strict, from_toml.secret_provider.strict);
+        assert_eq!(
+            from_cli.secret_provider.gcp.project_id,
+            from_toml.secret_provider.gcp.project_id
+        );
+        assert_eq!(
+            from_cli.secret_provider.gcp.secret_prefix,
+            from_toml.secret_provider.gcp.secret_prefix
+        );
+        assert_eq!(from_cli.secret_provider.gcp.project_id.as_deref(), Some("X"));
+
+        let cli_json = serde_json::to_string(&from_cli).expect("serialize CLI Config");
+        let toml_json = serde_json::to_string(&from_toml).expect("serialize TOML Config");
+        assert_eq!(
+            cli_json, toml_json,
+            "CLI flags and [secret_provider] table must yield the same Config"
+        );
+    }
+
     /// ADR-009: TOML values must survive when the matching clap flag is absent.
     /// Before ARCH-6b, clap `default_value` + unconditional `Some(...)` forced 8080 over 9090.
     #[test]
@@ -1308,13 +1294,13 @@ grpc_port = 60051
             panic!("expected Start");
         };
         assert!(args.beacon.beacon_url.is_some());
-        assert!(args.logging.logfile.is_some());
+        assert!(args.logging.logfile.path.is_some());
         assert!(args.tracing.endpoint.is_some());
         assert_eq!(args.keymanager.enabled, Some(true));
         assert!(args.grpc_signer.url.is_some());
-        assert!(args.proposer.proposer_config_file.is_some());
+        assert!(args.proposer.proposer_config.file.is_some());
         assert!(args.monitoring.endpoint.is_some());
-        assert!(args.builder.builder_circuit_breaker_consecutive_limit.is_some());
+        assert!(args.builder.builder_limits.circuit_breaker_consecutive_limit.is_some());
         assert!(args.slashing.slashing_db_path.is_some());
     }
 

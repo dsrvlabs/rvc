@@ -731,12 +731,12 @@ That is **23 of the 65 knobs** (17 dotted + 6 bare that belong to these groups).
 
 **Acceptance criteria.**
 
-- [ ] Four sections migrated; **A-4.4's decision (existing TOML section wins) is recorded in the
+- [x] Four sections migrated; **A-4.4's decision (existing TOML section wins) is recorded in the
       module doc of each**, so the next reader does not "correct" it back to ADR-008's literal wording.
-- [ ] `KeysArgs` flattens `SecretProviderArgs`, or the fallback is taken and documented.
-- [ ] All 23 knobs reachable from both CLI and TOML; flat/top-level spellings preserved by alias.
-- [ ] `logfile` still accepts a string **or** a table.
-- [ ] `ARCH-4d` snapshots byte-identical; G-2 and G-3 green.
+- [x] `KeysArgs` flattens `SecretProviderArgs`, or the fallback is taken and documented.
+- [x] All 23 knobs reachable from both CLI and TOML; flat/top-level spellings preserved by alias.
+- [x] `logfile` still accepts a string **or** a table.
+- [x] `ARCH-4d` snapshots byte-identical; G-2 and G-3 green.
 
 ---
 
