@@ -271,13 +271,13 @@ issue and in the PR description — the *measurement* is half the deliverable.
 they must stay out of the scanner's scope and **nothing is added to `EXEMPTIONS`**.
 
 **Acceptance criteria.**
-- [ ] A wiremock test exists that asserts a **specific documented BN behaviour** for
+- [x] A wiremock test exists that asserts a **specific documented BN behaviour** for
       `get_block_root(<current slot>)` — not a self-consistency tautology.
-- [ ] The observed status code and response body are recorded in the PR description and in
+- [x] The observed status code and response body are recorded in the PR description and in
       `plan/architecture-2026-08-12/` (one short note file), so the phase's premise is auditable.
-- [ ] The test drives the real HTTP client, not `MockBeaconNodeClient`.
-- [ ] No new test name ends in `_root` / `tree_hash` / `signing_root`; `EXEMPTIONS` unchanged.
-- [ ] The decision — proceed with 3c–3f, or re-scope — is written into the issue before it closes.
+- [x] The test drives the real HTTP client, not `MockBeaconNodeClient`.
+- [x] No new test name ends in `_root` / `tree_hash` / `signing_root`; `EXEMPTIONS` unchanged.
+- [x] The decision — proceed with 3c–3f, or re-scope — is written into the issue before it closes.
 
 ---
 

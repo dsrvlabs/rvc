@@ -130,4 +130,123 @@ mod tests {
             "BN error must yield head_root = None, not a panic or propagated error"
         );
     }
+
+    /// ARCH-3a defect pin (green against HEAD, red against intent).
+    ///
+    /// A spec-conformant BN 404s `get_block_root(<current slot>)` at t=0.
+    /// Today's `capture` collapses that to `head_root = None`, and the
+    /// sync-committee message phase therefore produces **zero** messages.
+    ///
+    /// ARCH-3c **replaces** this pin rather than inverting these assertions.
+    /// The split keeps t=0 `head_root` unset (`capture_parent` / `slot-1`);
+    /// messages are unblocked by a later phase-2 `capture_head`, covered by
+    /// new 3c tests (`test_capture_parent_leaves_head_unset_until_phase_two`,
+    /// `test_sync_messages_are_produced_when_bn_404s_the_current_slot`). Do
+    /// not stuff a root into `head_root` at t=0 to make this test submit.
+    #[tokio::test]
+    async fn test_capture_yields_no_context_when_bn_404s_current_slot() {
+        use std::sync::{Arc, Mutex};
+
+        use beacon::{BeaconClient, BeaconClientConfig, ExecutionOptimisticResponse};
+        use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+        use duty_tracker::DutyTracker;
+        use eth_types::SyncCommitteeDuty;
+        use signer::{always_enabled, SignerService};
+        use slashing::SlashingDb;
+        use validator_store::{ValidatorConfig, ValidatorStore};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::orchestrator::coordinator::tests::create_test_config;
+        use crate::orchestrator::sync_committee::SyncCommitteeService;
+
+        let slot: Slot = 1000;
+        let epoch: Epoch = slot / 32;
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/blocks/{slot}/root")))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                r#"{"code":404,"message":"NOT_FOUND: beacon block at slot 1000"}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Real HTTP client (not MockBeaconNodeClient): 404 is what capture sees.
+        let client =
+            BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(0))
+                .unwrap();
+        let ctx = SlotContext::capture(&client, slot, epoch).await;
+        assert!(
+            ctx.head_root.is_none(),
+            "spec-conformant 404 for the current slot must collapse to head_root = None"
+        );
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let submitted = Arc::new(Mutex::new(Vec::<Root>::new()));
+        let submitted_for_hook = Arc::clone(&submitted);
+        let duty_pk = pk.to_bytes();
+
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties(move |_epoch, _indices| {
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: duty_pk,
+                            validator_index: 1,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                })
+                .with_submit_sync_committee_messages(move |messages| {
+                    submitted_for_hook
+                        .lock()
+                        .unwrap()
+                        .extend(messages.iter().map(|m| m.beacon_block_root));
+                    Ok(())
+                }),
+        );
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let signer = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+        assert!(
+            !duty_tracker.get_sync_committee_duties(slot).await.is_empty(),
+            "harness must have sync duties for slot {slot}; empty-duty skip is not this pin"
+        );
+        assert!(
+            store.is_signing_enabled(&pk.to_bytes()),
+            "harness validator must be signing-enabled"
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(pk.to_bytes(), pk);
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            store,
+        );
+
+        service.maybe_produce_sync_messages(slot, epoch, &ctx).await;
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "ARCH-3a defect: capture 404 → head_root=None → zero sync committee messages"
+        );
+    }
 }
