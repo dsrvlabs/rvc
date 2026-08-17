@@ -1,28 +1,26 @@
 //! G-2 / ARCH-P1-1 config-drift gate — clauses (ii), (iii), (iv).
 //!
-//! Seam α (`bin/rvc/src/cli.rs` group `Args` structs → `impl From<StartArgs> for CliOverrides`)
-//! is the **one** seam in the five-site config pipeline that rustc does not guard: the destructure
-//! at `cli.rs` is exhaustive over the 13 group *bindings*, but the 74 group *fields* are read by
-//! field access, so a new field in e.g. `BeaconArgs` compiles silently and is ignored at runtime.
+//! Seam α is now `StartArgs` flatten groups → `Config::apply_cli` (`types.rs`).
+//! rustc does not require every group field to be read; clause (ii) still scans
+//! identifier-bounded `{binding}.{field}` accesses in `apply_cli`.
 //!
 //! ## Clause (i) is DROPPED, not forgotten
 //!
-//! "Every `CliOverrides` field is consumed in `merge_with_cli`" is **already enforced by rustc**:
-//! `merge_cli_fields!` exhaustively destructures `CliOverrides`
-//! (`crates/rvc/src/config/types.rs`). A scanner for it can only ever be green. Readers who do not
-//! know this will think it was overlooked — hence this paragraph.
+//! Clause (i) (`CliOverrides` consumed in `merge_with_cli`) is gone with that
+//! type (ARCH-4i). rustc no longer has an exhaustive destructure of 65 fields.
 //!
 //! ## Clause (ii) — seam α
 //!
-//! Every group-arg field must be read as `<binding>.<field>` in `From<StartArgs>`, unless listed
+//! Every group-arg field must be read as `<binding>.<field>` in `apply_cli`, unless listed
 //! on the shrinking-only `BYPASS` table. `ALIASES` documents rename / 2:1 collapse only; sources
 //! must still be read under the clap field name.
 //!
 //! ## Clause (iii) — validation coverage (descoped)
 //!
-//! Not "every `Config` field has a marker" (65 lines of noise). Instead: every `CliOverrides`
-//! field name appears in `Config::validate`'s body (`types.rs`) **or** on the shrinking-only
-//! [`UNVALIDATED`] list. Adding a knob without a check or a list entry fails CI.
+//! Not "every `Config` field has a marker" (65 lines of noise). Instead: every
+//! [`OPERATOR_KNOB_NAMES`] entry appears in `Config::validate`'s body (`types.rs`) **or**
+//! on the shrinking-only [`UNVALIDATED`] list. Adding a knob without a check or a list
+//! entry fails CI.
 //!
 //! ## Clause (iv) — `CLAP_DEFAULT_CLOBBERS` (ADR-009 / F9)
 //!
@@ -69,7 +67,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const CLI_RS: &str = "bin/rvc/src/cli.rs";
+const START_RS: &str = "crates/rvc/src/config/start.rs";
 const TYPES_RS: &str = "crates/rvc/src/config/types.rs";
+const KNOBS_RS: &str = "crates/rvc/src/config/knobs.rs";
 
 /// ARCH-4f/4g: migrated clap groups live in `rvc-config` and are re-imported by `StartArgs`.
 const MIGRATED_GROUP_SRCS: &[&str] = &[
@@ -239,7 +239,7 @@ fn workspace_root() -> PathBuf {
 /// `cli.rs` plus ARCH-4f section files so seam-α can see moved group structs.
 fn group_args_source(root: &Path) -> String {
     let mut src =
-        std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
+        std::fs::read_to_string(root.join(START_RS)).expect("crates/rvc/src/config/start.rs must exist");
     for rel in MIGRATED_GROUP_SRCS {
         let extra = std::fs::read_to_string(root.join(rel))
             .unwrap_or_else(|e| panic!("{rel} must exist after ARCH-4f: {e}"));
@@ -576,11 +576,11 @@ fn flatten_bindings(src: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// Body of `impl From<StartArgs> for CliOverrides { … }`.
-fn from_impl_body(src: &str) -> String {
+/// Body of `fn apply_cli(&mut self, cli: &StartArgs) { … }`.
+fn apply_cli_body(src: &str) -> String {
     let markers = [
-        "impl From<StartArgs> for CliOverrides",
-        "impl From<StartArgs> for crate::config::CliOverrides",
+        "fn apply_cli(&mut self, cli: &StartArgs)",
+        "fn apply_cli(&mut self, cli: &super::start::StartArgs)",
     ];
     let mut start = None;
     for m in markers {
@@ -656,8 +656,8 @@ fn seam_alpha_unread(
             if !has_field_access(&compact, binding, field) {
                 violations.push(format!(
                     "{ty}::{field} (--{}) is declared as a clap arg but never read by \
-                     `impl From<StartArgs> for CliOverrides`; it is accepted on the command line \
-                     and silently ignored. Add a `CliOverrides` field for it, or add it to BYPASS \
+                     `Config::apply_cli`; it is accepted on the command line \
+                     and silently ignored. Overlay it in `apply_cli`, or add it to BYPASS \
                      with a reason string (ALIASES only renames — the source field must still be \
                      read as `<binding>.<field>`).",
                     field.replace('_', "-")
@@ -952,7 +952,7 @@ fn unvalidated_violations(
             continue;
         }
         missing.push(format!(
-            "CliOverrides::{f} is neither mentioned in Config::validate nor listed in UNVALIDATED; \
+            "knob `{f}` is neither mentioned in Config::validate nor listed in UNVALIDATED; \
              add a validation check or a shrinking-only UNVALIDATED entry with a reason"
         ));
     }
@@ -968,20 +968,22 @@ fn unvalidated_violations(
 fn every_group_arg_field_is_read_by_the_from_impl() {
     let root = workspace_root();
     let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
+    let start = std::fs::read_to_string(root.join(START_RS)).expect("start.rs must exist");
+    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs must exist");
     let groups = group_args_source(&root);
 
-    let start_bindings = flatten_bindings(&cli);
+    let start_bindings = flatten_bindings(&start);
     assert_eq!(
         start_bindings.len(),
         13,
-        "expected 13 flattened Args groups on StartArgs; scanner or cli.rs changed"
+        "expected 13 flattened Args groups on StartArgs; scanner or start.rs changed"
     );
 
-    let body = from_impl_body(&cli);
+    let body = apply_cli_body(&types);
     let from_scan = scan_text(&body);
     assert!(
         has_field_access(&from_scan, "beacon", "url"),
-        "From-impl body extraction broke (missing beacon.url)"
+        "apply_cli body extraction broke (missing beacon.url)"
     );
 
     // Nested flatten (ARCH-4g) is expanded for field accounting; StartArgs stays at 13.
@@ -1108,14 +1110,29 @@ fn field_arithmetic_holds() {
     assert_eq!(collapse, 1, "expected exactly one 2:1 collapse alias (the −1)");
 
     let root = workspace_root();
-    let types =
-        std::fs::read_to_string(root.join(TYPES_RS)).expect("crates/rvc/src/config/types.rs");
-    let override_fields = struct_fields(&types, "CliOverrides");
+    let knobs = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
+    let override_fields = operator_knob_names(&knobs);
     assert_eq!(
         override_fields.len(),
         65,
-        "CliOverrides field count drifted; update arithmetic / seam α tables"
+        "OPERATOR_KNOB_NAMES count drifted; update arithmetic / seam α tables"
     );
+}
+
+/// String literals inside `OPERATOR_KNOB_NAMES`.
+fn operator_knob_names(src: &str) -> Vec<String> {
+    let marker = "pub const OPERATOR_KNOB_NAMES";
+    let start = src.find(marker).expect("OPERATOR_KNOB_NAMES must exist");
+    let rest = &src[start..];
+    let open = rest.find('[').expect("OPERATOR_KNOB_NAMES array");
+    let close = rest.find("];").expect("OPERATOR_KNOB_NAMES terminator");
+    rest[open + 1..close]
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim().trim_end_matches(',');
+            t.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,8 +1358,8 @@ fn has_field_access_is_identifier_bounded() {
 #[test]
 fn from_impl_body_extracts_live_cli_rs() {
     let root = workspace_root();
-    let cli = std::fs::read_to_string(root.join(CLI_RS)).unwrap();
-    let body = from_impl_body(&cli);
+    let types = std::fs::read_to_string(root.join(TYPES_RS)).unwrap();
+    let body = apply_cli_body(&types);
     assert!(!body.is_empty());
     assert!(body.contains("beacon"));
     assert!(has_field_access(&scan_text(&body), "beacon", "url"));
@@ -1355,10 +1372,11 @@ fn from_impl_body_extracts_live_cli_rs() {
 #[test]
 fn clap_default_clobbers_list_matches_the_source() {
     let root = workspace_root();
-    let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs");
+    let start = std::fs::read_to_string(root.join(START_RS)).expect("start.rs");
+    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs");
     let groups = group_args_source(&root);
-    let bindings = flatten_bindings(&cli);
-    let body = from_impl_body(&cli);
+    let bindings = flatten_bindings(&start);
+    let body = apply_cli_body(&types);
     let found = detect_clap_default_clobbers(&body, &groups, &bindings);
 
     let allowed: Vec<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
@@ -1478,11 +1496,12 @@ fn every_cli_override_field_is_validated_or_listed() {
     let root = workspace_root();
     let types =
         std::fs::read_to_string(root.join(TYPES_RS)).expect("crates/rvc/src/config/types.rs");
-    let override_fields = struct_fields(&types, "CliOverrides");
+    let knobs = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
+    let override_fields = operator_knob_names(&knobs);
     assert_eq!(
         override_fields.len(),
         65,
-        "CliOverrides field count drifted; update UNVALIDATED / clause iii"
+        "OPERATOR_KNOB_NAMES count drifted; update UNVALIDATED / clause iii"
     );
 
     let validate_body = config_validate_body(&types);
@@ -1499,7 +1518,7 @@ fn every_cli_override_field_is_validated_or_listed() {
     for &(field, _) in UNVALIDATED {
         assert!(
             override_fields.iter().any(|f| f == field),
-            "UNVALIDATED entry `{field}` is not a CliOverrides field"
+            "UNVALIDATED entry `{field}` is not an OPERATOR_KNOB_NAMES entry"
         );
     }
 
@@ -1557,4 +1576,39 @@ fn unvalidated_detector_flags_an_unlist_field() {
     listed.insert("brand_new_knob");
     let ok = unvalidated_violations(&override_fields, validate_body, &listed);
     assert!(ok.is_empty(), "listed field must pass: {ok:?}");
+}
+
+#[test]
+fn cli_overrides_type_no_longer_exists() {
+    let root = workspace_root();
+    let mut hits = Vec::new();
+    for dir in ["crates/rvc", "crates/rvc-config", "bin"] {
+        walk_rs(&root.join(dir), &mut hits);
+    }
+    assert!(
+        hits.is_empty(),
+        "M4: `struct CliOverrides` must not exist under crates/ or bin/: {hits:?}"
+    );
+}
+
+fn walk_rs(dir: &Path, hits: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_rs(&path, hits);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if src.contains("pub struct CliOverrides") || src.contains("struct CliOverrides {") {
+            hits.push(path.display().to_string());
+        }
+    }
 }

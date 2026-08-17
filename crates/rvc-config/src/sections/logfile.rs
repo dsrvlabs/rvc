@@ -66,7 +66,7 @@ pub struct LogfileArgs {
 impl LogfileArgs {
     /// Fold this declaration into a [`LogfileConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `LogfileConfig` / `rvc::config::Config`; load overlays Options.
     pub fn resolved(&self) -> LogfileConfig {
         LogfileConfig {
             path: self.path.clone(),

@@ -880,15 +880,15 @@ together with the `merge_cli_fields!` macro (`:932-981`) that drives it.
 
 **Acceptance criteria.**
 
-- [ ] `rg 'struct CliOverrides' crates/ bin/` → **nothing**; `From<StartArgs>`, `merge_with_cli` and
+- [x] `rg 'struct CliOverrides' crates/ bin/` → **nothing**; `From<StartArgs>`, `merge_with_cli` and
       `merge_cli_fields!` deleted.
-- [ ] `Config::load(file, cli)` implements defaults < file < CLI; errors name the provenance layer.
-- [ ] A TOML `metrics_port = 9090` binds **9090** at runtime.
-- [ ] `test_start_args_convert_to_equivalent_cli_overrides` **replaced** by real precedence coverage;
+- [x] `Config::load(file, cli)` implements defaults < file < CLI; errors name the provenance layer.
+- [x] A TOML `metrics_port = 9090` binds **9090** at runtime.
+- [x] `test_start_args_convert_to_equivalent_cli_overrides` **replaced** by real precedence coverage;
       `test_start_help_lists_every_flag` updated, not weakened.
-- [ ] `ARCH-4d` snapshots byte-identical — every one of the 65 knobs round-trips.
-- [ ] G-2 clause (iii) still green; G-3 green; all §2 green-build commands pass.
-- [ ] **Independently revertible** (NFR-4): this PR's revert restores a working binary without
+- [x] `ARCH-4d` snapshots byte-identical — every one of the 65 knobs round-trips.
+- [x] G-2 clause (iii) still green; G-3 green; all §2 green-build commands pass.
+- [x] **Independently revertible** (NFR-4): this PR's revert restores a working binary without
       requiring `ARCH-4j`…`4l` to be reverted.
 
 ---

@@ -54,7 +54,7 @@ pub struct BuilderLimitsArgs {
 impl BuilderLimitsArgs {
     /// Fold this declaration into a [`BuilderLimits`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `BuilderLimits`; load overlays Option fields.
     pub fn resolved(&self) -> BuilderLimits {
         BuilderLimits {
             circuit_breaker_consecutive_limit: self

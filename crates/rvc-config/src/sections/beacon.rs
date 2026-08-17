@@ -61,7 +61,7 @@ pub struct BeaconArgs {
 impl BeaconArgs {
     /// Fold this declaration into a [`BeaconConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> BeaconConfig {
         BeaconConfig {
             url: self.url.clone(),

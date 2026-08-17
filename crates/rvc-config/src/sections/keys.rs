@@ -68,7 +68,7 @@ pub struct KeysArgs {
 impl KeysArgs {
     /// Fold the five `[keys]` knobs into a [`KeysConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> KeysConfig {
         KeysConfig {
             keystore_path: self.keystore_path.clone(),

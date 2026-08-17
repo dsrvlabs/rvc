@@ -60,7 +60,7 @@ pub struct SecretProviderArgs {
 impl SecretProviderArgs {
     /// Fold this declaration into a [`SecretProviderConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `SecretProviderConfig`; load overlays Option fields.
     pub fn resolved(&self) -> SecretProviderConfig {
         SecretProviderConfig {
             providers: self

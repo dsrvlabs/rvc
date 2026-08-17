@@ -44,7 +44,7 @@ pub struct SlashingArgs {
 impl SlashingArgs {
     /// Fold this declaration into a [`SlashingConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> SlashingConfig {
         SlashingConfig {
             slashing_db_path: self.slashing_db_path.clone(),

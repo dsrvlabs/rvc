@@ -1,7 +1,5 @@
 //! Logging init helpers for the `rvc` binary.
 
-use std::path::PathBuf;
-
 use rvc::config::Config;
 use tracing::{error, info, warn};
 
@@ -111,20 +109,6 @@ pub fn init_logging(
     let reload_handle = telemetry::LogReloadHandle::new(level, reload_filter_handle);
 
     LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard, reload_handle }
-}
-
-pub fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
-    match config_path {
-        Some(path) => {
-            info!(path = ?path, "Loading configuration from file");
-            let config = Config::from_file(&path)?;
-            Ok(config)
-        }
-        None => {
-            info!("Using default configuration");
-            Ok(Config::default())
-        }
-    }
 }
 
 pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
@@ -260,10 +244,11 @@ mod tests {
     use super::*;
     use rvc::config::TracingConfig;
     use std::io;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     use clap::Parser;
-    use rvc::config::CliOverrides;
+    use rvc::config::StartArgs;
     use tracing_subscriber::fmt::MakeWriter;
 
     use crate::cli::Cli;
@@ -608,16 +593,12 @@ mod tests {
 
     #[test]
     fn test_grpc_signer_config_merge_with_cli() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            grpc_signer_url: Some("https://signer:50051".to_string()),
-            grpc_signer_tls_cert: Some(PathBuf::from("/cert.pem")),
-            grpc_signer_tls_key: Some(PathBuf::from("/key.pem")),
-            grpc_signer_tls_ca_cert: Some(PathBuf::from("/ca.pem")),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let mut args = StartArgs::default();
+        args.grpc_signer.url = Some("https://signer:50051".to_string());
+        args.grpc_signer.tls_cert = Some(PathBuf::from("/cert.pem"));
+        args.grpc_signer.tls_key = Some(PathBuf::from("/key.pem"));
+        args.grpc_signer.tls_ca_cert = Some(PathBuf::from("/ca.pem"));
+        let config = Config::load(None, args).expect("load");
 
         assert_eq!(config.grpc_signer.url.as_deref(), Some("https://signer:50051"));
         assert_eq!(config.grpc_signer.tls_cert, Some(PathBuf::from("/cert.pem")));
@@ -627,10 +608,7 @@ mod tests {
 
     #[test]
     fn test_grpc_signer_config_merge_preserves_none() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-
-        config.merge_with_cli(&cli);
+        let config = Config::load(None, StartArgs::default()).expect("load");
 
         assert!(config.grpc_signer.url.is_none());
         assert!(config.grpc_signer.tls_cert.is_none());
@@ -640,25 +618,23 @@ mod tests {
 
     #[test]
     fn test_allow_unsupported_fork_cli_merge() {
-        let mut config = Config::default();
+        let config = Config::default();
         assert!(!config.allow_unsupported_fork);
 
-        config.merge_with_cli(&CliOverrides {
-            allow_unsupported_fork: Some(true),
-            ..Default::default()
-        });
+        let mut args = StartArgs::default();
+        args.safety.allow_unsupported_fork = true;
+        let config = Config::load(None, args).expect("load");
         assert!(config.allow_unsupported_fork);
     }
 
     #[test]
     fn test_secret_provider_strict_cli_merge() {
-        let mut config = Config::default();
+        let config = Config::default();
         assert!(!config.secret_provider.strict);
 
-        config.merge_with_cli(&CliOverrides {
-            secret_provider_strict: Some(true),
-            ..Default::default()
-        });
+        let mut args = StartArgs::default();
+        args.keys.secret_provider.strict = Some(true);
+        let config = Config::load(None, args).expect("load");
         assert!(config.secret_provider.strict);
     }
 

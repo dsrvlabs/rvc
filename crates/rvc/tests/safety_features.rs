@@ -265,19 +265,15 @@ mod config_integration {
 
     #[test]
     fn cli_overrides_merge_all_safety_fields() {
-        use rvc::config::CliOverrides;
+        use rvc::config::StartArgs;
 
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            disable_attesting: Some(true),
-            slashed_validators_action: Some(SlashedAction::Shutdown),
-            builder_circuit_breaker_consecutive_limit: Some(10),
-            builder_circuit_breaker_epoch_limit: Some(20),
-            disable_keystore_locking: Some(true),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let mut args = StartArgs::default();
+        args.safety.disable_attesting = true;
+        args.safety.slashed_validators_action = Some(SlashedAction::Shutdown);
+        args.builder.builder_limits.circuit_breaker_consecutive_limit = Some(10);
+        args.builder.builder_limits.circuit_breaker_epoch_limit = Some(20);
+        args.keys.disable_keystore_locking = Some(true);
+        let config = Config::load(None, args).expect("load");
 
         assert!(config.disable_attesting);
         assert_eq!(config.slashed_validators_action, SlashedAction::Shutdown);

@@ -4097,6 +4097,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "beacon",
+ "clap",
  "criterion",
  "fd-lock",
  "hex",

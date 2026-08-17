@@ -79,7 +79,7 @@ pub struct KeymanagerArgs {
 impl KeymanagerArgs {
     /// Fold this declaration into a [`KeymanagerConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `KeymanagerConfig`; load overlays Option fields.
     pub fn resolved(&self) -> KeymanagerConfig {
         let enabled = if self.no_keymanager { false } else { self.enabled.unwrap_or(false) };
         KeymanagerConfig {

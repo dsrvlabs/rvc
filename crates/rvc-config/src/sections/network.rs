@@ -41,7 +41,7 @@ pub struct NetworkArgs {
 impl NetworkArgs {
     /// Fold this declaration into a [`NetworkConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> NetworkConfig {
         NetworkConfig {
             network: self.network,

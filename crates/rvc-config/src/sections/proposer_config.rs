@@ -66,7 +66,7 @@ pub struct ProposerConfigArgs {
 impl ProposerConfigArgs {
     /// Fold this declaration into a [`ProposerConfigSource`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `ProposerConfigSource`; load overlays Option fields.
     pub fn resolved(&self) -> ProposerConfigSource {
         ProposerConfigSource {
             url: self.url.clone(),

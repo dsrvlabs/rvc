@@ -12,89 +12,16 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use rvc::config::{BroadcastTopic, CliOverrides, Config, Network, SlashedAction, TracingExporter};
+use rvc::config::{
+    BroadcastTopic, Config, Network, SlashedAction, StartArgs, TracingExporter, OPERATOR_KNOB_NAMES,
+};
 use validator_store::BlockSelectionMode;
 
-/// Canonical 65 [`CliOverrides`] field names. Exhaustive destructure fails to
-/// compile if a field is added without updating this list.
 fn cli_override_field_names() -> Vec<&'static str> {
-    macro_rules! names {
-        ($($field:ident),+ $(,)?) => {{
-            let CliOverrides { $($field,)+ } = CliOverrides::default();
-            let _ = ($($field,)+);
-            vec![$(stringify!($field),)+]
-        }};
-    }
-    names! {
-        beacon_url,
-        beacon_nodes,
-        keystore_path,
-        password_file,
-        slashing_db_path,
-        init_slashing_db,
-        allow_unsupported_fork,
-        metrics_address,
-        metrics_port,
-        grpc_port,
-        grpc_address,
-        network,
-        genesis_time,
-        genesis_validators_root,
-        graffiti,
-        log_level,
-        doppelganger_detection,
-        keymanager_enabled,
-        keymanager_address,
-        keymanager_token_file,
-        remote_signer_url,
-        remote_signer_allowed_hosts,
-        key_decrypt_threads,
-        tracing_endpoint,
-        tracing_exporter,
-        tracing_sample_rate,
-        tracing_max_queue_size,
-        tracing_max_export_batch_size,
-        secret_provider,
-        gcp_project_id,
-        gcp_secret_prefix,
-        secret_refresh_interval,
-        secret_provider_strict,
-        allow_insecure_remote_signer,
-        keymanager_cors_origins,
-        keymanager_body_limit,
-        grpc_signer_url,
-        grpc_signer_tls_cert,
-        grpc_signer_tls_key,
-        grpc_signer_tls_ca_cert,
-        disable_attesting,
-        slashed_validators_action,
-        builder_circuit_breaker_consecutive_limit,
-        builder_circuit_breaker_epoch_limit,
-        disable_keystore_locking,
-        proposer_nodes,
-        broadcast,
-        proposer_config_url,
-        proposer_config_file,
-        proposer_config_refresh_interval,
-        proposer_config_url_token,
-        proposer_config_url_insecure,
-        monitoring_endpoint,
-        monitoring_interval,
-        monitoring_endpoint_insecure,
-        logfile,
-        logfile_max_size,
-        logfile_max_number,
-        logfile_compress,
-        logfile_level,
-        block_selection_mode,
-        validator_registration_batch_size,
-        validator_registration_batch_delay,
-        validators_config,
-        beacon_max_body_bytes,
-    }
+    OPERATOR_KNOB_NAMES.to_vec()
 }
 
-/// TOML keys that cover a CLI-only / renamed [`CliOverrides`] field.
+/// TOML keys that cover a CLI-only / renamed operator knob.
 fn toml_keys_covering_alias(cli_field: &str) -> Option<&'static [&'static str]> {
     match cli_field {
         "init_slashing_db" => Some(&["allow_fresh_db"]),
@@ -205,9 +132,9 @@ const REQUIRED_CORPUS: &[&str] = &[
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 65, "CliOverrides must stay at 65 fields until ARCH-4j");
+    assert_eq!(names.len(), 65, "operator knob count must stay at 65 until ARCH-4j");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 65, "CliOverrides field names must be unique");
+    assert_eq!(unique.len(), 65, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);
@@ -219,7 +146,7 @@ fn every_knob_appears_in_the_parity_corpus() {
         names.iter().copied().filter(|n| !knob_appears_in_corpus(n, &keys)).collect();
     assert!(
         missing.is_empty(),
-        "every CliOverrides field must appear in the parity corpus; missing: {missing:?}"
+        "every operator knob must appear in the parity corpus; missing: {missing:?}"
     );
 }
 
@@ -302,11 +229,11 @@ fn logfile_accepts_string_or_table() {
 
 #[test]
 fn toml_metrics_port_9090_survives_absent_cli_flag() {
-    let mut config = load_fixture("cli_precedence.toml");
-    assert_eq!(config.metrics_port, 9090);
-    // Absent clap flag ≡ empty CliOverrides (StartArgs lives in bin/rvc; this
-    // is the merge seam From<StartArgs> feeds). ADR-009: file value must stand.
-    config.merge_with_cli(&CliOverrides::default());
+    let from_file = load_fixture("cli_precedence.toml");
+    assert_eq!(from_file.metrics_port, 9090);
+    // Absent clap flag ≡ default StartArgs. ADR-009: file value must stand.
+    let config = Config::load(Some(&fixture_path("cli_precedence.toml")), StartArgs::default())
+        .expect("load file + empty CLI");
     assert_eq!(config.metrics_port, 9090);
     assert_config_snapshot("cli_precedence_file_only", &config);
 }
@@ -322,9 +249,8 @@ fn defaults_lose_to_file_lose_to_cli() {
     assert!(defaults.logfile.path.is_none());
     assert_eq!(defaults.beacon_url, "http://localhost:5052");
 
-    let from_file = load_fixture("cli_precedence.toml");
-    let mut file_only = from_file.clone();
-    file_only.merge_with_cli(&CliOverrides::default());
+    let file_only = Config::load(Some(&fixture_path("cli_precedence.toml")), StartArgs::default())
+        .expect("file only");
     assert_eq!(file_only.metrics_port, 9090);
     assert_eq!(file_only.log_level, "debug");
     assert_eq!(file_only.graffiti.as_deref(), Some("from-file"));
@@ -333,17 +259,15 @@ fn defaults_lose_to_file_lose_to_cli() {
     assert_eq!(file_only.logfile.path.as_deref(), Some(Path::new("/tmp/from-file.log")));
     assert_eq!(file_only.beacon_url, "http://file-only:5052");
 
-    let mut with_cli = from_file;
-    with_cli.merge_with_cli(&CliOverrides {
-        metrics_port: Some(9100),
-        log_level: Some("trace".to_string()),
-        graffiti: Some("from-cli".to_string()),
-        keymanager_enabled: Some(false),
-        tracing_sample_rate: Some(0.9),
-        logfile: Some(PathBuf::from("/tmp/from-cli.log")),
-        beacon_url: Some("http://cli-only:5052".to_string()),
-        ..Default::default()
-    });
+    let mut cli = StartArgs::default();
+    cli.server.metrics_port = Some(9100);
+    cli.logging.log_level = Some("trace".to_string());
+    cli.network.graffiti = Some("from-cli".to_string());
+    cli.keymanager.no_keymanager = true;
+    cli.tracing.sample_rate = Some(0.9);
+    cli.logging.logfile.path = Some(PathBuf::from("/tmp/from-cli.log"));
+    cli.beacon.url = Some("http://cli-only:5052".to_string());
+    let with_cli = Config::load(Some(&fixture_path("cli_precedence.toml")), cli).expect("file+cli");
     assert_eq!(with_cli.metrics_port, 9100);
     assert_eq!(with_cli.log_level, "trace");
     assert_eq!(with_cli.graffiti.as_deref(), Some("from-cli"));

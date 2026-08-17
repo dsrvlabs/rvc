@@ -40,7 +40,7 @@ pub struct ServerArgs {
 impl ServerArgs {
     /// Fold this declaration into a [`ServerConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> ServerConfig {
         ServerConfig {
             metrics_address: self.metrics_address,

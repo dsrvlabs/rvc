@@ -41,7 +41,7 @@ pub struct MonitoringArgs {
 impl MonitoringArgs {
     /// Fold this declaration into a [`MonitoringConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `MonitoringConfig`; load overlays Option fields.
     pub fn resolved(&self) -> MonitoringConfig {
         MonitoringConfig {
             endpoint: self.endpoint.clone(),

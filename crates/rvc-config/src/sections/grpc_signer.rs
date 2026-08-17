@@ -38,7 +38,7 @@ pub struct GrpcSignerArgs {
 impl GrpcSignerArgs {
     /// Fold this declaration into a [`GrpcSignerConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `GrpcSignerConfig`; load overlays Option fields.
     pub fn resolved(&self) -> GrpcSignerConfig {
         GrpcSignerConfig {
             url: self.url.clone(),

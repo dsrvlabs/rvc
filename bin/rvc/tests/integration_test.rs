@@ -140,9 +140,9 @@ keymanager_enabled = false
 
 /// Spawn `rvc start` with `--init-slashing-db` for the fresh-DB SEC-3 path.
 ///
-/// Ports must be passed on the CLI: clap always emits `default_value_t` for
-/// `--metrics-port` / `--grpc-port`, and `merge_with_cli` then overwrites the
-/// config-file values. Clear `OTEL_*` so ambient collector env stays offline.
+/// Ports are still passed on the CLI so parallel tests do not collide.
+/// After ARCH-4i / ADR-009 a TOML `metrics_port` survives when the flag is
+/// absent. Clear `OTEL_*` so ambient collector env stays offline.
 fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
     let binary_path = get_binary_path();
 

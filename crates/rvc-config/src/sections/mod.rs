@@ -4,6 +4,7 @@
 //! ARCH-4g: logfile, proposer_config, builder_limits, secret_provider (+ keys
 //! clap group that flattens `SecretProviderArgs`).
 //! ARCH-4h: beacon, server, network, safety, slashing; `[keys]` finished.
+//! `*Args::resolved()` is not called from `Config::load`.
 
 mod beacon;
 mod builder_limits;

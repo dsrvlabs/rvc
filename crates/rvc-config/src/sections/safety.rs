@@ -87,7 +87,7 @@ pub struct SafetyArgs {
 impl SafetyArgs {
     /// Fold this declaration into a [`SafetyConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> SafetyConfig {
         SafetyConfig {
             allow_unsupported_fork: if self.allow_unsupported_fork { Some(true) } else { None },

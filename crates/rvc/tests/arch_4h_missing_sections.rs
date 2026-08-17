@@ -417,6 +417,7 @@ fn every_one_of_the_65_knobs_has_exactly_one_declaration() {
         }
     }
     srcs.push(fs::read_to_string(root.join("bin/rvc/src/cli.rs")).expect("cli.rs"));
+    srcs.push(fs::read_to_string(root.join("crates/rvc/src/config/start.rs")).expect("start.rs"));
 
     let args_structs = [
         "TracingArgs",

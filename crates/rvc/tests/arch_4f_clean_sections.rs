@@ -3,6 +3,7 @@
 //! Test names do not end in `_root` (KAT scan).
 
 use rvc::config::Config;
+use tempfile::NamedTempFile;
 
 #[test]
 fn tracing_section_flat_alias_still_parses() {
@@ -67,7 +68,7 @@ fn otel_env_fallback_is_still_config_else_env() {
     let _guard = otel_env_lock();
     std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-must-lose:4318");
 
-    let mut cfg: Config = toml::from_str(
+    let cfg: Config = toml::from_str(
         r#"
 [tracing]
 endpoint = "http://config-wins:4318"
@@ -77,7 +78,11 @@ endpoint = "http://config-wins:4318"
     assert_eq!(cfg.tracing.endpoint.as_deref(), Some("http://config-wins:4318"));
     assert_eq!(cfg.tracing.resolve_endpoint().as_deref(), Some("http://config-wins:4318"));
 
-    cfg.merge_with_cli(&rvc::config::CliOverrides::default());
+    let mut file = NamedTempFile::new().expect("temp config");
+    std::io::Write::write_all(&mut file, b"[tracing]\nendpoint = \"http://config-wins:4318\"\n")
+        .expect("write");
+    let cfg = Config::load(Some(file.path()), rvc::config::StartArgs::default())
+        .expect("empty CLI must not change a file-loaded endpoint");
     assert_eq!(
         cfg.tracing.resolve_endpoint().as_deref(),
         Some("http://config-wins:4318"),

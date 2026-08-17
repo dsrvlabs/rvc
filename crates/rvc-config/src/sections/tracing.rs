@@ -82,7 +82,7 @@ pub struct TracingArgs {
 impl TracingArgs {
     /// Fold this declaration into a [`TracingConfig`].
     ///
-    /// Unused on today's `Config::from_file` / `merge_with_cli` path (ARCH-4i).
+    /// Defaults live on `TracingConfig`; load overlays Option fields.
     /// `sample_rate` stays `None` so [`TracingConfig::resolve_sample_rate`] can
     /// apply `OTEL_TRACES_SAMPLER_ARG` (config-else-env).
     pub fn resolved(&self) -> TracingConfig {

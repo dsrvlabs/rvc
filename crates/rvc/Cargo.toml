@@ -22,6 +22,7 @@ eth-types.workspace = true
 beacon.workspace = true
 bn-manager.workspace = true
 block-service.workspace = true
+clap.workspace = true
 crypto.workspace = true
 observability.workspace = true
 duty-tracker.workspace = true

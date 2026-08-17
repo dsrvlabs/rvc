@@ -2,18 +2,13 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
-use rvc::config::{
-    BeaconArgs, BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, CliOverrides,
-    GrpcSignerArgs, KeymanagerArgs, KeysArgs, LogfileArgs, MonitoringArgs, NetworkArgs,
-    ProposerConfigArgs, SafetyArgs, ServerArgs, SlashingArgs, TracingArgs,
-};
+use clap::{Parser, Subcommand};
+use rvc::config::{Config, StartArgs};
 use tracing::{error, info, warn};
 
 use crate::commands;
 use crate::logging::{
-    build_file_layer_config, build_tracing_config, init_logging, load_config,
-    spawn_log_reload_handler,
+    build_file_layer_config, build_tracing_config, init_logging, spawn_log_reload_handler,
 };
 
 #[derive(Parser)]
@@ -138,237 +133,6 @@ pub enum Commands {
     },
 }
 
-/// Arguments for `rvc start`, composed of flattened clap groups that mirror
-/// the nested config sections introduced in RF5-12.
-#[derive(Args, Debug)]
-pub struct StartArgs {
-    /// Path to the configuration file (TOML format)
-    #[arg(short, long)]
-    pub config: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub beacon: BeaconArgs,
-
-    #[command(flatten)]
-    pub keys: KeysArgs,
-
-    #[command(flatten)]
-    pub server: ServerArgs,
-
-    #[command(flatten)]
-    pub network: NetworkArgs,
-
-    #[command(flatten)]
-    pub logging: LoggingArgs,
-
-    #[command(flatten)]
-    pub tracing: TracingArgs,
-
-    #[command(flatten)]
-    pub keymanager: KeymanagerArgs,
-
-    #[command(flatten)]
-    pub grpc_signer: GrpcSignerArgs,
-
-    #[command(flatten)]
-    pub safety: SafetyArgs,
-
-    #[command(flatten)]
-    pub builder: BuilderArgs,
-
-    #[command(flatten)]
-    pub proposer: ProposerArgs,
-
-    #[command(flatten)]
-    pub monitoring: MonitoringArgs,
-
-    #[command(flatten)]
-    pub slashing: SlashingArgs,
-}
-
-/// Console logging plus flattened `[logfile]` knobs (ARCH-4g / A-4.4).
-///
-/// `[logfile]` keeps its TOML name/shape. `log_level` stays bare (ARCH-4h).
-/// `log_format` / `enable_log_reload` stay CLI-only (G-2 BYPASS).
-#[derive(Args, Debug)]
-pub struct LoggingArgs {
-    /// Log level (trace, debug, info, warn, error). Default when unset: info.
-    #[arg(long)]
-    pub log_level: Option<String>,
-
-    /// Console log output format: `pretty` (default, human-readable) or
-    /// `json` (one structured object per event, for log-aggregation backends
-    /// such as Loki / Elasticsearch / a SIEM). Also settable via the
-    /// `RVC_LOG_FORMAT` env var; an explicit flag wins. Applies to the console
-    /// stream only — the file appender keeps its own format (issue 5.5).
-    #[arg(long, default_value = "pretty")]
-    pub log_format: String,
-
-    /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
-    ///
-    /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and
-    /// swaps the active log filter in place — raising or lowering verbosity
-    /// without a restart. Disabled by default so the steady-state log path is
-    /// unchanged; the always-on reload *layer* is free on the disabled hot
-    /// path either way. Unix only (a no-op on other platforms).
-    #[arg(long, default_value_t = false)]
-    pub enable_log_reload: bool,
-
-    #[command(flatten)]
-    pub logfile: LogfileArgs,
-}
-
-/// Builder circuit-breaker plus bare registration knobs (ARCH-4g / A-4.4).
-///
-/// `[builder_limits]` keeps its TOML name/shape. The three bare knobs keep
-/// top-level TOML spelling (out of ARCH-4h's 22-knob table).
-#[derive(Args, Debug)]
-pub struct BuilderArgs {
-    #[command(flatten)]
-    pub builder_limits: BuilderLimitsArgs,
-
-    /// Block selection mode: max-profit (default), execution-only, builder-always, builder-only
-    #[arg(long)]
-    pub block_selection_mode: Option<BlockSelectionMode>,
-
-    /// Maximum number of validator registrations per batch (default: 500, 0 = send all at once)
-    #[arg(long)]
-    pub validator_registration_batch_size: Option<usize>,
-
-    /// Delay in milliseconds between registration batches (default: 500)
-    #[arg(long)]
-    pub validator_registration_batch_delay: Option<u64>,
-}
-
-/// Proposer-nodes, broadcast topics, and flattened `[proposer_config]` (ARCH-4g / A-4.4).
-///
-/// `[proposer_config]` keeps its TOML name/shape. `proposer_nodes` and
-/// `broadcast` keep top-level TOML spelling.
-#[derive(Args, Debug)]
-pub struct ProposerArgs {
-    /// Comma-separated list of dedicated proposer beacon node URLs for block production
-    #[arg(long, value_delimiter = ',')]
-    pub proposer_nodes: Option<Vec<String>>,
-
-    /// Comma-separated list of message types to broadcast to all BNs (attestations,blocks,sync-committee,subscriptions,none)
-    #[arg(long, value_delimiter = ',')]
-    pub broadcast: Option<Vec<BroadcastTopic>>,
-
-    #[command(flatten)]
-    pub proposer_config: ProposerConfigArgs,
-}
-
-/// Convert a present-only CLI boolean into the three-state `Option<bool>`
-/// used by [`CliOverrides`]: `true` → `Some(true)`, `false` (absent) → `None`.
-fn flag(b: bool) -> Option<bool> {
-    if b {
-        Some(true)
-    } else {
-        None
-    }
-}
-
-impl From<StartArgs> for CliOverrides {
-    fn from(args: StartArgs) -> Self {
-        let StartArgs {
-            config: _,
-            beacon,
-            keys,
-            server,
-            network,
-            logging,
-            tracing,
-            keymanager,
-            grpc_signer,
-            safety,
-            builder,
-            proposer,
-            monitoring,
-            slashing,
-        } = args;
-
-        Self {
-            beacon_url: beacon.url,
-            beacon_nodes: beacon.nodes,
-            keystore_path: keys.keystore_path,
-            password_file: keys.password_file,
-            slashing_db_path: slashing.slashing_db_path,
-            init_slashing_db: flag(slashing.init_slashing_db),
-            allow_unsupported_fork: flag(safety.allow_unsupported_fork),
-            metrics_address: server.metrics_address,
-            metrics_port: server.metrics_port,
-            grpc_port: server.grpc_port,
-            grpc_address: server.grpc_address,
-            network: network.network,
-            genesis_time: network.genesis_time,
-            genesis_validators_root: network.genesis_validators_root,
-            graffiti: network.graffiti,
-            log_level: logging.log_level,
-            doppelganger_detection: if safety.no_doppelganger_detection {
-                Some(false)
-            } else {
-                None
-            },
-            keymanager_enabled: if keymanager.no_keymanager {
-                Some(false)
-            } else if keymanager.enabled == Some(true) {
-                Some(true)
-            } else {
-                None
-            },
-            keymanager_address: keymanager.address,
-            keymanager_token_file: keymanager.token_file,
-            remote_signer_url: keymanager.remote_signer_url,
-            remote_signer_allowed_hosts: keymanager.remote_signer_allowed_hosts,
-            key_decrypt_threads: keys.key_decrypt_threads,
-            tracing_endpoint: tracing.endpoint,
-            tracing_exporter: tracing.exporter,
-            tracing_sample_rate: tracing.sample_rate,
-            tracing_max_queue_size: tracing.max_queue_size,
-            tracing_max_export_batch_size: tracing.max_export_batch_size,
-            secret_provider: keys.secret_provider.providers.clone(),
-            gcp_project_id: keys.secret_provider.gcp.project_id.clone(),
-            gcp_secret_prefix: keys.secret_provider.gcp.secret_prefix.clone(),
-            secret_refresh_interval: keys.secret_provider.refresh_interval,
-            secret_provider_strict: keys.secret_provider.strict.filter(|b| *b),
-            allow_insecure_remote_signer: keymanager.allow_insecure_remote_signer.filter(|b| *b),
-            keymanager_cors_origins: keymanager.cors_origins,
-            keymanager_body_limit: keymanager.body_limit,
-            grpc_signer_url: grpc_signer.url,
-            grpc_signer_tls_cert: grpc_signer.tls_cert,
-            grpc_signer_tls_key: grpc_signer.tls_key,
-            grpc_signer_tls_ca_cert: grpc_signer.tls_ca_cert,
-            disable_attesting: flag(safety.disable_attesting),
-            slashed_validators_action: safety.slashed_validators_action,
-            builder_circuit_breaker_consecutive_limit: builder
-                .builder_limits
-                .circuit_breaker_consecutive_limit,
-            builder_circuit_breaker_epoch_limit: builder.builder_limits.circuit_breaker_epoch_limit,
-            disable_keystore_locking: keys.disable_keystore_locking.filter(|b| *b),
-            proposer_nodes: proposer.proposer_nodes,
-            broadcast: proposer.broadcast,
-            proposer_config_url: proposer.proposer_config.url.clone(),
-            proposer_config_file: proposer.proposer_config.file.clone(),
-            proposer_config_refresh_interval: proposer.proposer_config.refresh_interval,
-            proposer_config_url_token: proposer.proposer_config.url_token.clone(),
-            proposer_config_url_insecure: proposer.proposer_config.url_insecure.filter(|b| *b),
-            monitoring_endpoint: monitoring.endpoint,
-            monitoring_interval: monitoring.interval,
-            monitoring_endpoint_insecure: monitoring.endpoint_insecure.filter(|b| *b),
-            logfile: logging.logfile.path.clone(),
-            logfile_max_size: logging.logfile.max_size,
-            logfile_max_number: logging.logfile.max_number,
-            logfile_compress: logging.logfile.compress.filter(|b| *b),
-            logfile_level: logging.logfile.level.clone(),
-            block_selection_mode: builder.block_selection_mode,
-            validator_registration_batch_size: builder.validator_registration_batch_size,
-            validator_registration_batch_delay: builder.validator_registration_batch_delay,
-            validators_config: keys.validators_config,
-            beacon_max_body_bytes: beacon.max_body_bytes,
-        }
-    }
-}
-
 /// Subcommands under `rvc slashing` (RF2-13 / B5). Kept as a small nested enum so
 /// Phase 5 F3 can relocate it without redesigning the arg surface.
 #[derive(Subcommand)]
@@ -459,10 +223,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let strict_permissions = args.slashing.strict_permissions;
             let strict_slashing_semantics = args.slashing.strict_slashing_semantics;
 
-            let cli_overrides = CliOverrides::from(args);
-
-            let mut cfg = load_config(config_path)?;
-            cfg.merge_with_cli(&cli_overrides);
+            if let Some(path) = config_path.as_ref() {
+                info!(path = ?path, "Loading configuration from file");
+            } else {
+                info!("Using default configuration");
+            }
+            let cfg = Config::load(config_path.as_deref(), args)?;
 
             let tracing_config = build_tracing_config(&cfg);
             let file_layer_config = build_file_layer_config(&cfg);
@@ -607,7 +373,9 @@ mod tests {
 
     use super::*;
     use clap::CommandFactory;
-    use rvc::config::{Network, SlashedAction, TracingExporter};
+    use rvc::config::{
+        BlockSelectionMode, BroadcastTopic, Network, SlashedAction, TracingExporter,
+    };
 
     /// Complete long-flag surface for `rvc start` (RF5-14 help snapshot).
     const START_FLAGS: &[&str] = &[
@@ -701,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn test_start_args_convert_to_equivalent_cli_overrides() {
+    fn test_start_args_load_onto_config() {
         let cli = Cli::try_parse_from([
             "rvc",
             "start",
@@ -828,81 +596,81 @@ mod tests {
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        let ov = CliOverrides::from(*args);
+        let cfg = Config::load(None, *args).expect("load");
 
-        assert_eq!(ov.beacon_url.as_deref(), Some("http://bn:5052"));
+        assert_eq!(cfg.beacon_url, "http://bn:5052");
         assert_eq!(
-            ov.beacon_nodes.as_deref(),
-            Some(["http://a:5052".to_string(), "http://b:5052".to_string()].as_slice())
+            cfg.beacon_nodes,
+            vec!["http://a:5052".to_string(), "http://b:5052".to_string()]
         );
-        assert_eq!(ov.keystore_path, Some(PathBuf::from("/keys")));
-        assert_eq!(ov.password_file, Some(PathBuf::from("/pw")));
-        assert_eq!(ov.slashing_db_path, Some(PathBuf::from("/slash.db")));
-        assert_eq!(ov.init_slashing_db, Some(true));
-        assert_eq!(ov.allow_unsupported_fork, Some(true));
-        assert_eq!(ov.metrics_address, Some("0.0.0.0".parse().unwrap()));
-        assert_eq!(ov.metrics_port, Some(9090));
-        assert_eq!(ov.grpc_port, Some(60051));
-        assert_eq!(ov.grpc_address.as_deref(), Some("0.0.0.0"));
-        assert_eq!(ov.network, Some(Network::Hoodi));
-        assert_eq!(ov.genesis_time, Some(1));
-        assert_eq!(ov.genesis_validators_root.as_deref(), Some("0xabc"));
-        assert_eq!(ov.graffiti.as_deref(), Some("rvc"));
-        assert_eq!(ov.log_level.as_deref(), Some("debug"));
-        assert_eq!(ov.doppelganger_detection, Some(false));
-        assert_eq!(ov.keymanager_enabled, Some(true));
-        assert_eq!(ov.keymanager_address.as_deref(), Some("127.0.0.1:5062"));
-        assert_eq!(ov.keymanager_token_file, Some(PathBuf::from("/token")));
-        assert_eq!(ov.remote_signer_url.as_deref(), Some("https://signer"));
-        assert_eq!(ov.remote_signer_allowed_hosts.as_deref(), Some("signer.local"));
-        assert_eq!(ov.key_decrypt_threads, Some(4));
-        assert_eq!(ov.tracing_endpoint.as_deref(), Some("http://otel:4318"));
-        assert_eq!(ov.tracing_exporter, Some(TracingExporter::Otlp));
-        assert_eq!(ov.tracing_sample_rate, Some(0.5));
-        assert_eq!(ov.tracing_max_queue_size, Some(100));
-        assert_eq!(ov.tracing_max_export_batch_size, Some(50));
-        assert_eq!(ov.secret_provider.as_deref(), Some("gcp"));
-        assert_eq!(ov.gcp_project_id.as_deref(), Some("proj"));
-        assert_eq!(ov.gcp_secret_prefix.as_deref(), Some("vk-"));
-        assert_eq!(ov.secret_refresh_interval, Some(60));
-        assert_eq!(ov.secret_provider_strict, Some(true));
-        assert_eq!(ov.allow_insecure_remote_signer, Some(true));
+        assert_eq!(cfg.keystore_path, PathBuf::from("/keys"));
+        assert_eq!(cfg.password_file, Some(PathBuf::from("/pw")));
+        assert_eq!(cfg.slashing_db_path, PathBuf::from("/slash.db"));
+        assert!(cfg.allow_fresh_db);
+        assert!(cfg.allow_unsupported_fork);
+        assert_eq!(cfg.metrics_address, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.metrics_port, 9090);
+        assert_eq!(cfg.grpc_port, 60051);
+        assert_eq!(cfg.grpc_address, "0.0.0.0");
+        assert_eq!(cfg.network, Network::Hoodi);
+        assert_eq!(cfg.genesis_time, Some(1));
+        assert_eq!(cfg.genesis_validators_root.as_deref(), Some("0xabc"));
+        assert_eq!(cfg.graffiti.as_deref(), Some("rvc"));
+        assert_eq!(cfg.log_level, "debug");
+        assert!(!cfg.doppelganger_detection);
+        assert!(cfg.keymanager.enabled);
+        assert_eq!(cfg.keymanager.address.as_deref(), Some("127.0.0.1:5062"));
+        assert_eq!(cfg.keymanager.token_file, Some(PathBuf::from("/token")));
+        assert_eq!(cfg.keymanager.remote_signer_url.as_deref(), Some("https://signer"));
         assert_eq!(
-            ov.keymanager_cors_origins.as_deref(),
-            Some(["https://a".to_string(), "https://b".to_string()].as_slice())
+            cfg.keymanager.remote_signer_allowed_hosts.as_deref(),
+            Some(["signer.local".to_string()].as_slice())
         );
-        assert_eq!(ov.keymanager_body_limit, Some(2048));
-        assert_eq!(ov.grpc_signer_url.as_deref(), Some("https://gs:50051"));
-        assert_eq!(ov.grpc_signer_tls_cert, Some(PathBuf::from("/c.pem")));
-        assert_eq!(ov.grpc_signer_tls_key, Some(PathBuf::from("/k.pem")));
-        assert_eq!(ov.grpc_signer_tls_ca_cert, Some(PathBuf::from("/ca.pem")));
-        assert_eq!(ov.disable_attesting, Some(true));
-        assert_eq!(ov.slashed_validators_action, Some(SlashedAction::Shutdown));
-        assert_eq!(ov.builder_circuit_breaker_consecutive_limit, Some(2));
-        assert_eq!(ov.builder_circuit_breaker_epoch_limit, Some(4));
-        assert_eq!(ov.disable_keystore_locking, Some(true));
-        assert_eq!(ov.proposer_nodes.as_deref(), Some(["http://p:5052".to_string()].as_slice()));
+        assert_eq!(cfg.key_decrypt_threads, Some(4));
+        assert_eq!(cfg.tracing.endpoint.as_deref(), Some("http://otel:4318"));
+        assert_eq!(cfg.tracing.exporter, TracingExporter::Otlp);
+        assert_eq!(cfg.tracing.sample_rate, Some(0.5));
+        assert_eq!(cfg.tracing.max_queue_size, Some(100));
+        assert_eq!(cfg.tracing.max_export_batch_size, Some(50));
+        assert_eq!(cfg.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(cfg.secret_provider.gcp.project_id.as_deref(), Some("proj"));
+        assert_eq!(cfg.secret_provider.gcp.secret_prefix, "vk-");
+        assert_eq!(cfg.secret_provider.refresh_interval, Some(60));
+        assert!(cfg.secret_provider.strict);
+        assert!(cfg.keymanager.allow_insecure_remote_signer);
         assert_eq!(
-            ov.broadcast.as_deref(),
-            Some([BroadcastTopic::Blocks, BroadcastTopic::Attestations].as_slice())
+            cfg.keymanager.cors_origins,
+            vec!["https://a".to_string(), "https://b".to_string()]
         );
-        assert_eq!(ov.proposer_config_url.as_deref(), Some("https://pc"));
-        assert_eq!(ov.proposer_config_refresh_interval, Some(10));
-        assert_eq!(ov.proposer_config_url_token.as_deref(), Some("tok"));
-        assert_eq!(ov.proposer_config_url_insecure, Some(true));
-        assert_eq!(ov.monitoring_endpoint.as_deref(), Some("https://mon"));
-        assert_eq!(ov.monitoring_interval, Some(30));
-        assert_eq!(ov.monitoring_endpoint_insecure, Some(true));
-        assert_eq!(ov.logfile, Some(PathBuf::from("/var/log/rvc.log")));
-        assert_eq!(ov.logfile_max_size, Some(100));
-        assert_eq!(ov.logfile_max_number, Some(3));
-        assert_eq!(ov.logfile_compress, Some(true));
-        assert_eq!(ov.logfile_level.as_deref(), Some("warn"));
-        assert_eq!(ov.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
-        assert_eq!(ov.validator_registration_batch_size, Some(10));
-        assert_eq!(ov.validator_registration_batch_delay, Some(20));
-        assert_eq!(ov.validators_config, Some(PathBuf::from("/validators.toml")));
-        assert_eq!(ov.beacon_max_body_bytes, Some(1024));
+        assert_eq!(cfg.keymanager.body_limit, 2048);
+        assert_eq!(cfg.grpc_signer.url.as_deref(), Some("https://gs:50051"));
+        assert_eq!(cfg.grpc_signer.tls_cert, Some(PathBuf::from("/c.pem")));
+        assert_eq!(cfg.grpc_signer.tls_key, Some(PathBuf::from("/k.pem")));
+        assert_eq!(cfg.grpc_signer.tls_ca_cert, Some(PathBuf::from("/ca.pem")));
+        assert!(cfg.disable_attesting);
+        assert_eq!(cfg.slashed_validators_action, SlashedAction::Shutdown);
+        assert_eq!(cfg.builder_limits.circuit_breaker_consecutive_limit, 2);
+        assert_eq!(cfg.builder_limits.circuit_breaker_epoch_limit, 4);
+        assert!(cfg.disable_keystore_locking);
+        assert_eq!(cfg.proposer_nodes, vec!["http://p:5052".to_string()]);
+        assert_eq!(cfg.broadcast, vec![BroadcastTopic::Blocks, BroadcastTopic::Attestations]);
+        assert_eq!(cfg.proposer_config.url.as_deref(), Some("https://pc"));
+        assert_eq!(cfg.proposer_config.refresh_interval, 10);
+        assert_eq!(cfg.proposer_config.url_token.as_deref(), Some("tok"));
+        assert!(cfg.proposer_config.url_insecure);
+        assert_eq!(cfg.monitoring.endpoint.as_deref(), Some("https://mon"));
+        assert_eq!(cfg.monitoring.interval, 30);
+        assert!(cfg.monitoring.endpoint_insecure);
+        assert_eq!(cfg.logfile.path, Some(PathBuf::from("/var/log/rvc.log")));
+        assert_eq!(cfg.logfile.max_size, 100);
+        assert_eq!(cfg.logfile.max_number, 3);
+        assert!(cfg.logfile.compress);
+        assert_eq!(cfg.logfile.level.as_deref(), Some("warn"));
+        assert_eq!(cfg.block_selection_mode, BlockSelectionMode::BuilderOnly);
+        assert_eq!(cfg.validator_registration_batch_size, 10);
+        assert_eq!(cfg.validator_registration_batch_delay, 20);
+        assert_eq!(cfg.validators_config, Some(PathBuf::from("/validators.toml")));
+        assert_eq!(cfg.beacon_max_body_bytes, 1024);
     }
 
     #[test]
@@ -911,31 +679,35 @@ mod tests {
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        let ov = CliOverrides::from(*args);
+        let defaults = Config::default();
+        let cfg = Config::load(None, *args).expect("load");
 
-        assert_eq!(ov.init_slashing_db, None);
-        assert_eq!(ov.allow_unsupported_fork, None);
-        assert_eq!(ov.doppelganger_detection, None);
-        assert_eq!(ov.keymanager_enabled, None);
-        assert_eq!(ov.secret_provider_strict, None);
-        assert_eq!(ov.allow_insecure_remote_signer, None);
-        assert_eq!(ov.disable_attesting, None);
-        assert_eq!(ov.disable_keystore_locking, None);
-        assert_eq!(ov.proposer_config_url_insecure, None);
-        assert_eq!(ov.monitoring_endpoint_insecure, None);
-        assert_eq!(ov.logfile_compress, None);
-        // RF5-15: no default_value_t — absent flag yields None (not Some(0.01)).
-        assert_eq!(ov.tracing_sample_rate, None);
-        // ADR-009 / ARCH-6b: former clap-default fields are Option; absent → None.
-        assert_eq!(ov.metrics_address, None);
-        assert_eq!(ov.metrics_port, None);
-        assert_eq!(ov.grpc_port, None);
-        assert_eq!(ov.grpc_address, None);
-        assert_eq!(ov.log_level, None);
-        assert_eq!(ov.tracing_exporter, None);
-        assert_eq!(ov.keymanager_body_limit, None);
-        assert_eq!(ov.slashed_validators_action, None);
-        assert_eq!(ov.beacon_max_body_bytes, None);
+        assert_eq!(cfg.allow_fresh_db, defaults.allow_fresh_db);
+        assert_eq!(cfg.allow_unsupported_fork, defaults.allow_unsupported_fork);
+        assert_eq!(cfg.doppelganger_detection, defaults.doppelganger_detection);
+        assert_eq!(cfg.keymanager.enabled, defaults.keymanager.enabled);
+        assert_eq!(cfg.secret_provider.strict, defaults.secret_provider.strict);
+        assert_eq!(
+            cfg.keymanager.allow_insecure_remote_signer,
+            defaults.keymanager.allow_insecure_remote_signer
+        );
+        assert_eq!(cfg.disable_attesting, defaults.disable_attesting);
+        assert_eq!(cfg.disable_keystore_locking, defaults.disable_keystore_locking);
+        assert_eq!(cfg.proposer_config.url_insecure, defaults.proposer_config.url_insecure);
+        assert_eq!(cfg.monitoring.endpoint_insecure, defaults.monitoring.endpoint_insecure);
+        assert_eq!(cfg.logfile.compress, defaults.logfile.compress);
+        // RF5-15: no default_value_t — absent flag leaves sample_rate unset.
+        assert_eq!(cfg.tracing.sample_rate, defaults.tracing.sample_rate);
+        // ADR-009 / ARCH-6b: former clap-default fields stay at Config defaults.
+        assert_eq!(cfg.metrics_address, defaults.metrics_address);
+        assert_eq!(cfg.metrics_port, defaults.metrics_port);
+        assert_eq!(cfg.grpc_port, defaults.grpc_port);
+        assert_eq!(cfg.grpc_address, defaults.grpc_address);
+        assert_eq!(cfg.log_level, defaults.log_level);
+        assert_eq!(cfg.tracing.exporter, defaults.tracing.exporter);
+        assert_eq!(cfg.keymanager.body_limit, defaults.keymanager.body_limit);
+        assert_eq!(cfg.slashed_validators_action, defaults.slashed_validators_action);
+        assert_eq!(cfg.beacon_max_body_bytes, defaults.beacon_max_body_bytes);
     }
 
     #[test]
@@ -960,8 +732,7 @@ mod tests {
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        let mut from_cli = Config::default();
-        from_cli.merge_with_cli(&CliOverrides::from(*args));
+        let from_cli = Config::load(None, *args).expect("load");
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
@@ -1035,9 +806,7 @@ slashed_validators_action = "shutdown"
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        let ov = CliOverrides::from(*args);
-        let mut cfg = Config::from_file(file.path()).unwrap();
-        cfg.merge_with_cli(&ov);
+        let cfg = Config::load(Some(file.path()), *args).expect("load");
 
         assert_eq!(
             cfg.metrics_port, 9090,
@@ -1088,9 +857,7 @@ grpc_port = 60051
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        let ov = CliOverrides::from(*args);
-        let mut cfg = Config::from_file(file.path()).unwrap();
-        cfg.merge_with_cli(&ov);
+        let cfg = Config::load(Some(file.path()), *args).expect("load");
 
         assert_eq!(cfg.metrics_port, 7000);
         assert_eq!(cfg.grpc_port, 7001);

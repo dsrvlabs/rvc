@@ -15,6 +15,17 @@ pub enum ConfigError {
     #[error("failed to parse config file: {0}")]
     ParseError(#[from] toml::de::Error),
 
+    /// Field-level error that names the provenance layer (`defaults < file < CLI`).
+    #[error("{field}: {message} (from {source_layer})")]
+    Invalid {
+        /// Dotted field path (e.g. `config`).
+        field: &'static str,
+        /// Human-readable reason.
+        message: String,
+        /// Layer that supplied the bad value.
+        source_layer: rvc_config::ConfigSource,
+    },
+
     #[error("invalid beacon URL: {0}")]
     InvalidBeaconUrl(String),
 
