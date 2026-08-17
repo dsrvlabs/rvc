@@ -1124,14 +1124,14 @@ The abandonment points, enumerated from HEAD:
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] All four abandonment points have a test; each reopens the DB and asserts durable state.
-- [ ] The invariant asserted is **"the row is retained and a conflicting sign is refused"**, never
+- [x] All four abandonment points have a test; each reopens the DB and asserts durable state.
+- [x] The invariant asserted is **"the row is retained and a conflicting sign is refused"**, never
       "the DB is pristine".
-- [ ] An identical re-sign after abandonment is still permitted (fail-safe without bricking).
-- [ ] Cancellation *before* the reserve leaves no row — the two cases are distinguished.
-- [ ] `spawn_blocking` is still what makes the sequence uncancellable (X9); no test asserts a
+- [x] An identical re-sign after abandonment is still permitted (fail-safe without bricking).
+- [x] Cancellation *before* the reserve leaves no row — the two cases are distinguished.
+- [x] `spawn_blocking` is still what makes the sequence uncancellable (X9); no test asserts a
       behaviour that would only hold without it.
-- [ ] The RED for the first test is reproduced locally against the pre-change tree and pasted into
+- [x] The RED for the first test is reproduced locally against the pre-change tree and pasted into
       the PR (ADR-012).
 
 ---

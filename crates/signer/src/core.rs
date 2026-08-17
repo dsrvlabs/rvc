@@ -378,6 +378,7 @@ pub struct SlashableSignSession {
 impl SlashableSignSession {
     /// Build a session from `tests/` (separate crate; fields stay private).
     #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn for_tests(
         handle: tokio::runtime::Handle,
@@ -845,7 +846,8 @@ pub struct SignSlashableRequest<'a> {
 
 /// Shared slashable-signing core.
 ///
-/// 1. Acquire the per-validator async lock.
+/// 1. Acquire the per-validator async lock (moved into `spawn_blocking` so a
+///    dropped caller cannot release it while the blocking body is still running).
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
@@ -972,11 +974,12 @@ where
 
     // Step 1: per-pubkey async lock.
     //
-    // CANCELLATION NOTE: if the caller drops this future at the
-    // `spawn_blocking(...).await` below, this guard is released while the
-    // blocking task keeps running. The authoritative double-sign serializer is
-    // the SQLite `BEGIN IMMEDIATE` lock held by the staged guard.
-    let _guard = req.locks.lock(&pubkey_bytes).await;
+    // Moved into `spawn_blocking` so dropping the caller at
+    // `spawn_blocking(...).await` cannot release it while the body still runs.
+    // After reserve, SQLite is no longer the serializer (COMMIT already
+    // released the connection mutex). Holding the lock until the body returns
+    // is also fail-safe for today's stage path.
+    let guard = req.locks.lock(&pubkey_bytes).await;
 
     // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
     if !req.enablement.is_signing_enabled(req.pubkey) {
@@ -1014,7 +1017,12 @@ where
         slashing_db: Arc::clone(&req.slashing_db),
     };
 
-    let result = tokio::task::spawn_blocking(move || body(session)).await.map_err(|e| {
+    let result = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        body(session)
+    })
+    .await
+    .map_err(|e| {
         error!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
             op = op_name,

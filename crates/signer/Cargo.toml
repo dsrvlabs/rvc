@@ -35,8 +35,8 @@ crypto.workspace = true
 # Enables `slashing::fail_next_commits` for RF4-03 path-level CommitFailed tests.
 slashing = { workspace = true, features = ["test-utils"] }
 # Feature-unify `test-utils` onto the crate-under-test so integration tests
-# (`tests/retain_on_ambiguity_matrix.rs`) can call `SlashableSignSession::for_tests`.
-# Production dependents do not get this line.
+# can call `SlashableSignSession::for_tests`. Production dependents do not
+# get this line.
 rvc-signer = { path = ".", features = ["test-utils"] }
 serde_json.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
