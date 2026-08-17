@@ -3408,7 +3408,7 @@ mod tests {
             crypto::RemoteSignerConfig::new("https://127.0.0.1:1"),
             vec![pk],
         );
-        composite.add_remote_key(pk, remote);
+        composite.add_remote_key(pk, Arc::new(remote));
     }
 
     /// Times out once, then signs promptly (same-root retry after retain).

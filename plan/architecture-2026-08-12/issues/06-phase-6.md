@@ -625,17 +625,17 @@ untouched — and the acceptance criteria assert it.
 
 **Acceptance criteria.**
 
-- [ ] `CompositeSigner.remote` is `Arc<dyn Signer + Send + Sync>`; `crypto` contains no field or
+- [x] `CompositeSigner.remote` is `Arc<dyn Signer + Send + Sync>`; `crypto` contains no field or
       parameter typed as the concrete `RemoteSigner` outside `remote_signer/` itself.
-- [ ] `rg 'RemoteSigner' crates/crypto/src --glob '!remote_signer/**'` returns only doc/comment hits
+- [x] `rg 'RemoteSigner' crates/crypto/src --glob '!remote_signer/**'` returns only doc/comment hits
       (`insecure.rs:8`) and `SigningError::RemoteSignerError` (`error.rs`) — no type usage.
-- [ ] The `FakeRemote` dispatch test exists and passes; its pre-change compile failure is in the PR.
-- [ ] `crypto::CompositeSigner` is still importable at that exact path;
+- [x] The `FakeRemote` dispatch test exists and passes; its pre-change compile failure is in the PR.
+- [x] `crypto::CompositeSigner` is still importable at that exact path;
       `crates/architecture-tests/tests/no_crypto_logging_paths.rs` green; the single wiring site
       `crates/rvc/src/config/builder.rs:394` is **byte-unchanged**.
-- [ ] `git diff <base> -- crates/crypto/Cargo.toml` is empty (no dependency moves in this issue).
-- [ ] `crates/crypto/tests/signing_root_kat.rs` green.
-- [ ] §2 standing commands green, including
+- [x] `git diff <base> -- crates/crypto/Cargo.toml` is empty (no dependency moves in this issue).
+- [x] `crates/crypto/tests/signing_root_kat.rs` green.
+- [x] §2 standing commands green, including
       `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings`.
 
 ---

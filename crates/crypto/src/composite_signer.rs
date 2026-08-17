@@ -7,7 +7,6 @@ use tracing::{debug, info, warn};
 use async_trait::async_trait;
 
 use super::bls::{SecretKey, Signature, PUBLIC_KEY_BYTES_LEN};
-use super::remote_signer::RemoteSigner;
 use super::signer_trait::{LocalSigner, Signer, SigningError};
 use super::typed_signer::TypedSigner;
 use eth_types::Root;
@@ -18,7 +17,7 @@ pub struct CompositeSigner {
     /// gRPC remote signers implement `TypedSigner` only (no raw-root path).
     /// The key is the BLS public key; the value is a `TypedSigner` handle.
     grpc_remote: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], Arc<dyn TypedSigner + Send + Sync>>>,
-    remote: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], Arc<RemoteSigner>>>,
+    remote: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], Arc<dyn Signer + Send + Sync>>>,
     dynamic_local: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], SecretKey>>,
 }
 
@@ -78,10 +77,14 @@ impl CompositeSigner {
         self.remote.read().contains_key(pubkey)
     }
 
-    pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
+    pub fn add_remote_key(
+        &self,
+        pubkey: [u8; PUBLIC_KEY_BYTES_LEN],
+        signer: Arc<dyn Signer + Send + Sync>,
+    ) {
         let pubkey_hex = hex::encode(pubkey);
         info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added remote signer key");
-        self.remote.write().insert(pubkey, Arc::new(signer));
+        self.remote.write().insert(pubkey, signer);
     }
 
     pub fn remove_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
@@ -227,7 +230,7 @@ mod tests {
     use super::*;
     use crate::bls::PublicKey;
     use crate::key_manager::KeyManager;
-    use crate::remote_signer::RemoteSignerConfig;
+    use crate::remote_signer::{RemoteSigner, RemoteSignerConfig};
     use wiremock::MockServer;
 
     fn create_empty_local_signer() -> LocalSigner {
@@ -265,7 +268,7 @@ mod tests {
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
-        composite.add_remote_key(pk_bytes, remote_signer);
+        composite.add_remote_key(pk_bytes, Arc::new(remote_signer));
 
         let result = composite.sign(&signing_root, &pk_bytes).await;
         match result.unwrap_err() {
@@ -304,7 +307,7 @@ mod tests {
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk2]);
 
         let composite = CompositeSigner::new(create_local_signer_with_key(sk1));
-        composite.add_remote_key(pk2, remote_signer);
+        composite.add_remote_key(pk2, Arc::new(remote_signer));
 
         let keys = composite.public_keys();
         assert_eq!(keys.len(), 2);
@@ -337,7 +340,7 @@ mod tests {
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
-        composite.add_remote_key(pk, remote_signer);
+        composite.add_remote_key(pk, Arc::new(remote_signer));
         assert_eq!(composite.public_keys().len(), 1);
 
         let removed = composite.remove_remote_key(&pk);
@@ -401,7 +404,7 @@ mod tests {
         // Same key in both local and remote — remote is consulted first and
         // refuses raw-root (SEC-8). Local is never reached for this pubkey.
         let composite = CompositeSigner::new(create_local_signer_with_key(sk));
-        composite.add_remote_key(pk_bytes, remote_signer);
+        composite.add_remote_key(pk_bytes, Arc::new(remote_signer));
 
         let result = composite.sign(&signing_root, &pk_bytes).await;
         match result.unwrap_err() {
@@ -422,6 +425,42 @@ mod tests {
         let sig = signer.sign(&signing_root, &pk_bytes).await.unwrap();
         assert_eq!(sig.to_bytes().len(), 96);
         assert_eq!(signer.public_keys().len(), 1);
+    }
+
+    /// In-test `Signer` that is not a `RemoteSigner`. ARCH-6e RED: `add_remote_key`
+    /// must accept any `Signer` impl so `crypto` can later drop the concrete type.
+    struct FakeRemote {
+        pubkey: [u8; PUBLIC_KEY_BYTES_LEN],
+        signature: Signature,
+    }
+
+    #[async_trait]
+    impl Signer for FakeRemote {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+        ) -> Result<Signature, SigningError> {
+            Ok(self.signature.clone())
+        }
+
+        fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+            vec![self.pubkey]
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_signer_accepts_any_signer_impl_for_a_remote_key() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+        let fixed = sk.sign(&signing_root);
+
+        let composite = CompositeSigner::new(create_empty_local_signer());
+        composite.add_remote_key(pk, Arc::new(FakeRemote { pubkey: pk, signature: fixed.clone() }));
+
+        let sig = composite.sign(&signing_root, &pk).await.unwrap();
+        assert_eq!(sig.to_bytes(), fixed.to_bytes());
     }
 
     // --- gRPC remote signer tests ---
