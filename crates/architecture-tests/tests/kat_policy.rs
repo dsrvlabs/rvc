@@ -71,11 +71,6 @@ const EXEMPTIONS: &[(&str, &str)] = &[
         "crates/block-service/src/service/tests/ssz.rs",
         "test_propose_block_ssz_block_root_uses_tree_hash",
     ),
-    (
-        "crates/crypto/src/remote_signer/client_tests.rs",
-        "test_web3signer_client_posts_typed_body_not_bare_root",
-    ),
-    ("crates/crypto/src/remote_signer/wire.rs", "test_all_builders_set_signing_root"),
     ("crates/crypto/src/signing.rs", "test_attestation_data_tree_hash_root"),
     ("crates/crypto/src/signing.rs", "test_checkpoint_tree_hash_root"),
     ("crates/crypto/src/signing.rs", "test_compute_signing_root_trace_truncates_domain_and_root"),

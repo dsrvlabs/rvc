@@ -724,25 +724,25 @@ operator-invisible but API-visible — note it in the release note.
 
 **Acceptance criteria.**
 
-- [ ] `crates/remote-signer-client/` exists; `rg 'reqwest' crates/crypto` returns nothing;
+- [x] `crates/remote-signer-client/` exists; `rg 'reqwest' crates/crypto` returns nothing;
       `crypto/Cargo.toml` no longer lists `reqwest` or `url`, and `cargo machete` (or `cargo udeps`)
       confirms no unused dependency remains.
 - [ ] `rvc-crypto` is `Layer::Base` in `CLASSIFICATION` and **G-5a is green over it**; the new crate
       is `Layer::Infra` and **G-5b is green over it**.
 - [ ] `crypto`'s remaining workspace out-edges are exactly `observability`, `eth-types`,
       `web3signer-wire`.
-- [ ] The one production consumer (`remote_keys.rs`) compiles with the new import path;
+- [x] The one production consumer (`remote_keys.rs`) compiles with the new import path;
       `crates/signer` carries the new crate only as a **dev-dependency**; `cargo build --workspace`
       green.
-- [ ] `crates/architecture-tests/tests/architecture_no_cycles.rs` is **byte-unchanged**, including
+- [x] `crates/architecture-tests/tests/architecture_no_cycles.rs` is **byte-unchanged**, including
       `SIGNER_SERVER_ALLOWED_EDGES` (`:93-102`) — verified unnecessary, not merely skipped (VD-6-8).
-- [ ] **Signing-root KATs green:** `cargo test -p rvc-crypto --test signing_root_kat` passes with the
+- [x] **Signing-root KATs green:** `cargo test -p rvc-crypto --test signing_root_kat` passes with the
       file byte-unchanged. No new `EXEMPTIONS` entry (shrinking-only).
 - [ ] Member count is **29** with `ARCHITECTURE.md` regenerated and
       `architecture_doc_matches_graph` green; `ZERO_OUT_EDGE_IF_PRESENT` still byte-unchanged.
-- [ ] Single wiring site `crates/rvc/src/config/builder.rs:394` byte-unchanged; C9 anchor 5 intact.
-- [ ] Release note records the `crypto::remote_signer::*` → `remote_signer_client::*` path change.
-- [ ] §2 standing commands green, including the `--features dvt` clippy run.
+- [x] Single wiring site `crates/rvc/src/config/builder.rs:394` byte-unchanged; C9 anchor 5 intact.
+- [x] Release note records the `crypto::remote_signer::*` → `remote_signer_client::*` path change.
+- [x] §2 standing commands green, including the `--features dvt` clippy run.
 
 ---
 

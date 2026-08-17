@@ -4119,6 +4119,7 @@ dependencies = [
  "rvc-keymanager-api",
  "rvc-metrics",
  "rvc-observability",
+ "rvc-remote-signer-client",
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
@@ -4277,10 +4278,8 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
- "reqwest 0.12.28",
  "rvc-eth-types",
  "rvc-observability",
- "rvc-web3signer-wire",
  "scrypt",
  "secrecy",
  "serde",
@@ -4295,7 +4294,6 @@ dependencies = [
  "tracing-test",
  "tree_hash",
  "uuid",
- "wiremock",
  "zeroize",
 ]
 
@@ -4456,6 +4454,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-remote-signer-client"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "reqwest 0.12.28",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-observability",
+ "rvc-web3signer-wire",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
 name = "rvc-secret-provider"
 version = "0.7.0"
 dependencies = [
@@ -4492,6 +4509,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-observability",
+ "rvc-remote-signer-client",
  "rvc-signer",
  "rvc-slashing",
  "serde_json",

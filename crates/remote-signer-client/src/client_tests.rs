@@ -7,9 +7,8 @@ use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::remote_signer::wire::build_attestation_request;
-use crate::SecretKey;
-use crate::{Signer, SigningError, TypedSigner, PUBLIC_KEY_BYTES_LEN};
+use crate::wire::build_attestation_request;
+use crypto::{SecretKey, Signer, SigningError, TypedSigner, PUBLIC_KEY_BYTES_LEN};
 
 /// Serialise tests in this module that read or mutate
 /// `RVC_REMOTE_SIGNER_ALLOW_INSECURE`.
@@ -276,7 +275,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanCapture {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_sign_creates_remote_span() {
     let sk = SecretKey::generate();
     let (_mock, signer, data, ctx, _root) = mock_attestation_signer(&sk).await;
@@ -341,7 +340,7 @@ impl tracing::field::Visit for FieldVisitor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_sign_span_records_status_code() {
     let sk = SecretKey::generate();
     let (_mock, signer, data, ctx, _root) = mock_attestation_signer(&sk).await;
@@ -374,7 +373,7 @@ async fn test_sign_span_records_status_code() {
 
 /// Gate 3: the `rvc.sign.remote` span carries the validator pubkey only in
 /// its truncated form.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_sign_span_url_truncates_pubkey() {
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
@@ -405,7 +404,7 @@ async fn test_sign_span_url_truncates_pubkey() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_sign_span_records_error_status_code() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -439,7 +438,7 @@ async fn test_sign_span_records_error_status_code() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn test_sign_span_redacts_url_credentials() {
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
@@ -631,6 +630,7 @@ fn futures_executor_block_on<F: std::future::Future>(f: F) -> F::Output {
 }
 
 #[tokio::test]
+// kat_exempt: name-pattern false positive — asserts a typed HTTP body, not a spec root
 async fn test_web3signer_client_posts_typed_body_not_bare_root() {
     use wiremock::matchers::body_partial_json;
 

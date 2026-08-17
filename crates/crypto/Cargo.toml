@@ -23,10 +23,8 @@ blst.workspace = true
 ctr.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-web3signer-wire.workspace = true
 pbkdf2.workspace = true
 rand.workspace = true
-reqwest = { workspace = true }
 scrypt.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -51,4 +49,3 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber.workspace = true
 tracing-test.workspace = true
-wiremock.workspace = true

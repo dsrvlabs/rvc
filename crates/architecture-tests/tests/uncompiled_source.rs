@@ -733,16 +733,16 @@ fn test_d2_rejects_a_module_no_root_declares() {
 #[test]
 fn test_d2_resolves_path_attribute_modules() {
     let root = workspace_root();
-    let client_tests = root.join("crates/crypto/src/remote_signer/client_tests.rs");
+    let client_tests = root.join("crates/remote-signer-client/src/client_tests.rs");
     assert!(client_tests.is_file(), "expected {} on disk", client_tests.display());
 
-    // Build the crypto package graph only — cheaper and sufficient for the path pin.
+    // Build the client package graph only — cheaper and sufficient for the path pin.
     let metadata = load_cargo_metadata();
     let packages = metadata["packages"].as_array().expect("packages");
     let crypto = packages
         .iter()
-        .find(|p| p["name"].as_str() == Some("rvc-crypto"))
-        .expect("rvc-crypto package in workspace");
+        .find(|p| p["name"].as_str() == Some("rvc-remote-signer-client"))
+        .expect("rvc-remote-signer-client package in workspace");
 
     let manifest = Path::new(crypto["manifest_path"].as_str().unwrap());
     let src_dir = manifest.parent().unwrap().join("src");
@@ -775,14 +775,14 @@ fn test_d2_resolves_path_attribute_modules() {
     let visited = reachable_from_roots(&roots, &files);
     let key = files
         .keys()
-        .find(|k| k.to_string_lossy().replace('\\', "/").ends_with("remote_signer/client_tests.rs"))
+        .find(|k| k.to_string_lossy().replace('\\', "/").ends_with("client_tests.rs"))
         .cloned()
-        .expect("client_tests.rs must be under crypto src/");
+        .expect("client_tests.rs must be under remote-signer-client src/");
 
     assert!(
         visited.contains(&key),
         "D2 must resolve #[path = \"client_tests.rs\"] on \
-         crates/crypto/src/remote_signer/client.rs so client_tests.rs is reachable; \
+         crates/remote-signer-client/src/client.rs so client_tests.rs is reachable; \
          without path handling this is the workspace's only false positive (A-E4)"
     );
 }

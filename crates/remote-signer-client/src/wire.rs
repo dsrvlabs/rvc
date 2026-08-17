@@ -25,9 +25,8 @@ pub use web3signer_wire::{SignPayload as Web3SignerPayload, SignRequest as Web3S
 
 use web3signer_wire::{SignPayload, SignRequest};
 
-use super::super::signer_trait::SigningError;
-use super::super::signing_root::signing_root_with_fork_version;
-use super::super::typed_signer::SignContext;
+use crypto::signing_root_with_fork_version;
+use crypto::{SignContext, SigningError};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 12;
 
@@ -360,7 +359,7 @@ pub fn build_aggregation_slot_request(slot: Slot, ctx: &SignContext) -> (SignReq
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SecretKey;
+    use crypto::SecretKey;
     use eth_types::{Attestation, Checkpoint, ForkInfo, SyncCommitteeContribution};
 
     fn test_fork_info() -> ForkInfo {
@@ -395,6 +394,7 @@ mod tests {
 
     /// RF3-10-M1 / RF3-11: every client-reachable builder must set `signing_root`.
     #[test]
+    // kat_exempt: name-pattern false positive — asserts the wire field is populated, not a spec root
     fn test_all_builders_set_signing_root() {
         let sk = SecretKey::generate();
         let ctx = test_ctx(&sk);

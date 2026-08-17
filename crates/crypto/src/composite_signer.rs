@@ -230,8 +230,6 @@ mod tests {
     use super::*;
     use crate::bls::PublicKey;
     use crate::key_manager::KeyManager;
-    use crate::remote_signer::{RemoteSigner, RemoteSignerConfig};
-    use wiremock::MockServer;
 
     fn create_empty_local_signer() -> LocalSigner {
         LocalSigner::new(KeyManager::new())
@@ -258,17 +256,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_composite_signer_remote_raw_sign_returns_unsupported() {
-        // SEC-8: Web3Signer HTTP refuses raw-root signing (typed body required).
+        // SEC-8: HTTP remotes refuse raw-root signing (typed body required).
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
 
-        let mock_server = MockServer::start().await;
-        let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
-
         let composite = CompositeSigner::new(create_empty_local_signer());
-        composite.add_remote_key(pk_bytes, Arc::new(remote_signer));
+        composite.add_remote_key(pk_bytes, Arc::new(FakeUnsupportedRemote { pubkey: pk_bytes }));
 
         let result = composite.sign(&signing_root, &pk_bytes).await;
         match result.unwrap_err() {
@@ -302,12 +296,8 @@ mod tests {
         let sk2 = SecretKey::generate();
         let pk2 = sk2.public_key().to_bytes();
 
-        let mock_server = MockServer::start().await;
-        let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk2]);
-
         let composite = CompositeSigner::new(create_local_signer_with_key(sk1));
-        composite.add_remote_key(pk2, Arc::new(remote_signer));
+        composite.add_remote_key(pk2, Arc::new(FakeUnsupportedRemote { pubkey: pk2 }));
 
         let keys = composite.public_keys();
         assert_eq!(keys.len(), 2);
@@ -335,12 +325,9 @@ mod tests {
     #[tokio::test]
     async fn test_composite_signer_remove_remote_key() {
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
-        let mock_server = MockServer::start().await;
-        let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
-        composite.add_remote_key(pk, Arc::new(remote_signer));
+        composite.add_remote_key(pk, Arc::new(FakeUnsupportedRemote { pubkey: pk }));
         assert_eq!(composite.public_keys().len(), 1);
 
         let removed = composite.remove_remote_key(&pk);
@@ -397,14 +384,10 @@ mod tests {
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
 
-        let mock_server = MockServer::start().await;
-        let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
-
         // Same key in both local and remote — remote is consulted first and
         // refuses raw-root (SEC-8). Local is never reached for this pubkey.
         let composite = CompositeSigner::new(create_local_signer_with_key(sk));
-        composite.add_remote_key(pk_bytes, Arc::new(remote_signer));
+        composite.add_remote_key(pk_bytes, Arc::new(FakeUnsupportedRemote { pubkey: pk_bytes }));
 
         let result = composite.sign(&signing_root, &pk_bytes).await;
         match result.unwrap_err() {
@@ -427,11 +410,33 @@ mod tests {
         assert_eq!(signer.public_keys().len(), 1);
     }
 
-    /// In-test `Signer` that is not a `RemoteSigner`. ARCH-6e RED: `add_remote_key`
-    /// must accept any `Signer` impl so `crypto` can later drop the concrete type.
+    /// In-test `Signer` that is not a concrete HTTP client. ARCH-6e RED: `add_remote_key`
+    /// must accept any `Signer` impl so `crypto` can drop the concrete type.
     struct FakeRemote {
         pubkey: [u8; PUBLIC_KEY_BYTES_LEN],
         signature: Signature,
+    }
+
+    /// Stands in for Web3Signer HTTP's SEC-8 raw-root refusal after ARCH-6f.
+    struct FakeUnsupportedRemote {
+        pubkey: [u8; PUBLIC_KEY_BYTES_LEN],
+    }
+
+    #[async_trait]
+    impl Signer for FakeUnsupportedRemote {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+        ) -> Result<Signature, SigningError> {
+            Err(SigningError::UnsupportedSigningType(
+                "raw-root signing is not supported; use TypedSigner".to_string(),
+            ))
+        }
+
+        fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+            vec![self.pubkey]
+        }
     }
 
     #[async_trait]

@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crypto::{CompositeSigner, PublicKey, RemoteSigner, RemoteSignerConfig};
+use crypto::{CompositeSigner, PublicKey};
 use keymanager_api::traits::{
     DeleteRemoteKeyError, ImportRemoteKeyError, Pubkey, RemoteKeyManager,
 };
+use remote_signer_client::{RemoteSigner, RemoteSignerConfig};
 use tokio::sync::watch;
 use tracing::{info, warn};
 

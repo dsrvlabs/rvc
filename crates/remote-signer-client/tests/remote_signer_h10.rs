@@ -16,8 +16,8 @@
 
 use std::sync::Mutex;
 
-use rvc_crypto::insecure::InsecureMode;
-use rvc_crypto::{check_remote_signer_url, REMOTE_SIGNER_INSECURE_ENV_VAR};
+use crypto::insecure::InsecureMode;
+use rvc_remote_signer_client::{check_remote_signer_url, REMOTE_SIGNER_INSECURE_ENV_VAR};
 
 /// Serialises access to `RVC_REMOTE_SIGNER_ALLOW_INSECURE` across the test
 /// threads within this binary.

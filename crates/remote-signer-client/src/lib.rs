@@ -1,10 +1,10 @@
 //! Web3Signer HTTP remote signer client.
 //!
 //! Split (RF3-11):
-//! - [`wire`] — config + request builders (consumes `web3signer_wire` types)
-//! - [`client`] — HTTP client + [`Signer`] / [`TypedSigner`] impls
+//! - `wire` — config + request builders (consumes `web3signer_wire` types)
+//! - `client` — HTTP client + `crypto::Signer` / `crypto::TypedSigner` impls
 //!
-//! Public path `crypto::remote_signer::*` is stable for consumers.
+//! Public path is `remote_signer_client::*` (ARCH-6f; was `crypto::remote_signer::*`).
 
 mod client;
 mod wire;

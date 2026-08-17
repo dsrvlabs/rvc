@@ -32,6 +32,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 crypto.workspace = true
+remote-signer-client.workspace = true
 # Enables `slashing::fail_next_commits` for RF4-03 path-level CommitFailed tests.
 slashing = { workspace = true, features = ["test-utils"] }
 # Feature-unify `test-utils` onto the crate-under-test so integration tests

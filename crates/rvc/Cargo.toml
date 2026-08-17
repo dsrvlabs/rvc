@@ -25,6 +25,7 @@ block-service.workspace = true
 clap.workspace = true
 crypto.workspace = true
 observability.workspace = true
+remote-signer-client.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
 grpc-signer.workspace = true

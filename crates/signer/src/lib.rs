@@ -3404,8 +3404,8 @@ mod tests {
     /// Register pubkey as HTTP-remote in the composite (no live dial) so
     /// `backend_kind == Remote` for policy tests.
     fn register_http_remote_marker(composite: &CompositeSigner, pk: [u8; 48]) {
-        let remote = crypto::RemoteSigner::new_for_tests(
-            crypto::RemoteSignerConfig::new("https://127.0.0.1:1"),
+        let remote = remote_signer_client::RemoteSigner::new_for_tests(
+            remote_signer_client::RemoteSignerConfig::new("https://127.0.0.1:1"),
             vec![pk],
         );
         composite.add_remote_key(pk, Arc::new(remote));

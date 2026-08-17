@@ -1,7 +1,7 @@
 # Architecture
 
 <!-- BEGIN GENERATED -->
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 30 crates (3 binaries + 27 libraries).
 
 > **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
 > ```
@@ -20,7 +20,7 @@ graph TD
     RVC_BN_MANAGER["bn-manager<br/><i>multi-BN</i>"]
     RVC_BUILDER["builder<br/><i>MEV registration</i>"]
     RVC_CONFIG["config<br/><i>operator config names domain concepts</i>"]
-    RVC_CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
+    RVC_CRYPTO["crypto<br/><i>BLS, EIP-2333, keystore</i>"]
     RVC_DOPPELGANGER["doppelganger<br/><i>duplicate detection</i>"]
     RVC_DUTY_TRACKER["duty-tracker<br/><i>duty cache</i>"]
     RVC_ETH_TYPES["eth-types<br/><i>consensus types</i>"]
@@ -29,6 +29,7 @@ graph TD
     RVC_KEYMANAGER_API["keymanager-api<br/><i>key mgmt REST</i>"]
     RVC_METRICS["metrics<br/><i>prometheus</i>"]
     RVC_OBSERVABILITY["observability<br/><i>logging helpers</i>"]
+    RVC_REMOTE_SIGNER_CLIENT["remote-signer-client<br/><i>Web3Signer HTTP client</i>"]
     RVC_SECRET_PROVIDER["secret-provider<br/><i>cloud key mgmt</i>"]
     RVC_SIGNER["signer<br/><i>safe signing</i>"]
     RVC_SIGNER_BIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
@@ -58,6 +59,7 @@ graph TD
     RVC --> RVC_KEYMANAGER_API
     RVC --> RVC_METRICS
     RVC --> RVC_OBSERVABILITY
+    RVC --> RVC_REMOTE_SIGNER_CLIENT
     RVC --> RVC_SECRET_PROVIDER
     RVC --> RVC_SIGNER
     RVC --> RVC_SLASHING
@@ -91,7 +93,6 @@ graph TD
     RVC_CONFIG --> RVC_ETH_TYPES
     RVC_CRYPTO --> RVC_ETH_TYPES
     RVC_CRYPTO --> RVC_OBSERVABILITY
-    RVC_CRYPTO --> RVC_WEB3SIGNER_WIRE
     RVC_DOPPELGANGER --> RVC_CRYPTO
     RVC_DOPPELGANGER --> RVC_ETH_TYPES
     RVC_DOPPELGANGER --> RVC_OBSERVABILITY
@@ -109,6 +110,10 @@ graph TD
     RVC_KEYMANAGER_API --> RVC_ETH_TYPES
     RVC_KEYMANAGER_API --> RVC_METRICS
     RVC_KEYMANAGER_API --> RVC_OBSERVABILITY
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_CRYPTO
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_ETH_TYPES
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_OBSERVABILITY
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_WEB3SIGNER_WIRE
     RVC_SECRET_PROVIDER --> RVC_CRYPTO
     RVC_SECRET_PROVIDER --> RVC_ETH_TYPES
     RVC_SECRET_PROVIDER --> RVC_METRICS
@@ -145,7 +150,7 @@ graph TD
     style RVC_BN_MANAGER fill:#20c997,color:#fff
     style RVC_BUILDER fill:#ffd43b,color:#333
     style RVC_CONFIG fill:#ffd43b,color:#333
-    style RVC_CRYPTO fill:#20c997,color:#fff
+    style RVC_CRYPTO fill:#51cf66,color:#fff
     style RVC_DOPPELGANGER fill:#ffd43b,color:#333
     style RVC_DUTY_TRACKER fill:#ffd43b,color:#333
     style RVC_ETH_TYPES fill:#51cf66,color:#fff
@@ -154,6 +159,7 @@ graph TD
     style RVC_KEYMANAGER_API fill:#20c997,color:#fff
     style RVC_METRICS fill:#51cf66,color:#fff
     style RVC_OBSERVABILITY fill:#51cf66,color:#fff
+    style RVC_REMOTE_SIGNER_CLIENT fill:#20c997,color:#fff
     style RVC_SECRET_PROVIDER fill:#20c997,color:#fff
     style RVC_SIGNER fill:#ffd43b,color:#333
     style RVC_SIGNER_BIN fill:#4a9eff,color:#fff

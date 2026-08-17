@@ -100,16 +100,20 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-telemetry", Layer::Base, "telemetry", "OTel tracing"),
     // Pure serde wire types; sole out-edge eth-types (Base).
     ("rvc-web3signer-wire", Layer::Base, "web3signer-wire", "remote sign wire"),
+    // BLS + EIP-2333 + keystore. ARCH-6f extracted remote_signer/ (reqwest +
+    // web3signer-wire). Remaining WS out-edges: observability, eth-types (Base).
+    ("rvc-crypto", Layer::Base, "crypto", "BLS, EIP-2333, keystore"),
     // Beacon-API HTTP client — network I/O.
     ("beacon", Layer::Infra, "beacon", "HTTP client"),
     // Multi-BN pool, failover, SSE — network I/O.
     ("rvc-bn-manager", Layer::Infra, "bn-manager", "multi-BN"),
-    // Infra until ARCH-6f extracts remote_signer/; do not pre-flip to Base (VD-6-3).
-    ("rvc-crypto", Layer::Infra, "crypto", "BLS, signing, Web3Signer"),
     // tonic/gRPC client — network I/O. Review omits this member (VD-A1).
     ("rvc-grpc-signer", Layer::Infra, "grpc-signer", "gRPC signer client"),
     // Key-management REST surface — network I/O.
     ("rvc-keymanager-api", Layer::Infra, "keymanager-api", "key mgmt REST"),
+    // Web3Signer HTTP client; reqwest — network I/O. Out-edges crypto(Base)/
+    // eth-types/web3signer-wire/observability: Infra→Base only (ARCH-6f).
+    ("rvc-remote-signer-client", Layer::Infra, "remote-signer-client", "Web3Signer HTTP client"),
     // Cloud KMS clients — network I/O.
     ("rvc-secret-provider", Layer::Infra, "secret-provider", "cloud key mgmt"),
     // EIP-3076 SQLite store. Structurally Base-eligible; deliberately Infra (A-6-8).

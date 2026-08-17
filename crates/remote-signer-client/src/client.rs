@@ -4,6 +4,10 @@
 //! any wire types (those live in `web3signer_wire`).
 
 use async_trait::async_trait;
+use crypto::{
+    InsecureGate, InsecureMode, PublicKey, SignContext, Signature, Signer, SigningError,
+    TypedSigner, PUBLIC_KEY_BYTES_LEN,
+};
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
     Epoch, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
@@ -14,11 +18,7 @@ use serde::Deserialize;
 use tracing::Instrument;
 use web3signer_wire::SignRequest;
 
-use super::super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
-use super::super::insecure::{InsecureGate, InsecureMode};
-use super::super::signer_trait::{Signer, SigningError};
-use super::super::typed_signer::{SignContext, TypedSigner};
-use super::wire::{
+use crate::wire::{
     build_aggregate_and_proof_request, build_attestation_request, build_blinded_block_v2_request,
     build_block_v2_request, build_contribution_and_proof_request, build_randao_reveal_request,
     build_sync_committee_message_request, build_sync_selection_proof_request,

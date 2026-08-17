@@ -3,6 +3,25 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## API: Web3Signer HTTP client path (`crypto::remote_signer::*`)
+
+The Web3Signer HTTP client has moved out of `rvc-crypto` into crate
+`rvc-remote-signer-client` (workspace alias `remote-signer-client`).
+
+**Import path change (library consumers only; operator-invisible):**
+
+| Before | After |
+|---|---|
+| `crypto::remote_signer::*` | `remote_signer_client::*` |
+| `crypto::RemoteSigner` | `remote_signer_client::RemoteSigner` |
+| `crypto::RemoteSignerConfig` | `remote_signer_client::RemoteSignerConfig` |
+| `crypto::REMOTE_SIGNER_INSECURE_ENV_VAR` | `remote_signer_client::REMOTE_SIGNER_INSECURE_ENV_VAR` |
+
+`RVC_REMOTE_SIGNER_ALLOW_INSECURE` is unchanged (security opt-out; C3). Signing
+roots, request bodies, and URL gating are unchanged.
+
+---
+
 ## Deprecations
 
 ### gRPC healthz endpoint deprecated — migrate probes to metrics `/livez` and `/readyz`
