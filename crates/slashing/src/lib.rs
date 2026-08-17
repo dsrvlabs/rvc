@@ -26,3 +26,13 @@ pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
+
+/// Production `rules.rs` engine as a history-validity oracle (ARCH-5h).
+///
+/// Integration tests cannot see `pub(crate)` `check_*`; this re-export is
+/// gated so production dependents never take it (they do not enable
+/// `test-utils`).
+#[cfg(any(test, feature = "test-utils"))]
+pub use rules::{
+    eip3076_allows_attestation, eip3076_allows_block, first_eip3076_history_violation,
+};

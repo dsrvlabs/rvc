@@ -901,13 +901,13 @@ behind.
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] Both properties are implemented against the production rule engine as oracle.
-- [ ] The RED demonstration — a shrunk counterexample from a deliberately broken reserve — is
+- [x] Both properties are implemented against the production rule engine as oracle.
+- [x] The RED demonstration — a shrunk counterexample from a deliberately broken reserve — is
       pasted into the PR (ADR-012 "demonstrated, not asserted").
-- [ ] Runs inside `cargo nextest run --workspace` in under ~30 s; not `#[ignore]`d.
-- [ ] `crates/slashing/tests/conformance.rs` is **unchanged**, and VD-5.7's hazard is recorded in
+- [x] Runs inside `cargo nextest run --workspace` in under ~30 s; not `#[ignore]`d.
+- [x] `crates/slashing/tests/conformance.rs` is **unchanged**, and VD-5.7's hazard is recorded in
       the new file's header for whoever deletes `stage_*`.
-- [ ] `proptest` is a dev-dependency only; no production dependency is added.
+- [x] `proptest` is a dev-dependency only; no production dependency is added.
 
 ---
 
