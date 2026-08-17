@@ -405,9 +405,10 @@ where
             }
 
             // === Phase 1: t=0 — Block proposal ===
-            // Capture slot context once; downstream phases reuse the same head root
-            // to avoid TOCTOU races (H-5). Uses slot-qualified query, not "head" (L-5).
-            let ctx = SlotContext::capture(&*self.beacon, current_slot, current_epoch).await;
+            // Parent from slot-1 at t=0. Head is captured at phase 2 and
+            // reused at phase 3 (H-5). Both queries are slot-qualified (L-5).
+            let mut ctx =
+                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await;
             {
                 // M2: offset from slot start to entry of maybe_propose_block.
                 // Recorded after duty fetches / epoch-boundary work (not a reorder).
@@ -447,6 +448,9 @@ where
                 if self.check_shutdown() {
                     return Ok(());
                 }
+
+                // Head as of phase 2. Phase 3 reuses this value (H-5).
+                ctx.capture_head(&*self.beacon).await;
 
                 // Check for missed attestation deadline.
                 // Basis-points formula in milliseconds (report §4.3), consistent

@@ -101,7 +101,12 @@ where
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
             self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block(slot, &pubkey, expected_proposer_index, ctx.head_root),
+            self.block_service.propose_block(
+                slot,
+                &pubkey,
+                expected_proposer_index,
+                ctx.parent_root,
+            ),
         )
         .await
         {

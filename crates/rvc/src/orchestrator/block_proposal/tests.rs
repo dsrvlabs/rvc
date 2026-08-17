@@ -117,7 +117,7 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
     ));
 
     // Invoke the proposer path directly.
-    let ctx = SlotContext { slot, epoch, head_root: None };
+    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // H-4: a forged proposer_index must drop the duty before any
@@ -229,7 +229,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
         pubkey_map,
     ));
 
-    let ctx = SlotContext { slot, epoch, head_root: None };
+    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // D-3: the block must NOT be proposed when is_signing_enabled=false.
@@ -238,5 +238,184 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
     assert!(
         !publish_called.load(Ordering::SeqCst),
         "D-3: block must NOT be proposed when is_signing_enabled=false"
+    );
+}
+
+/// ARCH-3c: `propose_block`'s 4th argument must be the slot N-1 root
+/// (`parent_root`), not slot N (`head_root`). Passing the current slot's
+/// root would arm ParentRootMismatch on a valid block.
+#[tokio::test]
+async fn test_proposal_passes_previous_slot_as_expected_parent() {
+    use async_trait::async_trait;
+    use beacon::{BlockRootData, DataResponse, DependentRootResponse, ProposerDuty};
+    use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
+    use bn_manager::MockBeaconNodeClient;
+    use eth_types::{Root, SignedBeaconBlock, SignedBlindedBeaconBlock};
+
+    struct ParentAwareBlockBeacon {
+        slot: Slot,
+        proposer_index: u64,
+        parent: Root,
+        publish_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl BeaconBlockClient for ParentAwareBlockBeacon {
+        async fn produce_block_v3(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            let mut block = eth_types::external_vector_deneb_block();
+            block.slot = self.slot;
+            block.proposer_index = self.proposer_index;
+            block.parent_root = self.parent;
+            Ok(ProduceBlockResponse {
+                data: serde_json::to_value(&block)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?,
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: Some("0".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+            })
+        }
+
+        async fn publish_block(
+            &self,
+            _signed_block: &SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+        ) -> Result<(), BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let slot: Slot = 100;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    let validator_index = 42u64;
+    let r_prev: Root = [0x11; 32];
+    let r_curr: Root = [0x22; 32];
+    let r_prev_hex = format!("0x{}", hex::encode(r_prev));
+    let r_curr_hex = format!("0x{}", hex::encode(r_curr));
+
+    let secret_key = SecretKey::generate();
+    let pubkey = secret_key.public_key();
+    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+    let beacon = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_block_root({
+                let r_prev_hex = r_prev_hex.clone();
+                let r_curr_hex = r_curr_hex.clone();
+                move |block_id| {
+                    let root = if block_id == slot.to_string() {
+                        r_curr_hex.clone()
+                    } else if block_id == (slot - 1).to_string() {
+                        r_prev_hex.clone()
+                    } else {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    };
+                    Ok(DataResponse { data: BlockRootData { root } })
+                }
+            })
+            .with_get_proposer_duties({
+                let pubkey_hex = pubkey_hex.clone();
+                move |_epoch| {
+                    Ok(DependentRootResponse {
+                        dependent_root:
+                            "0x0000000000000000000000000000000000000000000000000000000000000000"
+                                .to_string(),
+                        execution_optimistic: false,
+                        data: vec![ProposerDuty {
+                            pubkey: pubkey_hex.clone(),
+                            validator_index: validator_index.to_string(),
+                            slot: slot.to_string(),
+                        }],
+                    })
+                }
+            }),
+    );
+
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+    duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+    let publish_called = Arc::new(AtomicBool::new(false));
+    let block_beacon = Arc::new(ParentAwareBlockBeacon {
+        slot,
+        proposer_index: validator_index,
+        parent: r_prev,
+        publish_called: publish_called.clone(),
+    });
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(secret_key);
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+
+    let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
+
+    let mut pubkey_map_inner = HashMap::new();
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon.clone(),
+        block_beacon,
+        None,
+        validator_store,
+        create_test_config(),
+        pubkey_map,
+    ));
+
+    let mut ctx = SlotContext::capture_parent(beacon.as_ref(), slot, epoch).await;
+    ctx.capture_head(beacon.as_ref()).await;
+    assert_eq!(ctx.parent_root, Some(r_prev), "t=0 parent must be slot N-1");
+    assert_eq!(ctx.head_root, Some(r_curr), "phase-2 head must be slot N");
+
+    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+    assert!(
+        publish_called.load(Ordering::SeqCst),
+        "propose_block 4th arg must be slot N-1 (parent_root); passing head_root \
+         rejects a valid previous-slot parent with ParentRootMismatch"
     );
 }

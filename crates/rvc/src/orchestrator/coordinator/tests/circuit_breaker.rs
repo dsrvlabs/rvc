@@ -80,7 +80,7 @@ async fn test_non_builder_timeout_does_not_trip_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, head_root: None };
+    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // Non-builder BN error must NOT record a miss.
@@ -162,7 +162,7 @@ async fn test_builder_timeout_trips_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, head_root: None };
+    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // Builder BN error MUST record a miss.
@@ -248,7 +248,7 @@ async fn test_signer_error_does_not_trip_breaker() {
         )
     });
 
-    let ctx = SlotContext { slot, epoch, head_root: None };
+    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // Signer error must NOT record a miss.

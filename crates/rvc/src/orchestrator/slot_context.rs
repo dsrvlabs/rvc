@@ -1,12 +1,13 @@
-//! Slot-scoped context captured once per slot in the coordinator.
+//! Slot-scoped context with two chain positions, captured at two times.
 //!
-//! `SlotContext` is constructed at the start of phase 1 (t=0) and passed by
-//! reference to attestation, block-proposal, and sync-committee phases. This
-//! prevents TOCTOU races where independent fetches of the head block root can
-//! observe different values across the slot's three phases (H-5).
+//! `parent_root` is captured at t=0 via `get_block_root(slot - 1)` and is
+//! the expected parent of a block proposed for this slot. `head_root` is
+//! captured at phase 2 (t=slot/3) via the slot-qualified current slot and
+//! reused at phase 3 so messages and contributions agree (H-5).
 //!
-//! The head root is queried via `get_block_root(slot=current_slot)` rather
-//! than the literal string `"head"`, incorporating the L-5 fix.
+//! Both queries are slot-qualified. The literal `"head"` block_id is not
+//! used (L-5). Do not repair the t=0 query to return the current slot's
+//! root: that value is never a valid parent of a slot-N block (ADR-003).
 
 use tracing::warn;
 
@@ -15,48 +16,71 @@ use eth_types::{Epoch, Root, Slot};
 
 use super::utils::parse_hex_root;
 
-/// Immutable snapshot of chain context captured at slot start.
+/// Per-slot chain context. `parent_root` and `head_root` are different
+/// positions, captured at different times.
 pub(crate) struct SlotContext {
     /// The slot this context was captured for.
     pub slot: Slot,
     /// The epoch this slot belongs to.
     pub epoch: Epoch,
-    /// Head block root at slot start, queried slot-qualified (not `"head"`).
-    ///
-    /// `None` when the beacon node query failed; downstream phases handle
-    /// this gracefully (e.g. sync committee skips signing without the root).
+    /// Parent of a block proposed for `slot`. Captured at t=0 from
+    /// `get_block_root(slot - 1)`. `None` if that query failed.
+    pub parent_root: Option<Root>,
+    /// Canonical head as of phase 2. Captured once at t=slot/3 and reused
+    /// at phase 3 (H-5). Left `None` at t=0 — a current-slot 404 then is
+    /// the normal path, not an exception. `None` after phase 2 means the
+    /// head query failed and sync duties skip.
     pub head_root: Option<Root>,
 }
 
 impl SlotContext {
-    /// Captures the slot context by querying the beacon node.
+    /// Captures `parent_root` at t=0 from `get_block_root(slot - 1)`.
     ///
-    /// Uses `get_block_root(slot=slot)` — **not** the literal `"head"` — to
-    /// obtain a deterministic, slot-qualified root (L-5 fix rolled in here).
+    /// Walk-back over skipped slots is ARCH-3d. `head_root` stays `None`.
+    pub(crate) async fn capture_parent(
+        beacon: &dyn BeaconNodeClient,
+        slot: Slot,
+        epoch: Epoch,
+    ) -> Self {
+        let parent_slot = slot.saturating_sub(1);
+        let parent_root = fetch_slot_qualified_root(beacon, &parent_slot.to_string(), slot).await;
+        Self { slot, epoch, parent_root, head_root: None }
+    }
+
+    /// Captures `head_root` at phase 2 from the slot-qualified current slot.
     ///
-    /// On any BN error the context is returned with `head_root = None` so the
-    /// slot loop can continue. The caller is responsible for handling `None`
-    /// gracefully.
-    pub(crate) async fn capture(beacon: &dyn BeaconNodeClient, slot: Slot, epoch: Epoch) -> Self {
-        let block_id = slot.to_string();
-        let head_root = match beacon.get_block_root(&block_id).await {
-            Ok(response) => match parse_hex_root(&response.data.root) {
-                Ok(root) => Some(root),
-                Err(e) => {
-                    warn!(slot, error = %e, "Failed to parse block root for slot context");
-                    None
-                }
-            },
+    /// When that slot has no block yet (spec-conformant 404), the chain head
+    /// is the parent already captured at t=0. Phase 3 must reuse this value
+    /// and must not call this again.
+    pub(crate) async fn capture_head(&mut self, beacon: &dyn BeaconNodeClient) {
+        self.head_root = fetch_slot_qualified_root(beacon, &self.slot.to_string(), self.slot).await;
+        if self.head_root.is_none() {
+            self.head_root = self.parent_root;
+        }
+    }
+}
+
+async fn fetch_slot_qualified_root(
+    beacon: &dyn BeaconNodeClient,
+    block_id: &str,
+    slot: Slot,
+) -> Option<Root> {
+    match beacon.get_block_root(block_id).await {
+        Ok(response) => match parse_hex_root(&response.data.root) {
+            Ok(root) => Some(root),
             Err(e) => {
-                warn!(
-                    slot,
-                    error = %e,
-                    "Failed to fetch block root for slot context; continuing without head_root"
-                );
+                warn!(slot, error = %e, "Failed to parse block root for slot context");
                 None
             }
-        };
-        Self { slot, epoch, head_root }
+        },
+        Err(e) => {
+            warn!(
+                slot,
+                error = %e,
+                "Failed to fetch block root for slot context"
+            );
+            None
+        }
     }
 }
 
@@ -83,10 +107,10 @@ mod tests {
     // Tests
     // -----------------------------------------------------------------------
 
-    /// `SlotContext::capture` must use `get_block_root(slot=N)` — NOT `"head"`.
+    /// Both captures must be slot-qualified — NOT the literal `"head"`.
     ///
-    /// The mock returns distinct roots for the two query forms; the assertion
-    /// verifies that the slot-qualified root was captured.
+    /// The mock returns distinct roots for `"head"` vs any other id; the
+    /// assertions verify that neither capture used `"head"`.
     #[tokio::test]
     async fn test_capture_uses_slot_qualified_query() {
         let slot_root =
@@ -99,20 +123,28 @@ mod tests {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
 
-        let ctx = SlotContext::capture(&beacon, slot, epoch).await;
+        let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
         assert_eq!(ctx.slot, slot);
         assert_eq!(ctx.epoch, epoch);
 
         let expected = parse_hex_root(&slot_root).unwrap();
         assert_eq!(
+            ctx.parent_root,
+            Some(expected),
+            "capture_parent must use slot-qualified slot-1, not 'head'"
+        );
+        assert!(ctx.head_root.is_none());
+
+        ctx.capture_head(&beacon).await;
+        assert_eq!(
             ctx.head_root,
             Some(expected),
-            "capture must use slot-qualified query, not 'head'"
+            "capture_head must use slot-qualified current slot, not 'head'"
         );
     }
 
-    /// When the beacon node returns an error, `head_root` must be `None` and
+    /// When the beacon node returns an error, both roots stay `None` and
     /// the slot loop must not be aborted (no panic, no propagated error).
     #[tokio::test]
     async fn test_capture_handles_bn_error() {
@@ -121,28 +153,31 @@ mod tests {
         let slot: Slot = 200;
         let epoch: Epoch = slot / 32;
 
-        let ctx = SlotContext::capture(&beacon, slot, epoch).await;
+        let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
         assert_eq!(ctx.slot, slot);
         assert_eq!(ctx.epoch, epoch);
+        assert!(
+            ctx.parent_root.is_none(),
+            "BN error must yield parent_root = None, not a panic or propagated error"
+        );
+        assert!(ctx.head_root.is_none());
+
+        ctx.capture_head(&beacon).await;
         assert!(
             ctx.head_root.is_none(),
             "BN error must yield head_root = None, not a panic or propagated error"
         );
     }
 
-    /// ARCH-3a defect pin (green against HEAD, red against intent).
+    /// ARCH-3a pin, kept after the 3c split (do not invert).
     ///
-    /// A spec-conformant BN 404s `get_block_root(<current slot>)` at t=0.
-    /// Today's `capture` collapses that to `head_root = None`, and the
-    /// sync-committee message phase therefore produces **zero** messages.
-    ///
-    /// ARCH-3c **replaces** this pin rather than inverting these assertions.
-    /// The split keeps t=0 `head_root` unset (`capture_parent` / `slot-1`);
-    /// messages are unblocked by a later phase-2 `capture_head`, covered by
-    /// new 3c tests (`test_capture_parent_leaves_head_unset_until_phase_two`,
-    /// `test_sync_messages_are_produced_when_bn_404s_the_current_slot`). Do
-    /// not stuff a root into `head_root` at t=0 to make this test submit.
+    /// A spec-conformant BN 404s `get_block_root(<current slot>)`. t=0
+    /// `capture_parent` queries slot-1 and must leave `head_root` unset;
+    /// the message phase on that t=0 context still produces **zero**
+    /// messages. Messages after phase-2 `capture_head` are covered by
+    /// `test_sync_messages_are_produced_when_bn_404s_the_current_slot`.
+    /// Do not stuff a root into `head_root` at t=0 to make this test submit.
     #[tokio::test]
     async fn test_capture_yields_no_context_when_bn_404s_current_slot() {
         use std::sync::{Arc, Mutex};
@@ -169,18 +204,31 @@ mod tests {
             .respond_with(ResponseTemplate::new(404).set_body_string(
                 r#"{"code":404,"message":"NOT_FOUND: beacon block at slot 1000"}"#,
             ))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let parent_slot = slot - 1;
+        let parent_hex = format!("0x{}", "11".repeat(32));
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/blocks/{parent_slot}/root")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": { "root": parent_hex }
+            })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        // Real HTTP client (not MockBeaconNodeClient): 404 is what capture sees.
+        // Real HTTP client (not MockBeaconNodeClient): t=0 queries slot-1.
         let client =
             BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(0))
                 .unwrap();
-        let ctx = SlotContext::capture(&client, slot, epoch).await;
+        let ctx = SlotContext::capture_parent(&client, slot, epoch).await;
         assert!(
             ctx.head_root.is_none(),
-            "spec-conformant 404 for the current slot must collapse to head_root = None"
+            "t=0 capture_parent must leave head_root unset even when slot-1 succeeds"
         );
 
         let sk = SecretKey::generate();
@@ -247,6 +295,65 @@ mod tests {
         assert!(
             submitted.lock().unwrap().is_empty(),
             "ARCH-3a defect: capture 404 → head_root=None → zero sync committee messages"
+        );
+    }
+
+    /// t=0 `capture_parent` must leave `head_root` unset. A later
+    /// `capture_head` fills it from the slot-qualified current slot — not
+    /// by stuffing a parent into `head_root` at t=0.
+    #[tokio::test]
+    async fn test_capture_parent_leaves_head_unset_until_phase_two() {
+        let slot: Slot = 100;
+        let epoch: Epoch = slot / 32;
+        let parent_hex =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let current_hex =
+            "0x2222222222222222222222222222222222222222222222222222222222222222".to_string();
+        let head_hex =
+            "0x3333333333333333333333333333333333333333333333333333333333333333".to_string();
+
+        let beacon = MockBeaconNodeClient::new().with_get_block_root({
+            let parent_hex = parent_hex.clone();
+            let current_hex = current_hex.clone();
+            let head_hex = head_hex.clone();
+            move |block_id| {
+                let root = if block_id == "head" {
+                    head_hex.clone()
+                } else if block_id == slot.to_string() {
+                    current_hex.clone()
+                } else if block_id == (slot - 1).to_string() {
+                    parent_hex.clone()
+                } else {
+                    return Err(beacon::BeaconError::HttpError(format!(
+                        "unexpected block_id {block_id}"
+                    )));
+                };
+                Ok(DataResponse { data: BlockRootData { root } })
+            }
+        });
+
+        let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+        assert_eq!(ctx.slot, slot);
+        assert_eq!(ctx.epoch, epoch);
+        assert_eq!(
+            ctx.parent_root,
+            Some(parse_hex_root(&parent_hex).unwrap()),
+            "t=0 must capture slot-1, not the current slot or \"head\""
+        );
+        assert!(
+            ctx.head_root.is_none(),
+            "t=0 must leave head_root unset; do not stuff a root into head_root at capture_parent"
+        );
+
+        ctx.capture_head(&beacon).await;
+        assert_eq!(
+            ctx.head_root,
+            Some(parse_hex_root(&current_hex).unwrap()),
+            "phase-2 capture_head must use the slot-qualified current slot, not \"head\""
+        );
+        assert_ne!(
+            ctx.head_root, ctx.parent_root,
+            "head and parent name different chain positions; copying parent is not capture_head"
         );
     }
 }

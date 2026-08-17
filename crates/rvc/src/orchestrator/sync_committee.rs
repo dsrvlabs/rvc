@@ -59,8 +59,8 @@ impl SyncCommitteeService {
             return;
         }
 
-        // H-5: use the head_root captured once at slot start instead of
-        // fetching independently. If the BN failed during capture, skip
+        // H-5: use the head_root captured once at phase 2 instead of
+        // fetching independently. If the BN failed during capture_head, skip
         // rather than falling back to a fresh (potentially drifted) fetch.
         let head_root = match ctx.head_root {
             Some(root) => root,
@@ -142,8 +142,8 @@ impl SyncCommitteeService {
             return;
         }
 
-        // H-5: use the head_root captured once at slot start instead of
-        // fetching independently. If the BN failed during capture, skip
+        // H-5: use the head_root captured once at phase 2 instead of
+        // fetching independently. If the BN failed during capture_head, skip
         // rather than falling back to a fresh (potentially drifted) fetch.
         let head_root = match ctx.head_root {
             Some(root) => root,
@@ -578,7 +578,7 @@ mod tests {
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
         // SlotContext constructed once at slot start — this is the fix's contract.
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
         // Run both sync-committee phases with the same context.
         service.maybe_produce_sync_messages(0, 0, &ctx).await;
@@ -629,8 +629,8 @@ mod tests {
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
-        // head_root = None simulates a BN failure during SlotContext::capture.
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: None };
+        // head_root = None simulates a BN failure during SlotContext::capture_head.
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
 
         service.maybe_produce_sync_messages(0, 0, &ctx).await;
 
@@ -666,8 +666,8 @@ mod tests {
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
-        // head_root = None simulates a BN failure during SlotContext::capture.
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: None };
+        // head_root = None simulates a BN failure during SlotContext::capture_head.
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
 
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
@@ -706,7 +706,7 @@ mod tests {
 
         let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
 
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
         service.maybe_produce_sync_messages(0, 0, &ctx).await;
 
         // No messages must be submitted for a disabled validator.
@@ -814,7 +814,7 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         // In GREEN: filter_sync_duties returns [] because the validator is
@@ -917,7 +917,7 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
         // Must complete without panic / hang — isolation property.
         service.maybe_produce_sync_messages(0, 0, &ctx).await;
 
@@ -1010,7 +1010,7 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         // A and C are aggregators for subcommittee 0 → two contribution fetches
@@ -1025,5 +1025,81 @@ mod tests {
             2,
             "H-6: proofs from A and C must be submitted; B must not abort the loop"
         );
+    }
+
+    /// ARCH-3c: a spec-conformant BN 404s the current slot. After t=0
+    /// `capture_parent` (slot-1) and phase-2 `capture_head`, messages must
+    /// still be produced — do not leave `head_root` stuck at the t=0 404.
+    #[tokio::test]
+    async fn test_sync_messages_are_produced_when_bn_404s_the_current_slot() {
+        let slot: Slot = 1000;
+        let epoch = slot / 32;
+        let parent_hex =
+            "0x1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let expected_parent = {
+            let mut r = [0u8; 32];
+            r.fill(0x11);
+            r
+        };
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let submitted = Arc::new(Mutex::new(Vec::<Root>::new()));
+        let submitted_for_hook = Arc::clone(&submitted);
+        let duty_pk = pk.to_bytes();
+        let parent_for_stub = parent_hex.clone();
+
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_slot_aware_block_root(slot, &[], move |queried| match queried {
+                    None => "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                    Some(_) => parent_for_stub.clone(),
+                })
+                .with_post_sync_committee_duties(move |_epoch, _indices| {
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: duty_pk,
+                            validator_index: 1,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                })
+                .with_submit_sync_committee_messages(move |messages| {
+                    submitted_for_hook
+                        .lock()
+                        .unwrap()
+                        .extend(messages.iter().map(|m| m.beacon_block_root));
+                    Ok(())
+                }),
+        );
+
+        let service = setup_service(beacon.clone(), pk_hex, pk, sk).await;
+
+        // Coordinator sequence: parent at t=0, head at phase 2, then messages.
+        let mut ctx = SlotContext::capture_parent(beacon.as_ref(), slot, epoch).await;
+        assert!(ctx.head_root.is_none(), "t=0 capture_parent must not populate head_root");
+        assert_eq!(ctx.parent_root, Some(expected_parent));
+
+        ctx.capture_head(beacon.as_ref()).await;
+        assert!(
+            ctx.head_root.is_some(),
+            "phase-2 capture_head must supply a head even when the current slot 404s"
+        );
+
+        service.maybe_produce_sync_messages(slot, epoch, &ctx).await;
+        let roots = submitted.lock().unwrap();
+        assert!(
+            !roots.is_empty(),
+            "sync messages must be produced after phase-2 capture when the current slot 404s"
+        );
+        for root in roots.iter() {
+            assert_eq!(
+                *root, expected_parent,
+                "messages must sign the captured head (parent when slot N has no block)"
+            );
+        }
     }
 }

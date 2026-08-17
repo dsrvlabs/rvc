@@ -418,19 +418,19 @@ is verified at HEAD: `block_proposal/mod.rs:104` → `service/mod.rs:89-95` (`ex
 this issue.
 
 **Acceptance criteria.**
-- [ ] `SlotContext` has four fields; `parent_root` is captured at t=0 from `slot - 1`, `head_root` at
+- [x] `SlotContext` has four fields; `parent_root` is captured at t=0 from `slot - 1`, `head_root` at
       phase 2 from the slot-qualified current slot, and phase 3 **reuses** phase 2's value.
-- [ ] `block_proposal/mod.rs:104` passes `parent_root`; no production caller passes a head root into
+- [x] `block_proposal/mod.rs:104` passes `parent_root`; no production caller passes a head root into
       `expected_parent_root`.
-- [ ] With a 404-on-current-slot BN, sync-committee **messages** are produced (contributions in 3e's
+- [x] With a 404-on-current-slot BN, sync-committee **messages** are produced (contributions in 3e's
       criteria; the code path is already shared).
-- [ ] `test_messages_and_contributions_share_head_root` is green and **byte-identically named**, with
+- [x] `test_messages_and_contributions_share_head_root` is green and **byte-identically named**, with
       its struct literal at `:582` updated for the new field (VD-37) and its call-count assertion
       unchanged.
-- [ ] Both captures stay **slot-qualified**; the literal `"head"` block_id is not reintroduced (the
+- [x] Both captures stay **slot-qualified**; the literal `"head"` block_id is not reintroduced (the
       L-5 fix is preserved; `"head"` appears only as 3d's terminal fallback).
-- [ ] The three misleading doc comments are corrected, not deleted.
-- [ ] `cargo nextest run --workspace` green; `EXEMPTIONS` unchanged.
+- [x] The three misleading doc comments are corrected, not deleted.
+- [x] `cargo nextest run --workspace` green; `EXEMPTIONS` unchanged.
 
 ---
 
