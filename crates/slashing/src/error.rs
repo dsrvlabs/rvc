@@ -91,6 +91,25 @@ pub enum SlashingError {
     /// File inspection failed before open (permissions, I/O).
     #[error("failed to inspect slashing protection database at {path}: {message}")]
     InspectFailed { path: String, message: String },
+
+    /// INSERT+COMMIT inside [`crate::SlashingDb::reserve_block`] /
+    /// [`crate::SlashingDb::reserve_attestation`] failed. The transaction was
+    /// rolled back; no new history row exists.
+    ///
+    /// Distinguished from a rule violation (`SlashableBlock` /
+    /// `SlashableAttestation` / watermark floors) so the signer can map this
+    /// to `CommitFailed` (same-root retry safe), never `SlashingBlocked`.
+    /// Classification of this variant is ARCH-5i; the inject is ARCH-5e/5g.
+    #[error("slashing-protection reserve commit failed (no row written): {0}")]
+    ReserveCommitFailed(String),
+}
+
+impl SlashingError {
+    /// True when a `reserve_*` persist (INSERT/COMMIT, including the test inject)
+    /// failed. Not a slashing-rule verdict.
+    pub fn is_reserve_commit_failure(&self) -> bool {
+        matches!(self, Self::ReserveCommitFailed(_))
+    }
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

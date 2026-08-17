@@ -61,6 +61,35 @@
 //! `StagedAttestation<'_>` are also `!Send`.  Do **not** hold a staged guard
 //! across an `.await` point unless the entire future is pinned to a single
 //! thread (e.g. via `spawn_blocking`).
+//!
+//! ## Additive `reserve_*` (ARCH-5e / ADR-005)
+//!
+//! [`SlashingDb::reserve_block`] / [`SlashingDb::reserve_attestation`] sit
+//! **alongside** `stage_*` (A-5.2). They run rule check + INSERT + COMMIT in
+//! one short write transaction and return a [`CommittedReservation`] that is
+//! `Send` — no `MutexGuard` escapes. `stage_*`, `commit()`, `discard()`, and
+//! `Drop` are unchanged.
+//!
+//! **M-1 prior-art warning** (`crates/signer/tests/phantom_row_m1.rs:1-10`):
+//! this repo already shipped commit-before-sign and reverted it as a bug.
+//! *Before the fix, `sign_attestation` / `sign_block` called
+//! `check_and_record_*` (which committed the row immediately) and only then
+//! called `signer.sign`. A signing failure left a committed row in the DB,
+//! causing the next legitimate sign attempt to look like a DoubleVote.*
+//! M-1's failure mode was **liveness, not safety** (a phantom row refuses a
+//! legitimate sign; it never permits a double-sign).
+//!
+//! The compensating delete (`reconcile_unsigned`) is **ARCH-5f**. It is
+//! deliberately not implemented here. **Do not** wire `reserve_*` as a
+//! production signing caller until 5f lands — shipping this ordering without
+//! compensation re-opens M-1.
+//!
+//! **C1 (binding):** stage → release → sign → re-check-and-commit is rejected
+//! by name. It cannot retain a released row, so an ambiguous remote sign
+//! silently becomes a rolled-back row — a signature that may exist on the
+//! wire with **no** slashing record. Tentative-commit makes retention the
+//! default (the row is already committed). C9's cancellation-proof
+//! `stage → sign → commit` core is not weakened: `stage_*` stays.
 
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
@@ -116,6 +145,33 @@ struct AttestationRow {
     /// Hex-encoded genesis validators root to write into the per-row column.
     gvr_hex: String,
     is_duplicate: bool,
+}
+
+// ── CommittedReservation (ARCH-5e) ────────────────────────────────────────────
+
+/// Proof that a history row is COMMITTED and the DB lock is released.
+///
+/// Carries what a compensating delete needs. `Send` — the mutex is gone.
+///
+/// **Not a production sign-path token yet.** `reconcile_unsigned` is ARCH-5f;
+/// shipping `reserve_*` without that delete re-opens M-1. C1 retain-on-ambiguity
+/// is the reason the row is committed *before* the sign: an ambiguous signer
+/// error needs no action to retain it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedReservation {
+    pub pubkey_hex: String,
+    pub kind: ReservationKind,
+    pub signing_root_hex: Option<String>,
+    /// Distinguishes a fresh INSERT (reconcilable by ARCH-5f) from an
+    /// idempotent re-sign or duplicate, where NOTHING may be deleted.
+    pub inserted: bool,
+}
+
+/// Discriminant stored on [`CommittedReservation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationKind {
+    Block { slot: Slot },
+    Attestation { source: Epoch, target: Epoch },
 }
 
 // ── StagedBlock ───────────────────────────────────────────────────────────────
@@ -481,4 +537,185 @@ impl SlashingDb {
             inject_fail_commit,
         })
     }
+
+    /// Rule check + INSERT + COMMIT in one short write transaction.
+    ///
+    /// The connection mutex is acquired and released **inside** this call; no
+    /// guard escapes, so the returned [`CommittedReservation`] is `Send`.
+    ///
+    /// GVR is still checked **before** the mutex, preserving the M-6 nested-lock
+    /// avoidance already at [`Self::stage_block`].
+    ///
+    /// # C1 / M-1
+    ///
+    /// This commits the row *before* any sign. That is what makes retain-on-
+    /// ambiguity the default (C1). It is **not** the rejected
+    /// stage→release→sign→re-check design. Compensating delete is ARCH-5f;
+    /// **do not** call this from a production signing path until 5f lands.
+    ///
+    /// # Errors
+    ///
+    /// - [`SlashingError::GenesisRootMismatch`] — M-6, before the mutex.
+    /// - [`SlashingError::SlashableBlock`] / watermark floors — rule check;
+    ///   transaction rolled back, no row.
+    /// - [`SlashingError::ReserveCommitFailed`] — INSERT/COMMIT (or the test
+    ///   inject) failed; transaction rolled back, no new row. Distinguishable
+    ///   from a rule violation.
+    pub fn reserve_block(
+        &self,
+        pubkey_hex: &str,
+        slot: Slot,
+        signing_root_hex: Option<String>,
+        gvr: &Root,
+    ) -> Result<CommittedReservation, SlashingError> {
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "reserve_block rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let guard = self.conn.lock();
+
+        with_immediate_txn(&guard, |conn| {
+            let strict = self.strict_semantics.load(Ordering::Relaxed);
+            let watermark = read_watermark(conn, &pubkey, WatermarkKind::Block)?;
+            let history = TargetedSqlBlockHistory::new(conn, &pubkey);
+            let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
+            let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
+            let outcome = check_block(&pubkey, &history, &watermarks, &candidate, strict)?;
+            let inserted = !matches!(outcome, BlockVerdict::Resign);
+
+            persist_reserved_row(self, conn, || {
+                if inserted {
+                    conn.execute(
+                        "INSERT INTO blocks
+                         (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (AUDIT_ORIGIN, &pubkey, slot as i64, &signing_root_hex, &gvr_hex),
+                    )
+                    .map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))?;
+                }
+                Ok(())
+            })?;
+
+            Ok(CommittedReservation {
+                pubkey_hex: pubkey,
+                kind: ReservationKind::Block { slot },
+                signing_root_hex,
+                inserted,
+            })
+        })
+    }
+
+    /// Attestation counterpart of [`Self::reserve_block`].
+    ///
+    /// Same contract: one short write transaction, `Send` token, M-6 GVR check
+    /// before the mutex, errors between `BEGIN IMMEDIATE` and return funnel
+    /// through exactly one `ROLLBACK`. Not a production caller until ARCH-5f.
+    pub fn reserve_attestation(
+        &self,
+        pubkey_hex: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root_hex: Option<String>,
+        gvr: &Root,
+    ) -> Result<CommittedReservation, SlashingError> {
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "reserve_attestation rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let guard = self.conn.lock();
+
+        with_immediate_txn(&guard, |conn| {
+            let strict = self.strict_semantics.load(Ordering::Relaxed);
+            let wm_source = read_watermark(conn, &pubkey, WatermarkKind::AttestationSource)?;
+            let wm_target = read_watermark(conn, &pubkey, WatermarkKind::AttestationTarget)?;
+            let history = TargetedSqlAttestationHistory::new(conn, &pubkey);
+            let watermarks = AttestationWatermarks {
+                source: wm_source.map(|w| w as Epoch),
+                target: wm_target.map(|w| w as Epoch),
+            };
+            let candidate = AttestationCandidate {
+                source_epoch,
+                target_epoch,
+                signing_root: signing_root_hex.clone(),
+            };
+            let verdict = check_attestation(&pubkey, &history, &watermarks, &candidate, strict)?;
+            let inserted = !matches!(verdict, AttestationVerdict::Duplicate);
+
+            persist_reserved_row(self, conn, || {
+                if inserted {
+                    conn.execute(
+                        "INSERT INTO attestations \
+                         (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (
+                            AUDIT_ORIGIN,
+                            &pubkey,
+                            source_epoch as i64,
+                            target_epoch as i64,
+                            &signing_root_hex,
+                            &gvr_hex,
+                        ),
+                    )
+                    .map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))?;
+                }
+                Ok(())
+            })?;
+
+            Ok(CommittedReservation {
+                pubkey_hex: pubkey,
+                kind: ReservationKind::Attestation { source: source_epoch, target: target_epoch },
+                signing_root_hex,
+                inserted,
+            })
+        })
+    }
+}
+
+/// `BEGIN IMMEDIATE` then `body`. Any `Err` from `body` (rule, SQL, inject,
+/// COMMIT) is followed by exactly one `ROLLBACK` so the connection is never
+/// left mid-transaction. A successful `body` has already `COMMIT`ted.
+fn with_immediate_txn<T, F>(conn: &Connection, body: F) -> Result<T, SlashingError>
+where
+    F: FnOnce(&Connection) -> Result<T, SlashingError>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match body(conn) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Consume the commit inject (if armed), run `insert`, then `COMMIT`.
+/// INSERT/COMMIT failures become [`SlashingError::ReserveCommitFailed`].
+fn persist_reserved_row(
+    db: &SlashingDb,
+    conn: &Connection,
+    insert: impl FnOnce() -> Result<(), SlashingError>,
+) -> Result<(), SlashingError> {
+    if db.take_injected_commit_failure() {
+        return Err(SlashingError::ReserveCommitFailed(
+            "injected commit failure (test-utils)".into(),
+        ));
+    }
+    insert()?;
+    conn.execute_batch("COMMIT").map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))
 }

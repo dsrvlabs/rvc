@@ -4598,6 +4598,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-observability",
+ "rvc-slashing",
  "serde",
  "serde_json",
  "tempfile",

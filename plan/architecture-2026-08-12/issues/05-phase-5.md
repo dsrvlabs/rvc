@@ -669,17 +669,17 @@ pub fn reserve_block(&self, pubkey_hex: &str, slot: Slot,
   to stay outside the scanner's `.*_root$` pattern.
 
 **Acceptance criteria**
-- [ ] `reserve_block` / `reserve_attestation` exist, commit inside one short write transaction, and
+- [x] `reserve_block` / `reserve_attestation` exist, commit inside one short write transaction, and
       return a `Send` `CommittedReservation`; no `MutexGuard` escapes.
-- [ ] Two different pubkeys can hold reservations concurrently — asserted with a timeout.
-- [ ] The M-6 GVR pre-check runs **before** the mutex, unchanged.
-- [ ] All error paths between `BEGIN IMMEDIATE` and return funnel through exactly one `ROLLBACK`.
-- [ ] `inserted` is `false` on a resign/duplicate and `true` on a fresh INSERT.
-- [ ] Reserve-time commit failure is a distinct error from a rule violation.
-- [ ] `stage_*` and its **63** counted test call sites (6 files, A-5.2) are **byte-unchanged**;
+- [x] Two different pubkeys can hold reservations concurrently — asserted with a timeout.
+- [x] The M-6 GVR pre-check runs **before** the mutex, unchanged.
+- [x] All error paths between `BEGIN IMMEDIATE` and return funnel through exactly one `ROLLBACK`.
+- [x] `inserted` is `false` on a resign/duplicate and `true` on a fresh INSERT.
+- [x] Reserve-time commit failure is a distinct error from a rule violation.
+- [x] `stage_*` and its **63** counted test call sites (6 files, A-5.2) are **byte-unchanged**;
       `cargo nextest run -p rvc-slashing` green with no test edits.
-- [ ] The PR description quotes `phantom_row_m1.rs:1-10` and links §5's rejected-alternatives table.
-- [ ] **E3's A-12 resolution is recorded in `plan/tracing-2026-08-06/` before this PR merges** —
+- [x] The PR description quotes `phantom_row_m1.rs:1-10` and links §5's rejected-alternatives table.
+- [x] **E3's A-12 resolution is recorded in `plan/tracing-2026-08-06/` before this PR merges** —
       lifted or re-pinned, never discovered.
 
 ---

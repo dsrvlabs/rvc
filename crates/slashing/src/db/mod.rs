@@ -81,19 +81,25 @@ pub struct SlashingDb {
     /// Per-instance countdown of forced commit failures (`test-utils` only arms it).
     ///
     /// Scoped to this `SlashingDb` so parallel tests with separate in-memory DBs
-    /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`.
+    /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`;
+    /// consumed inside `reserve_*` immediately before INSERT.
     pub(crate) fail_next_commits: AtomicU32,
 }
 
 impl SlashingDb {
-    /// Force the next `n` `Staged*::commit` calls on **this** DB to fail before
-    /// INSERT/`COMMIT`. Drop still rolls back. Per-instance — safe under parallel
-    /// tests with separate `open_in_memory()` DBs.
+    /// Force the next `n` persist operations on **this** DB to fail before
+    /// INSERT/`COMMIT`: `Staged*::commit` (snapshotted at `stage_*`) and
+    /// `reserve_*` (consumed immediately before INSERT). Drop of a staged
+    /// guard still rolls back. Per-instance — safe under parallel tests with
+    /// separate `open_in_memory()` DBs.
     ///
     /// # Test-only
     ///
-    /// Gated by the `test-utils` feature.
-    #[cfg(feature = "test-utils")]
+    /// Not on the production API. Gated by `cfg(test)` (this crate's unit
+    /// tests) or the `test-utils` feature (other crates' `[dev-dependencies]`,
+    /// and this crate's integration tests via the self-path `test-utils`
+    /// dev-dep). Production binaries cannot arm the inject.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_next_commits(&self, n: u32) {
         self.fail_next_commits.store(n, Ordering::SeqCst);
     }
