@@ -1,211 +1,179 @@
-//! G-2 / ARCH-P1-1 config-drift gate — clauses (ii), (iii), (iv).
+//! G-2 / ARCH-P1-1 config-drift gate — clauses (iii) and (iv), plus an
+//! `apply_cli` presence scan (successor to clause (ii), no bypass/alias tables).
 //!
-//! Seam α is now `StartArgs` flatten groups → `Config::apply_cli` (`types.rs`).
-//! rustc does not require every group field to be read; clause (ii) still scans
-//! identifier-bounded `{binding}.{field}` accesses in `apply_cli`.
+//! ## Retired tables (ARCH-4k)
 //!
-//! ## Clause (i) is DROPPED, not forgotten
+//! Original seam α was group `Args` → `From<StartArgs>` / `CliOverrides` /
+//! `merge_with_cli`. ARCH-4i deleted that **translation**. The tables that
+//! existed only for it (`BYPASS`, `ALIASES`) and the `bindings.len() == 13` /
+//! `checked == 74` non-vacuity checks were deleted here (R10: do not leave a
+//! gate that can only ever be green).
 //!
-//! Clause (i) (`CliOverrides` consumed in `merge_with_cli`) is gone with that
-//! type (ARCH-4i). rustc no longer has an exhaustive destructure of 65 fields.
+//! `From<StartArgs>` / `CliOverrides` is gone. `Config::apply_cli` remains a
+//! **field-access overlay**: `StartArgs`' destructure is exhaustive over
+//! groups, not fields, so rustc will not fail a new clap leaf that `apply_cli`
+//! never writes. That overlay is **not** rustc-guarded; the presence scan
+//! below is what keeps it falsifiable.
 //!
-//! ## Clause (ii) — seam α
+//! ## apply_cli presence scan
 //!
-//! Every group-arg field must be read as `<binding>.<field>` in `apply_cli`, unless listed
-//! on the shrinking-only `BYPASS` table. `ALIASES` documents rename / 2:1 collapse only; sources
-//! must still be read under the clap field name.
+//! Every clap leaf field must appear as an identifier-bounded
+//! `{section}.{field}` access in `Config::apply_cli`, or be listed on
+//! [`CLI_ONLY_ARGS`]. No bypass/alias tables. The four CLI-only names must
+//! still have a second-leg read in `bin/rvc/src/cli.rs`.
 //!
-//! ## Clause (iii) — validation coverage (descoped)
+//! ## Clause (iii) — validation coverage
 //!
-//! Not "every `Config` field has a marker" (65 lines of noise). Instead: every
-//! [`OPERATOR_KNOB_NAMES`] entry appears in `Config::validate`'s body (`types.rs`) **or**
-//! on the shrinking-only [`UNVALIDATED`] list. Adding a knob without a check or a list
-//! entry fails CI.
+//! Every operator knob — a **section-struct field path** in `rvc-config`
+//! (plus the six wrapper knobs on `start.rs`) — appears in `Config::validate`
+//! (`types.rs`) **or** on the shrinking-only [`UNVALIDATED`] list. Inventory is
+//! **69** (`OPERATOR_KNOB_NAMES` in `crates/rvc/src/config/knobs.rs`). Adding
+//! a section field without a check or a list entry fails CI.
 //!
-//! ## Clause (iv) — `CLAP_DEFAULT_CLOBBERS` (ADR-009 / F9)
+//! ## Clause (iv) — clap default clobber (ADR-009 / F9)
 //!
-//! Formerly nine `CliOverrides` fields were populated with unconditional `Some(<clap field with
-//! default_value>)` in `From<StartArgs>`. Clap's default is indistinguishable from an operator
-//! flag, so `merge_with_cli`'s `set` arm overwrote a TOML value even when the flag was absent
-//! (e.g. TOML `metrics_port = 9090` silently became 8080). ARCH-6b converted those clap fields to
-//! `Option<T>` without `default_value`, so [`CLAP_DEFAULT_CLOBBERS`] is now **empty**. The list
-//! remains **shrinking-only** (may not grow); the detector still flags a synthetic reintroduction
-//! so an empty list is not a dead gate.
+//! [`CLAP_DEFAULT_CLOBBERS`] is **empty** (Phase 1 / ARCH-6b) and must stay
+//! empty. The live property is structural: no `clap::Args` field in
+//! `rvc-config` has both a `default_value` / `default_value_t` and a
+//! non-`Option` type. Present-only `bool` + `default_value_t` + exact
+//! `#[serde(skip)]` polarity flags are excluded (`apply_cli` is present-only).
+//! `serde(skip_serializing_if)` is **not** a skip. A valued non-`Option` with
+//! `default_value` still fails.
 //!
-//! ## Tests that *look* like precedence tests and are not
+//! ## CLI-only args (VD-4.8)
 //!
-//! No existing test catches the clap-default clobber:
-//! - `test_start_args_convert_to_equivalent_cli_overrides` (`bin/rvc/src/cli.rs`) passes every flag
-//!   **explicitly**, so it only exercises the operator-supplied branch.
-//! - `test_start_help_lists_every_flag` compares a hand-maintained `START_FLAGS` array against
-//!   `--help` text — a surface inventory, not a file-vs-CLI precedence check.
+//! Four flags have **no** Config / TOML representation. They used to sit on
+//! clause (ii)'s bypass table; that table is gone, so they are listed as
+//! [`CLI_ONLY_ARGS`]. Losing the list would hide the only CLI-only args.
 //!
-//! ## Interim lifetime
+//! ## Lifetime
 //!
-//! This gate is **interim by construction**. ADR-008 Phase 4 collapses seam α (group `Args` →
-//! direct `Config` paths), at which point clauses (i)/(ii) and the `BYPASS` / `ALIASES` tables are
-//! deleted with it; only clauses (iii)/(iv) survive (iv with an empty list after ARCH-6b).
+//! Interim `BYPASS` / `ALIASES` tables were retired by ARCH-4k with the
+//! From/CliOverrides translation. `apply_cli` remains a manual field-access
+//! overlay and is gated by the presence scan, not by rustc.
 //!
-//! ## Non-vacuity
-//!
-//! `assert_eq!(bindings.len(), 13)` and `assert_eq!(checked, 74)` so a rename of `StartArgs` or a
-//! group cannot turn the gate green forever. Field arithmetic: `74 − 4 − 1 = 69` (group fields
-//! minus BYPASS minus the sole 2:1 alias collapse) equals the operator knob count.
-//!
-//! ## Matcher limits (clause ii is a presence scan)
-//!
-//! Field access matching is **identifier-bounded** (`binding.field` must not be a prefix of a
-//! longer sibling such as `logfile` vs `logfile_max_size`) and runs on a **comment-stripped**
-//! From body. It is still **presence-only**: a discarded read (`let _ = binding.field`) satisfies
-//! the detector. Requiring RHS assignment into `CliOverrides { … }` is deferred (typed dataflow
-//! is out of scope for this interim gate); treat green as necessary, not sufficient, against a
-//! deliberate greenwash of that form.
-//!
-//! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as `kat_policy.rs`.
+//! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as
+//! `kat_policy.rs`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const CLI_RS: &str = "bin/rvc/src/cli.rs";
 const START_RS: &str = "crates/rvc/src/config/start.rs";
 const TYPES_RS: &str = "crates/rvc/src/config/types.rs";
 const KNOBS_RS: &str = "crates/rvc/src/config/knobs.rs";
+const SECTIONS_DIR: &str = "crates/rvc-config/src/sections";
 
-/// ARCH-4f/4g: migrated clap groups live in `rvc-config` and are re-imported by `StartArgs`.
-const MIGRATED_GROUP_SRCS: &[&str] = &[
-    "crates/rvc-config/src/sections/tracing.rs",
-    "crates/rvc-config/src/sections/keymanager.rs",
-    "crates/rvc-config/src/sections/grpc_signer.rs",
-    "crates/rvc-config/src/sections/monitoring.rs",
-    "crates/rvc-config/src/sections/logfile.rs",
-    "crates/rvc-config/src/sections/proposer_config.rs",
-    "crates/rvc-config/src/sections/builder_limits.rs",
-    "crates/rvc-config/src/sections/secret_provider.rs",
-    "crates/rvc-config/src/sections/keys.rs",
-    "crates/rvc-config/src/sections/beacon.rs",
-    "crates/rvc-config/src/sections/server.rs",
-    "crates/rvc-config/src/sections/network.rs",
-    "crates/rvc-config/src/sections/safety.rs",
-    "crates/rvc-config/src/sections/slashing.rs",
+/// clap `*Args` groups that declare operator knobs, with the section path prefix.
+const SECTION_GROUPS: &[(&str, &str)] = &[
+    ("BeaconArgs", "beacon"),
+    ("BuilderArgs", "builder"),
+    ("BuilderLimitsArgs", "builder_limits"),
+    ("GcpSecretArgs", "secret_provider.gcp"),
+    ("GrpcSignerArgs", "grpc_signer"),
+    ("KeymanagerArgs", "keymanager"),
+    ("KeysArgs", "keys"),
+    ("LogfileArgs", "logfile"),
+    ("LoggingArgs", "logging"),
+    ("MonitoringArgs", "monitoring"),
+    ("NetworkArgs", "network"),
+    ("ProposerArgs", "proposer"),
+    ("ProposerConfigArgs", "proposer_config"),
+    ("SafetyArgs", "safety"),
+    ("SecretProviderArgs", "secret_provider"),
+    ("ServerArgs", "server"),
+    ("SlashingArgs", "slashing"),
+    ("TracingArgs", "tracing"),
 ];
 
-// ---------------------------------------------------------------------------
-// Shrinking-only tables (reason string required per entry)
-// ---------------------------------------------------------------------------
+/// Flags with no Config / TOML field (VD-4.8). Sorted by name.
+///
+/// Documented here because the clause-(ii) bypass table was deleted in ARCH-4k.
+/// Each name must still have a second-leg read in `bin/rvc/src/cli.rs`.
+const CLI_ONLY_ARGS: &[&str] =
+    &["enable_log_reload", "log_format", "strict_permissions", "strict_slashing_semantics"];
 
-/// Group-struct fields that deliberately never reach `Config`: they are read
-/// straight off `StartArgs` at `cli.rs` into run/logging options.
-///
-/// **Shrinking-only.** ARCH-4j removed the four BN timeouts (8 → 4). Entries
-/// may be **removed**, never **added**. Adding one hides a real drift.
-///
-/// Tuple: `(struct_name, field_name, reason)`.
-const BYPASS: &[(&str, &str, &str)] = &[
-    ("LoggingArgs", "enable_log_reload", "run/logging init only (cli.rs); no Config field"),
-    ("LoggingArgs", "log_format", "telemetry::LogFormat::resolve only (cli.rs); no Config field"),
-    ("SlashingArgs", "strict_permissions", "run options only (cli.rs); no Config field"),
-    ("SlashingArgs", "strict_slashing_semantics", "run options only (cli.rs); no Config field"),
+/// clap fields that are not operator knobs: CLI-only args plus the `--no-keymanager`
+/// half of the 2:1 collapse into `keymanager.enabled`.
+const NOT_A_KNOB: &[&str] = &[
+    "enable_log_reload",
+    "log_format",
+    "no_keymanager",
+    "strict_permissions",
+    "strict_slashing_semantics",
 ];
 
-/// Group fields whose `CliOverrides` name differs from the clap field name.
+/// Clause (iv) / ADR-009. Emptied by ARCH-6b; must remain empty.
 ///
-/// Two opposite shapes (F13):
-/// - 1:1 negated rename: `no_doppelganger_detection` → `doppelganger_detection`
-/// - 2:1 collapse: `no_keymanager` + `keymanager_enabled` → `keymanager_enabled` (the sole −1 in
-///   `74 − 4 − 1 = 69`)
-///
-/// Tuple: `(struct_name, field_name, override_field, reason)`.
-const ALIASES: &[(&str, &str, &str, &str)] = &[
-    (
-        "KeymanagerArgs",
-        "no_keymanager",
-        "keymanager_enabled",
-        "2:1 collapse with keymanager_enabled (cli.rs From impl); sole −1 in 74−4−1=69",
-    ),
-    (
-        "SafetyArgs",
-        "no_doppelganger_detection",
-        "doppelganger_detection",
-        "1:1 negated rename: flag sets doppelganger_detection=Some(false) (cli.rs From impl)",
-    ),
-];
-
-/// Clause (iv) / ADR-009 / F9: `CliOverrides` fields populated with unconditional
-/// `Some(<binding>.<field>)` from a non-`Option` clap field that carries `default_value` /
-/// `default_value_t`. Clap's default then clobbers a TOML value when the flag is absent.
-///
-/// **Shrinking-only.** Emptied by ARCH-6b (nine clap fields → `Option<T>` without defaults).
-/// A new instance is a live defect and fails the gate. The synthetic RED in
-/// `clap_default_clobber_detector_flags_a_tenth_instance` keeps an empty list falsifiable.
-///
-/// Tuple: `(cli_overrides_field, reason)`. Sorted by field name.
+/// Tuple: `(field, reason)`. Sorted by field name.
 const CLAP_DEFAULT_CLOBBERS: &[(&str, &str)] = &[];
 
-/// Clause (iii): `CliOverrides` fields whose names do **not** appear (identifier-bounded) in
-/// `Config::validate`'s body. Most knobs legitimately have nothing to check at startup.
+/// Clause (iii): section-struct field paths whose names do **not** appear
+/// (identifier-bounded) in `Config::validate`'s body.
 ///
-/// **Shrinking-only.** Entries may be **removed** (by adding a field-name check to `validate`),
-/// never **added** without acknowledging a new unvalidated knob. A new `CliOverrides` field that
-/// is neither mentioned in `validate` nor listed here fails the gate.
+/// **Shrinking-only.** Entries may be **removed** (by adding a check to
+/// `validate`), never **added** without acknowledging a new unvalidated knob.
+/// A new section field that is neither mentioned in `validate` nor listed here
+/// fails the gate.
 ///
-/// Tuple: `(cli_overrides_field, reason)`. Sorted by field name.
+/// Tuple: `(section.path, reason)`. Sorted by path.
 const UNVALIDATED: &[(&str, &str)] = &[
-    ("allow_unsupported_fork", "no field-name check in Config::validate"),
-    ("beacon_max_body_bytes", "no field-name check in Config::validate"),
-    ("block_selection_mode", "no field-name check in Config::validate"),
-    ("builder_circuit_breaker_consecutive_limit", "no field-name check in Config::validate"),
-    ("builder_circuit_breaker_epoch_limit", "no field-name check in Config::validate"),
-    ("disable_attesting", "no field-name check in Config::validate"),
-    ("disable_keystore_locking", "no field-name check in Config::validate"),
-    ("doppelganger_detection", "no field-name check in Config::validate"),
-    ("gcp_secret_prefix", "no field-name check in Config::validate"),
-    ("genesis_time", "checked via effective_genesis_time(); name not in validate body"),
+    ("beacon.max_body_bytes", "no field-name check in Config::validate"),
+    ("builder.block_selection_mode", "no field-name check in Config::validate"),
+    ("builder.validator_registration_batch_delay", "no field-name check in Config::validate"),
+    ("builder.validator_registration_batch_size", "no field-name check in Config::validate"),
+    ("builder_limits.circuit_breaker_consecutive_limit", "no field-name check in Config::validate"),
+    ("builder_limits.circuit_breaker_epoch_limit", "no field-name check in Config::validate"),
+    ("grpc_signer.tls_ca_cert", "no field-name check in Config::validate"),
+    ("grpc_signer.tls_cert", "no field-name check in Config::validate"),
+    ("grpc_signer.tls_key", "no field-name check in Config::validate"),
+    ("grpc_signer.url", "no field-name check in Config::validate"),
+    ("keymanager.address", "no field-name check in Config::validate"),
+    ("keymanager.body_limit", "no field-name check in Config::validate"),
+    ("keymanager.cors_origins", "no field-name check in Config::validate"),
+    ("keymanager.enabled", "no field-name check in Config::validate"),
+    ("keymanager.remote_signer_allowed_hosts", "no field-name check in Config::validate"),
+    ("keymanager.remote_signer_url", "no field-name check in Config::validate"),
+    ("keymanager.token_file", "no field-name check in Config::validate"),
+    ("keys.disable_keystore_locking", "no field-name check in Config::validate"),
+    ("keys.key_decrypt_threads", "no field-name check in Config::validate"),
+    ("keys.keystore_path", "no field-name check in Config::validate"),
+    ("keys.password_file", "no field-name check in Config::validate"),
+    ("keys.validators_config", "no field-name check in Config::validate"),
+    ("logfile.compress", "no field-name check in Config::validate"),
+    ("logfile.level", "no field-name check in Config::validate"),
+    ("logfile.max_number", "no field-name check in Config::validate"),
+    ("logfile.max_size", "no field-name check in Config::validate"),
+    ("logfile.path", "no field-name check in Config::validate"),
+    ("logging.log_level", "no field-name check in Config::validate"),
+    ("monitoring.endpoint", "no field-name check in Config::validate"),
+    ("monitoring.endpoint_insecure", "no field-name check in Config::validate"),
+    ("monitoring.interval", "no field-name check in Config::validate"),
+    ("network.genesis_time", "checked via effective_genesis_time(); name not in validate body"),
     (
-        "genesis_validators_root",
+        "network.genesis_validators_root",
         "checked via effective_genesis_validators_root(); name not in validate body",
     ),
-    ("grpc_address", "no field-name check in Config::validate"),
-    ("grpc_signer_tls_ca_cert", "no field-name check in Config::validate"),
-    ("grpc_signer_tls_cert", "no field-name check in Config::validate"),
-    ("grpc_signer_tls_key", "no field-name check in Config::validate"),
-    ("grpc_signer_url", "no field-name check in Config::validate"),
-    ("init_slashing_db", "no field-name check in Config::validate"),
-    ("key_decrypt_threads", "no field-name check in Config::validate"),
-    ("keymanager_address", "no field-name check in Config::validate"),
-    ("keymanager_body_limit", "no field-name check in Config::validate"),
-    ("keymanager_cors_origins", "no field-name check in Config::validate"),
-    ("keymanager_enabled", "no field-name check in Config::validate"),
-    ("keymanager_token_file", "no field-name check in Config::validate"),
-    ("keystore_path", "no field-name check in Config::validate"),
-    ("log_level", "no field-name check in Config::validate"),
-    ("logfile", "no field-name check in Config::validate"),
-    ("logfile_compress", "no field-name check in Config::validate"),
-    ("logfile_level", "no field-name check in Config::validate"),
-    ("logfile_max_number", "no field-name check in Config::validate"),
-    ("logfile_max_size", "no field-name check in Config::validate"),
-    ("metrics_address", "no field-name check in Config::validate"),
-    ("monitoring_endpoint", "no field-name check in Config::validate"),
-    ("monitoring_endpoint_insecure", "no field-name check in Config::validate"),
-    ("monitoring_interval", "no field-name check in Config::validate"),
-    ("network", "no field-name check in Config::validate"),
-    ("password_file", "no field-name check in Config::validate"),
-    ("proposer_config_refresh_interval", "no field-name check in Config::validate"),
-    ("proposer_config_url_insecure", "no field-name check in Config::validate"),
-    ("proposer_config_url_token", "no field-name check in Config::validate"),
-    ("remote_signer_allowed_hosts", "no field-name check in Config::validate"),
-    ("remote_signer_url", "no field-name check in Config::validate"),
-    ("secret_provider_strict", "no field-name check in Config::validate"),
-    ("secret_refresh_interval", "no field-name check in Config::validate"),
-    ("slashed_validators_action", "no field-name check in Config::validate"),
-    ("slashing_db_path", "no field-name check in Config::validate"),
-    ("tracing_endpoint", "no field-name check in Config::validate"),
-    ("tracing_exporter", "no field-name check in Config::validate"),
-    ("tracing_max_export_batch_size", "no field-name check in Config::validate"),
-    ("tracing_max_queue_size", "no field-name check in Config::validate"),
-    ("tracing_sample_rate", "no field-name check in Config::validate"),
-    ("validator_registration_batch_delay", "no field-name check in Config::validate"),
-    ("validator_registration_batch_size", "no field-name check in Config::validate"),
-    ("validators_config", "no field-name check in Config::validate"),
+    ("network.network", "no field-name check in Config::validate"),
+    ("proposer_config.refresh_interval", "no field-name check in Config::validate"),
+    ("proposer_config.url_insecure", "no field-name check in Config::validate"),
+    ("proposer_config.url_token", "no field-name check in Config::validate"),
+    ("safety.allow_unsupported_fork", "no field-name check in Config::validate"),
+    ("safety.disable_attesting", "no field-name check in Config::validate"),
+    ("safety.doppelganger_detection", "no field-name check in Config::validate"),
+    ("safety.slashed_validators_action", "no field-name check in Config::validate"),
+    ("secret_provider.gcp.secret_prefix", "no field-name check in Config::validate"),
+    ("secret_provider.refresh_interval", "no field-name check in Config::validate"),
+    ("secret_provider.strict", "no field-name check in Config::validate"),
+    ("server.grpc_address", "no field-name check in Config::validate"),
+    ("server.metrics_address", "no field-name check in Config::validate"),
+    ("slashing.init_slashing_db", "no field-name check in Config::validate"),
+    ("slashing.slashing_db_path", "no field-name check in Config::validate"),
+    ("tracing.endpoint", "no field-name check in Config::validate"),
+    ("tracing.exporter", "no field-name check in Config::validate"),
+    ("tracing.max_export_batch_size", "no field-name check in Config::validate"),
+    ("tracing.max_queue_size", "no field-name check in Config::validate"),
+    ("tracing.sample_rate", "no field-name check in Config::validate"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -216,23 +184,54 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
 }
 
-/// `cli.rs` plus ARCH-4f section files so seam-α can see moved group structs.
-fn group_args_source(root: &Path) -> String {
-    let mut src = std::fs::read_to_string(root.join(START_RS))
-        .expect("crates/rvc/src/config/start.rs must exist");
-    for rel in MIGRATED_GROUP_SRCS {
-        let extra = std::fs::read_to_string(root.join(rel))
-            .unwrap_or_else(|e| panic!("{rel} must exist after ARCH-4f: {e}"));
+fn rvc_config_sections_source(root: &Path) -> String {
+    let dir = root.join(SECTIONS_DIR);
+    let mut src = String::new();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{SECTIONS_DIR} must exist: {e}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    files.sort();
+    for path in files {
+        src.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read {}: {e}", path.display());
+        }));
         src.push('\n');
-        src.push_str(&extra);
     }
     src
 }
 
-/// Normalize whitespace for field-access matching:
-/// - collapse whitespace around `.` so `builder\n    .field` → `builder.field`
-/// - replace other whitespace runs with a single space so adjacent identifiers across
-///   newlines do **not** fuse (`a.b\nc.d` → `a.b c.d`, not `a.bc.d`)
+fn operator_knob_names(src: &str) -> Vec<String> {
+    let marker = "pub const OPERATOR_KNOB_NAMES";
+    let start = src.find(marker).expect("OPERATOR_KNOB_NAMES must exist");
+    let rest = &src[start..];
+    let open = rest.find('[').expect("OPERATOR_KNOB_NAMES array");
+    let close = rest.find("];").expect("OPERATOR_KNOB_NAMES terminator");
+    rest[open + 1..close]
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim().trim_end_matches(',');
+            t.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+        })
+        .collect()
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_option_type(ty: &str) -> bool {
+    let t = ty.trim();
+    t.starts_with("Option<") || t.starts_with("Option <")
+}
+
+/// Collapse whitespace around `.` so `foo\n    .bar` → `foo.bar`.
 fn compact_ws(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(chars.len());
@@ -245,11 +244,8 @@ fn compact_ws(s: &str) -> String {
             }
             let prev_is_dot = out.ends_with('.');
             let next_is_dot = j < chars.len() && chars[j] == '.';
-            if !(prev_is_dot || next_is_dot) {
-                // Token separator — prevents `no_keymanager` + `keymanager` from fusing.
-                if !out.is_empty() && !out.ends_with(' ') {
-                    out.push(' ');
-                }
+            if !(prev_is_dot || next_is_dot) && !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
             }
             i = j;
             continue;
@@ -260,71 +256,7 @@ fn compact_ws(s: &str) -> String {
     out
 }
 
-fn is_ident_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Strip `//` line comments and `/* … */` block comments; leave string literals intact so
-/// `://` inside URLs is not treated as a line comment. String content is replaced with spaces
-/// of equal length so comment-only and string-only mentions cannot satisfy field-access needles.
-fn strip_comments_and_strings(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        // String literal: blank it out (preserve length for simpler debugging; not required).
-        if c == b'"' {
-            out.push(b' ');
-            i += 1;
-            while i < bytes.len() {
-                let ch = bytes[i];
-                out.push(b' ');
-                i += 1;
-                if ch == b'\\' && i < bytes.len() {
-                    out.push(b' ');
-                    i += 1;
-                    continue;
-                }
-                if ch == b'"' {
-                    break;
-                }
-            }
-            continue;
-        }
-        // Line comment
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out.push(b' ');
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            out.push(b' ');
-            out.push(b' ');
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
-                i += 1;
-            }
-            if i + 1 < bytes.len() {
-                out.push(b' ');
-                out.push(b' ');
-                i += 2;
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_default()
-}
-
-/// True if `compact` contains an identifier-bounded `{binding}.{field}` access.
-///
-/// Rejects prefix collisions: `logging.logfile_max_size` does **not** satisfy `logging.logfile`.
+/// Identifier-bounded `{binding}.{field}` (rejects `logfile` satisfied by `logfile_max_size`).
 fn has_field_access(compact: &str, binding: &str, field: &str) -> bool {
     let needle = format!("{binding}.{field}");
     let n_bytes = needle.as_bytes();
@@ -346,9 +278,83 @@ fn has_field_access(compact: &str, binding: &str, field: &str) -> bool {
     false
 }
 
-/// Compacted, comment-/string-stripped scan text for field-access matching.
+/// Strip `//` line comments and `/* … */` block comments; blank string literals
+/// so comment-only / string-only mentions cannot satisfy a presence scan.
+fn strip_comments_and_strings(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            out.push(b' ');
+            i += 1;
+            while i < bytes.len() {
+                let ch = bytes[i];
+                out.push(b' ');
+                i += 1;
+                if ch == b'\\' && i < bytes.len() {
+                    out.push(b' ');
+                    i += 1;
+                    continue;
+                }
+                if ch == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push(b' ');
+            out.push(b' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
 fn scan_text(src: &str) -> String {
     compact_ws(&strip_comments_and_strings(src))
+}
+
+/// Identifier-bounded presence of `name` in `text`.
+fn has_ident(text: &str, name: &str) -> bool {
+    let n_bytes = name.as_bytes();
+    let hay = text.as_bytes();
+    let mut from = 0;
+    while from + n_bytes.len() <= hay.len() {
+        let Some(rel) = text[from..].find(name) else {
+            return false;
+        };
+        let at = from + rel;
+        let after = at + n_bytes.len();
+        let before_ok = at == 0 || !is_ident_char(hay[at - 1]);
+        let after_ok = after >= hay.len() || !is_ident_char(hay[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +368,6 @@ fn struct_body<'a>(src: &'a str, struct_name: &str) -> Option<&'a str> {
     loop {
         let rel = src[from..].find(&needle)?;
         let at = from + rel;
-        // Require word boundary before `struct` (avoid matching inside comments/identifiers).
         if at > 0 {
             let b = src.as_bytes()[at - 1];
             if b.is_ascii_alphanumeric() || b == b'_' {
@@ -375,11 +380,8 @@ fn struct_body<'a>(src: &'a str, struct_name: &str) -> Option<&'a str> {
             from = at + needle.len();
             continue;
         };
-        // Reject `struct Foo;` / generics-before-brace mismatches: allow only whitespace between
-        // name and `{` (no other struct name).
         let between = after[..brace_rel].trim();
         if !between.is_empty() {
-            // e.g. `struct Foo<T>` — not present at HEAD for Args groups; skip.
             from = at + needle.len();
             continue;
         }
@@ -401,37 +403,73 @@ fn struct_body<'a>(src: &'a str, struct_name: &str) -> Option<&'a str> {
     }
 }
 
+fn struct_names(src: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find("struct ") {
+        let at = from + rel;
+        if at > 0 {
+            let b = src.as_bytes()[at - 1];
+            if is_ident_char(b) {
+                from = at + 7;
+                continue;
+            }
+        }
+        let after = src[at + 7..].trim_start();
+        if after.is_empty() || !is_ident_start(after.as_bytes()[0]) {
+            from = at + 7;
+            continue;
+        }
+        let name: String =
+            after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+        from = at + 7;
+    }
+    names
+}
+
 /// Field identifiers declared directly inside `pub struct Name { … }`.
-///
-/// Skips doc comments, attributes, and nested braces (depth tracking).
 fn struct_fields(src: &str, struct_name: &str) -> Vec<String> {
+    fields_with_attrs(src, struct_name).into_iter().map(|(name, _, _)| name).collect()
+}
+
+/// `(field, joined_attrs, type)` for each `pub field: Type` in `struct_name`.
+///
+/// Skips `#[command(flatten)]` nestings. Accumulates multi-line attributes.
+fn fields_with_attrs(src: &str, struct_name: &str) -> Vec<(String, String, String)> {
     let Some(body) = struct_body(src, struct_name) else {
         return Vec::new();
     };
-    let mut fields = Vec::new();
-    let mut depth = 0i32;
+    let mut out = Vec::new();
+    let mut pending_attrs = String::new();
+    let mut attr_depth = 0i32;
     for line in body.lines() {
         let t = line.trim();
-        // Track nested braces on the line (field types rarely nest; keep honest).
-        for ch in t.chars() {
-            match ch {
-                '{' | '(' | '[' => depth += 1,
-                '}' | ')' | ']' => depth -= 1,
-                _ => {}
+        if t.starts_with("#[") || attr_depth > 0 {
+            pending_attrs.push_str(t);
+            pending_attrs.push(' ');
+            for ch in t.chars() {
+                match ch {
+                    '[' | '(' => attr_depth += 1,
+                    ']' | ')' => attr_depth = attr_depth.saturating_sub(1),
+                    _ => {}
+                }
             }
-        }
-        if depth != 0 {
             continue;
         }
-        if t.is_empty() || t.starts_with("//") || t.starts_with("///") || t.starts_with("#[") {
+        if t.is_empty() || t.starts_with("//") || t.starts_with("///") {
             continue;
         }
-        // `pub field: Type` / `pub field: Type,`
+        let attrs = std::mem::take(&mut pending_attrs);
+        if attrs.contains("command(flatten)") {
+            continue;
+        }
         let mut rest = t;
         if let Some(r) = rest.strip_prefix("pub") {
             rest = r.trim_start();
             if let Some(r) = rest.strip_prefix('(') {
-                // pub(crate) etc.
                 let Some(close) = r.find(')') else {
                     continue;
                 };
@@ -445,115 +483,169 @@ fn struct_fields(src: &str, struct_name: &str) -> Vec<String> {
         if name.is_empty() {
             continue;
         }
-        // Must be followed by `:` after optional whitespace (not a method).
         let after_name = rest[name.len()..].trim_start();
-        if after_name.starts_with(':') {
-            fields.push(name);
+        if !after_name.starts_with(':') {
+            continue;
+        }
+        let ty = after_name[1..].trim().trim_end_matches(',').trim().to_string();
+        out.push((name, attrs, ty));
+    }
+    out
+}
+
+fn clap_id_from_attrs(attrs: &str) -> Option<String> {
+    for key in ["id = \"", "long = \""] {
+        if let Some(start) = attrs.find(key) {
+            let rest = &attrs[start + key.len()..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].replace('-', "_"));
+            }
         }
     }
+    None
+}
+
+fn knob_name(field: &str, attrs: &str) -> String {
+    if field == "no_doppelganger_detection" {
+        return "doppelganger_detection".to_string();
+    }
+    clap_id_from_attrs(attrs).unwrap_or_else(|| field.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Clause (iv) — structural default_value + non-Option scan
+// ---------------------------------------------------------------------------
+
+/// clap fields whose type is not `Option<_>` and whose attrs mention `default_value`.
+fn defaulted_non_option_fields(src: &str) -> Vec<(String, String)> {
+    defaulted_non_option_fields_with_attrs(src)
+        .into_iter()
+        .map(|f| (f.struct_name, f.field))
+        .collect()
+}
+
+struct DefaultedField {
+    struct_name: String,
+    field: String,
+    attrs: String,
+    ty: String,
+}
+
+fn defaulted_non_option_fields_with_attrs(src: &str) -> Vec<DefaultedField> {
+    let mut out = Vec::new();
+    for st in struct_names(src) {
+        for (field, attrs, ty) in fields_with_attrs(src, &st) {
+            if is_option_type(&ty) {
+                continue;
+            }
+            if attrs.contains("default_value") {
+                out.push(DefaultedField { struct_name: st.clone(), field, attrs, ty });
+            }
+        }
+    }
+    out
+}
+
+/// Exact `serde(skip)` / `serde(skip, …)` — not `serde(skip_serializing_if)`.
+fn has_exact_serde_skip(attrs: &str) -> bool {
+    let bytes = attrs.as_bytes();
+    let mut from = 0;
+    while from + 10 <= bytes.len() {
+        let Some(rel) = attrs[from..].find("serde(skip") else {
+            return false;
+        };
+        let at = from + rel;
+        let after_skip = at + "serde(skip".len();
+        if after_skip >= bytes.len() {
+            return false;
+        }
+        let next = bytes[after_skip];
+        // `serde(skip)` or `serde(skip,` or `serde(skip )` — reject `skip_serializing_if`.
+        if next == b')' || next == b',' || next.is_ascii_whitespace() {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// Present-only polarity bool: `bool` + `default_value_t` + exact `#[serde(skip)]`.
+/// These cannot clobber TOML (`apply_cli` only applies when the flag is true).
+fn is_present_only_skipped_bool(attrs: &str, ty: &str) -> bool {
+    ty.trim() == "bool" && attrs.contains("default_value") && has_exact_serde_skip(attrs)
+}
+
+/// Section-facing clap fields: excludes only present-only skipped bools.
+/// A valued `default_value` + non-`Option` still flags, even with
+/// `serde(skip_serializing_if)` or `#[serde(skip)]`.
+fn defaulted_non_option_section_fields(src: &str) -> Vec<(String, String)> {
+    defaulted_non_option_fields_with_attrs(src)
+        .into_iter()
+        .filter(|f| !is_present_only_skipped_bool(&f.attrs, &f.ty))
+        .map(|f| (f.struct_name, f.field))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Clause (iii) — section-struct field paths
+// ---------------------------------------------------------------------------
+
+struct SectionField {
+    path: String,
+    knob: String,
+}
+
+fn collect_section_fields_from(src: &str) -> Vec<SectionField> {
+    let skip: HashSet<&str> = NOT_A_KNOB.iter().copied().collect();
+    let mut fields = Vec::new();
+    for (st, prefix) in SECTION_GROUPS {
+        for (field, attrs, _) in fields_with_attrs(src, st) {
+            let knob = knob_name(&field, &attrs);
+            if skip.contains(knob.as_str()) || skip.contains(field.as_str()) {
+                continue;
+            }
+            let path_field = if field == "no_doppelganger_detection" {
+                "doppelganger_detection".to_string()
+            } else {
+                field
+            };
+            fields.push(SectionField { path: format!("{prefix}.{path_field}"), knob });
+        }
+    }
+    fields.sort_by(|a, b| a.path.cmp(&b.path));
     fields
 }
 
-/// True when `field` on `struct_name` is a `#[command(flatten)]` nested group.
-fn field_is_command_flatten(src: &str, struct_name: &str, field: &str) -> bool {
-    field_attrs_and_type(src, struct_name, field)
-        .map(|(attrs, _)| attrs.contains("command(flatten)"))
-        .unwrap_or(false)
+fn collect_section_fields(root: &Path) -> Vec<SectionField> {
+    let mut src = rvc_config_sections_source(root);
+    src.push_str(
+        &std::fs::read_to_string(root.join(START_RS)).expect("crates/rvc/src/config/start.rs"),
+    );
+    collect_section_fields_from(&src)
 }
 
-/// Leaf clap fields of `struct_name` (excludes `#[command(flatten)]` nestings).
-fn leaf_struct_fields(src: &str, struct_name: &str) -> Vec<String> {
-    struct_fields(src, struct_name)
-        .into_iter()
-        .filter(|f| !field_is_command_flatten(src, struct_name, f))
-        .collect()
+fn collect_section_field_paths(root: &Path) -> Vec<String> {
+    collect_section_fields(root).into_iter().map(|f| f.path).collect()
 }
 
-/// `#[command(flatten)] pub name: Type` pairs declared on `struct_name`.
-fn nested_flatten_fields(src: &str, struct_name: &str) -> Vec<(String, String)> {
-    struct_fields(src, struct_name)
-        .into_iter()
-        .filter(|f| field_is_command_flatten(src, struct_name, f))
-        .filter_map(|f| {
-            let (_, ty) = field_attrs_and_type(src, struct_name, &f)?;
-            let ty_name: String =
-                ty.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-            if ty_name.is_empty() {
-                None
-            } else {
-                Some((f, ty_name))
-            }
-        })
-        .collect()
-}
-
-/// StartArgs flatten bindings plus nested `#[command(flatten)]` groups (ARCH-4g).
-///
-/// StartArgs still has 13 groups. Nested flatten (`KeysArgs.secret_provider`,
-/// `LoggingArgs.logfile`, …) is expanded so seam α can see the inner fields
-/// without counting a 14th StartArgs binding.
-fn expand_flatten_bindings(
-    src: &str,
-    start: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut all = start.clone();
-    let mut queue: Vec<String> = start.values().cloned().collect();
-    let mut seen = HashSet::new();
-    while let Some(ty) = queue.pop() {
-        if !seen.insert(ty.clone()) {
-            continue;
-        }
-        for (field, inner_ty) in nested_flatten_fields(src, &ty) {
-            all.entry(field).or_insert_with(|| inner_ty.clone());
-            queue.push(inner_ty);
+/// Every clap leaf (including CLI-only and polarity flags), as `(section_prefix, rust_field)`.
+fn collect_clap_leaves_from(src: &str) -> Vec<(String, String)> {
+    let mut leaves = Vec::new();
+    for (st, prefix) in SECTION_GROUPS {
+        for (field, _, _) in fields_with_attrs(src, st) {
+            leaves.push(((*prefix).to_string(), field));
         }
     }
-    all
+    leaves.sort();
+    leaves
 }
 
-/// `StartArgs`' `#[command(flatten)] pub <binding>: <XArgs>,` lines → binding → type.
-fn flatten_bindings(src: &str) -> BTreeMap<String, String> {
-    let Some(body) = struct_body(src, "StartArgs") else {
-        return BTreeMap::new();
-    };
-    let mut out = BTreeMap::new();
-    let lines: Vec<&str> = body.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let t = lines[i].trim();
-        if t.starts_with("#[command(flatten)]") || t.starts_with("#[command(flatten,") {
-            // Next non-empty / non-attr / non-comment line is the field.
-            i += 1;
-            while i < lines.len() {
-                let l = lines[i].trim();
-                if l.is_empty() || l.starts_with("//") || l.starts_with("#[") {
-                    i += 1;
-                    continue;
-                }
-                // `pub binding: Type,`
-                let mut rest = l;
-                if let Some(r) = rest.strip_prefix("pub") {
-                    rest = r.trim_start();
-                }
-                let binding: String =
-                    rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-                let after = rest[binding.len()..].trim_start();
-                if let Some(after_colon) = after.strip_prefix(':') {
-                    let ty: String = after_colon
-                        .trim_start()
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    if !binding.is_empty() && !ty.is_empty() {
-                        out.insert(binding, ty);
-                    }
-                }
-                break;
-            }
-        }
-        i += 1;
-    }
-    out
+fn group_args_source(root: &Path) -> String {
+    let mut src = rvc_config_sections_source(root);
+    src.push_str(
+        &std::fs::read_to_string(root.join(START_RS)).expect("crates/rvc/src/config/start.rs"),
+    );
+    src
 }
 
 /// Body of `fn apply_cli(&mut self, cli: &StartArgs) { … }`.
@@ -593,272 +685,31 @@ fn apply_cli_body(src: &str) -> String {
     String::new()
 }
 
-// ---------------------------------------------------------------------------
-// Seam-α detector (pure — synthetic tests feed crafted inputs)
-// ---------------------------------------------------------------------------
-
-/// Return unread group fields: each `(struct, field)` must appear as an identifier-bounded
-/// `{binding}.{field}` in the From-impl body (comment-/string-stripped, whitespace-insensitive)
-/// unless listed in `bypass`.
-///
-/// `ALIASES` sources are **not** skipped: the From impl still reads them under the clap field name
-/// (`safety.no_doppelganger_detection`, `keymanager.no_keymanager`). The table documents the
-/// override rename / 2:1 collapse for arithmetic and reviewers; dropping a read is still a
-/// violation.
-///
-/// Presence-only: any non-comment occurrence of the access counts (including `let _ = …`).
-///
-/// `bindings`: binding name → struct type.
-/// `fields_by_type`: struct type → field names.
-/// `bypass`: `(struct_type, field_name)` set of intentional non-`CliOverrides` routes.
-fn seam_alpha_unread(
-    bindings: &BTreeMap<String, String>,
-    fields_by_type: &BTreeMap<String, Vec<String>>,
-    from_body: &str,
-    bypass: &HashSet<(&str, &str)>,
-) -> (usize, Vec<String>) {
-    let compact = scan_text(from_body);
+/// Unread clap leaves: each `{prefix}.{field}` must appear in `apply_cli` unless
+/// the rust field name is on `cli_only`.
+fn apply_cli_unread(
+    leaves: &[(String, String)],
+    apply_body: &str,
+    cli_only: &HashSet<&str>,
+) -> Vec<String> {
+    let compact = scan_text(apply_body);
     let mut violations = Vec::new();
-    let mut checked = 0usize;
-
-    for (binding, ty) in bindings {
-        let Some(fields) = fields_by_type.get(ty) else {
-            violations.push(format!(
-                "binding `{binding}: {ty}` has no extracted fields (struct parse failed?)"
-            ));
+    for (prefix, field) in leaves {
+        if cli_only.contains(field.as_str()) {
             continue;
-        };
-        for field in fields {
-            checked += 1;
-            if bypass.contains(&(ty.as_str(), field.as_str())) {
-                continue;
-            }
-            if !has_field_access(&compact, binding, field) {
-                violations.push(format!(
-                    "{ty}::{field} (--{}) is declared as a clap arg but never read by \
-                     `Config::apply_cli`; it is accepted on the command line \
-                     and silently ignored. Overlay it in `apply_cli`, or add it to BYPASS \
-                     with a reason string (ALIASES only renames — the source field must still be \
-                     read as `<binding>.<field>`).",
-                    field.replace('_', "-")
-                ));
-            }
+        }
+        if !has_field_access(&compact, prefix, field) {
+            violations.push(format!(
+                "{prefix}.{field} is a clap leaf but is never read by `Config::apply_cli`; \
+                 overlay it, or add the rust field name to CLI_ONLY_ARGS if it has no Config field"
+            ));
         }
     }
     violations.sort();
-    (checked, violations)
+    violations
 }
 
-fn bypass_set() -> HashSet<(&'static str, &'static str)> {
-    BYPASS.iter().map(|&(ty, field, _)| (ty, field)).collect()
-}
-
-fn aliases_set() -> HashSet<(&'static str, &'static str)> {
-    ALIASES.iter().map(|&(ty, field, _, _)| (ty, field)).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Clause (iv) — clap default clobber detector
-// ---------------------------------------------------------------------------
-
-/// Unconditional `field: Some(binding.source)` rows in a From-impl / struct-literal body.
-///
-/// Returns `(override_field, binding, source_field)`. Whitespace-tolerant; ignores comments
-/// and string literals via [`scan_text`].
-fn find_some_binding_wrappers(from_body: &str) -> Vec<(String, String, String)> {
-    let compact = scan_text(from_body);
-    let bytes = compact.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Identify a potential field name start.
-        if !is_ident_start(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let name_start = i;
-        i += 1;
-        while i < bytes.len() && is_ident_char(bytes[i]) {
-            i += 1;
-        }
-        let field = &compact[name_start..i];
-        // Skip whitespace already collapsed to single spaces.
-        let mut j = i;
-        if j < bytes.len() && bytes[j] == b' ' {
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != b':' {
-            continue;
-        }
-        j += 1;
-        if j < bytes.len() && bytes[j] == b' ' {
-            j += 1;
-        }
-        // Some(
-        if j + 5 > bytes.len() || &compact[j..j + 5] != "Some(" {
-            continue;
-        }
-        j += 5;
-        if j < bytes.len() && bytes[j] == b' ' {
-            j += 1;
-        }
-        if j >= bytes.len() || !is_ident_start(bytes[j]) {
-            continue;
-        }
-        let bind_start = j;
-        j += 1;
-        while j < bytes.len() && is_ident_char(bytes[j]) {
-            j += 1;
-        }
-        let binding = &compact[bind_start..j];
-        if j >= bytes.len() || bytes[j] != b'.' {
-            continue;
-        }
-        j += 1;
-        if j >= bytes.len() || !is_ident_start(bytes[j]) {
-            continue;
-        }
-        let src_start = j;
-        j += 1;
-        while j < bytes.len() && is_ident_char(bytes[j]) {
-            j += 1;
-        }
-        let source = &compact[src_start..j];
-        if j < bytes.len() && bytes[j] == b' ' {
-            j += 1;
-        }
-        if j >= bytes.len() || bytes[j] != b')' {
-            continue;
-        }
-        // Only count when override field name equals the clap source field (the F9 shape).
-        if field == source {
-            out.push((field.to_string(), binding.to_string(), source.to_string()));
-        }
-        i = j;
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-
-/// Attributes text (joined) and type text for `pub field: Type` inside `struct_name`, if found.
-fn field_attrs_and_type(src: &str, struct_name: &str, field: &str) -> Option<(String, String)> {
-    let body = struct_body(src, struct_name)?;
-    let lines: Vec<&str> = body.lines().collect();
-    let mut pending_attrs: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    for line in lines {
-        let t = line.trim();
-        for ch in t.chars() {
-            match ch {
-                '{' | '(' | '[' => depth += 1,
-                '}' | ')' | ']' => depth -= 1,
-                _ => {}
-            }
-        }
-        if depth != 0 {
-            continue;
-        }
-        if t.is_empty() {
-            continue;
-        }
-        if t.starts_with("///") || t.starts_with("//") {
-            continue;
-        }
-        if t.starts_with("#[") {
-            pending_attrs.push(t.to_string());
-            continue;
-        }
-        let mut rest = t;
-        if let Some(r) = rest.strip_prefix("pub") {
-            rest = r.trim_start();
-            if let Some(r) = rest.strip_prefix('(') {
-                let close = r.find(')')?;
-                rest = r[close + 1..].trim_start();
-            }
-        } else {
-            pending_attrs.clear();
-            continue;
-        }
-        let name: String =
-            rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-        if name.is_empty() {
-            pending_attrs.clear();
-            continue;
-        }
-        let after_name = rest[name.len()..].trim_start();
-        if !after_name.starts_with(':') {
-            pending_attrs.clear();
-            continue;
-        }
-        let ty = after_name[1..].trim().trim_end_matches(',').trim().to_string();
-        if name == field {
-            return Some((pending_attrs.join(" "), ty));
-        }
-        pending_attrs.clear();
-    }
-    None
-}
-
-/// True when the clap field declaration is non-`Option` and carries `default_value` /
-/// `default_value_t` (the ADR-009 clobber precondition).
-fn clap_field_is_defaulted_non_option(src: &str, struct_name: &str, field: &str) -> bool {
-    let Some((attrs, ty)) = field_attrs_and_type(src, struct_name, field) else {
-        return false;
-    };
-    let is_option = ty.starts_with("Option<") || ty.starts_with("Option <");
-    if is_option {
-        return false;
-    }
-    attrs.contains("default_value")
-}
-
-/// Detect clap-default clobbers in a From-impl body.
-///
-/// A hit is `field: Some(binding.field)` where the clap field on `bindings[binding]` is
-/// non-`Option` with a `default_value`. Returns sorted unique override field names.
-fn detect_clap_default_clobbers(
-    from_body: &str,
-    cli_src: &str,
-    bindings: &BTreeMap<String, String>,
-) -> Vec<String> {
-    let mut hits = Vec::new();
-    for (field, binding, source) in find_some_binding_wrappers(from_body) {
-        if field != source {
-            continue;
-        }
-        let Some(ty) = bindings.get(&binding) else {
-            continue;
-        };
-        if clap_field_is_defaulted_non_option(cli_src, ty, &field) {
-            hits.push(field);
-        }
-    }
-    hits.sort();
-    hits.dedup();
-    hits
-}
-
-/// Clobber field names found by the detector that are **not** on the allow-list (growth).
-fn clobber_growth(found: &[String], allowed: &HashSet<&str>) -> Vec<String> {
-    found.iter().filter(|f| !allowed.contains(f.as_str())).cloned().collect()
-}
-
-/// Allow-list entries not present in the detector output (stale list / source drift).
-fn clobber_stale(found: &[String], allowed: &[&str]) -> Vec<String> {
-    let found_set: HashSet<&str> = found.iter().map(String::as_str).collect();
-    allowed.iter().filter(|f| !found_set.contains(*f)).map(|s| (*s).to_string()).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Clause (iii) — validation coverage
-// ---------------------------------------------------------------------------
-
-/// Body of `pub fn validate(&self) -> Result<(), ConfigError>` (first match in `src`).
+/// Body of `pub fn validate(&self) -> Result<(), ConfigError>` (first match).
 fn config_validate_body(src: &str) -> String {
     let markers = [
         "pub fn validate(&self) -> Result<(), ConfigError>",
@@ -895,45 +746,43 @@ fn config_validate_body(src: &str) -> String {
     String::new()
 }
 
-/// Identifier-bounded presence of `name` in `text` (comments/strings kept — string error
-/// messages and doc comments inside the method body are intentional signals).
-fn has_ident(text: &str, name: &str) -> bool {
-    let n_bytes = name.as_bytes();
-    let hay = text.as_bytes();
-    let mut from = 0;
-    while from + n_bytes.len() <= hay.len() {
-        let Some(rel) = text[from..].find(name) else {
-            return false;
-        };
-        let at = from + rel;
-        let after = at + n_bytes.len();
-        let before_ok = at == 0 || !is_ident_char(hay[at - 1]);
-        let after_ok = after >= hay.len() || !is_ident_char(hay[after]);
-        if before_ok && after_ok {
+fn path_mentioned_in_validate(path: &str, knob: &str, validate: &str) -> bool {
+    if has_ident(validate, knob) {
+        return true;
+    }
+    let compact = compact_ws(validate);
+    let Some((parent, field)) = path.rsplit_once('.') else {
+        return false;
+    };
+    if has_field_access(&compact, parent, field) {
+        return true;
+    }
+    if let Some((_, bind)) = parent.rsplit_once('.') {
+        if has_field_access(&compact, bind, field) {
             return true;
         }
-        from = at + 1;
     }
     false
 }
 
-/// `CliOverrides` fields absent from both the validate body and the unvalidated allow-list.
 fn unvalidated_violations(
-    override_fields: &[String],
+    fields: &[SectionField],
     validate_body: &str,
     unvalidated: &HashSet<&str>,
 ) -> Vec<String> {
     let mut missing = Vec::new();
-    for f in override_fields {
-        if has_ident(validate_body, f) {
+    for f in fields {
+        if path_mentioned_in_validate(&f.path, &f.knob, validate_body) {
             continue;
         }
-        if unvalidated.contains(f.as_str()) {
+        if unvalidated.contains(f.path.as_str()) {
             continue;
         }
         missing.push(format!(
-            "knob `{f}` is neither mentioned in Config::validate nor listed in UNVALIDATED; \
-             add a validation check or a shrinking-only UNVALIDATED entry with a reason"
+            "section field `{}` (knob `{}`) is neither mentioned in Config::validate \
+             nor listed in UNVALIDATED; add a validation check or a shrinking-only \
+             UNVALIDATED entry with a reason",
+            f.path, f.knob
         ));
     }
     missing.sort();
@@ -941,463 +790,209 @@ fn unvalidated_violations(
 }
 
 // ---------------------------------------------------------------------------
-// Live gate (clause ii)
+// Live gate — clause (iii)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_group_arg_field_is_read_by_the_from_impl() {
+fn clause_iii_covers_every_section_field() {
     let root = workspace_root();
-    let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
-    let start = std::fs::read_to_string(root.join(START_RS)).expect("start.rs must exist");
-    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs must exist");
-    let groups = group_args_source(&root);
-
-    let start_bindings = flatten_bindings(&start);
+    let paths = collect_section_field_paths(&root);
     assert_eq!(
-        start_bindings.len(),
-        13,
-        "expected 13 flattened Args groups on StartArgs; scanner or start.rs changed"
-    );
-
-    let body = apply_cli_body(&types);
-    let from_scan = scan_text(&body);
-    assert!(
-        has_field_access(&from_scan, "beacon", "url"),
-        "apply_cli body extraction broke (missing beacon.url)"
-    );
-
-    // Nested flatten (ARCH-4g) is expanded for field accounting; StartArgs stays at 13.
-    let bindings = expand_flatten_bindings(&groups, &start_bindings);
-    let mut fields_by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for ty in bindings.values() {
-        fields_by_type.entry(ty.clone()).or_insert_with(|| leaf_struct_fields(&groups, ty));
-    }
-    // Reverse map: struct type → binding name (for BYPASS second-leg needles).
-    // Prefer the StartArgs binding when a type is both a top-level group and a nest.
-    let ty_to_binding: BTreeMap<&str, &str> =
-        bindings.iter().map(|(b, t)| (t.as_str(), b.as_str())).collect();
-
-    let bypass = bypass_set();
-    let aliases = aliases_set();
-    assert_eq!(bypass.len(), BYPASS.len(), "duplicate BYPASS entries");
-    assert_eq!(aliases.len(), ALIASES.len(), "duplicate ALIASES entries");
-    assert_eq!(BYPASS.len(), 4, "BYPASS must have exactly 4 entries");
-    assert_eq!(ALIASES.len(), 2, "ALIASES must have exactly 2 entries");
-
-    // Table hygiene: every BYPASS/ALIASES source must exist on its group struct.
-    for (ty, field, _reason) in BYPASS {
-        let fs = fields_by_type.get(*ty).map(Vec::as_slice).unwrap_or(&[]);
-        assert!(
-            fs.iter().any(|f| f == field),
-            "BYPASS entry {ty}::{field} not found on group struct"
-        );
-    }
-    for (ty, field, _target, _reason) in ALIASES {
-        let fs = fields_by_type.get(*ty).map(Vec::as_slice).unwrap_or(&[]);
-        assert!(
-            fs.iter().any(|f| f == field),
-            "ALIASES source {ty}::{field} not found on group struct"
-        );
-    }
-
-    // Second-leg: BYPASS fields must still be consumed outside From (run options).
-    // Scan the whole cli.rs (comment-stripped); From does not read these fields, so hits are
-    // the Commands::Start routing path (e.g. args.logging.log_format).
-    let cli_scan = scan_text(&cli);
-    for (ty, field, _reason) in BYPASS {
-        let binding = ty_to_binding
-            .get(ty)
-            .unwrap_or_else(|| panic!("BYPASS type {ty} has no StartArgs flatten binding"));
-        assert!(
-            has_field_access(&cli_scan, binding, field),
-            "BYPASS {ty}::{field} has no second-leg read as `{binding}.{field}` outside/alongside \
-             From (run options routing missing?)"
-        );
-    }
-
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields_by_type, &body, &bypass);
-
-    assert_eq!(checked, 74, "expected 74 group-arg fields at HEAD; got {checked}");
-    assert!(
-        violations.is_empty(),
-        "ARCH-P1-1 / G-2 seam α (clause ii):\n  {}",
-        violations.join("\n  ")
-    );
-}
-
-#[test]
-fn bypass_and_aliases_are_sorted_and_unique() {
-    let mut seen_b = HashSet::new();
-    let mut prev_b: Option<(&str, &str)> = None;
-    for &(ty, field, reason) in BYPASS {
-        assert!(!reason.trim().is_empty(), "BYPASS ({ty}, {field}) missing reason");
-        assert!(seen_b.insert((ty, field)), "duplicate BYPASS: {ty}::{field}");
-        if let Some(p) = prev_b {
-            assert!(
-                p < (ty, field),
-                "BYPASS must stay sorted by (struct, field); {:?} precedes {ty}::{field}",
-                p
-            );
-        }
-        prev_b = Some((ty, field));
-    }
-
-    let mut seen_a = HashSet::new();
-    let mut prev_a: Option<(&str, &str)> = None;
-    for &(ty, field, target, reason) in ALIASES {
-        assert!(!reason.trim().is_empty(), "ALIASES ({ty}, {field}) missing reason");
-        assert!(!target.trim().is_empty(), "ALIASES ({ty}, {field}) missing override target");
-        assert!(seen_a.insert((ty, field)), "duplicate ALIASES: {ty}::{field}");
-        if let Some(p) = prev_a {
-            assert!(
-                p < (ty, field),
-                "ALIASES must stay sorted by (struct, field); {:?} precedes {ty}::{field}",
-                p
-            );
-        }
-        prev_a = Some((ty, field));
-    }
-}
-
-#[test]
-fn every_bypass_and_alias_entry_carries_a_reason() {
-    assert_eq!(BYPASS.len(), 4);
-    assert_eq!(ALIASES.len(), 2);
-    for &(ty, field, reason) in BYPASS {
-        assert!(
-            !reason.trim().is_empty(),
-            "BYPASS entry {ty}::{field} must carry a non-empty reason string"
-        );
-    }
-    for &(ty, field, target, reason) in ALIASES {
-        assert!(
-            !reason.trim().is_empty(),
-            "ALIASES entry {ty}::{field}→{target} must carry a non-empty reason string"
-        );
-    }
-}
-
-#[test]
-fn field_arithmetic_holds() {
-    // 74 group fields − 4 BYPASS − 1 (2:1 no_keymanager collapse) = 69 knobs (ARCH-4j).
-    assert_eq!(74 - 4 - 1, 69);
-    assert_eq!(BYPASS.len(), 4);
-    // Exactly one ALIASES entry is the 2:1 collapse (the −1); the other is 1:1.
-    let collapse = ALIASES
-        .iter()
-        .filter(|(_, _, target, reason)| *target == "keymanager_enabled" && reason.contains("2:1"))
-        .count();
-    assert_eq!(collapse, 1, "expected exactly one 2:1 collapse alias (the −1)");
-
-    let root = workspace_root();
-    let knobs = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
-    let override_fields = operator_knob_names(&knobs);
-    assert_eq!(
-        override_fields.len(),
+        paths.len(),
         69,
-        "OPERATOR_KNOB_NAMES count drifted; update arithmetic / seam α tables"
+        "clause (iii) must cover every section-struct field path (OPERATOR_KNOB_NAMES is 69); \
+         got {paths:?}"
+    );
+    let fields = collect_section_fields(&root);
+
+    let knobs_src = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
+    let knobs = operator_knob_names(&knobs_src);
+    assert_eq!(knobs.len(), 69, "OPERATOR_KNOB_NAMES count drifted; expected 69");
+
+    let field_knobs: HashSet<&str> = fields.iter().map(|f| f.knob.as_str()).collect();
+    let knob_set: HashSet<&str> = knobs.iter().map(String::as_str).collect();
+    assert_eq!(
+        field_knobs,
+        knob_set,
+        "section field knobs must match OPERATOR_KNOB_NAMES;\n  extra: {:?}\n  missing: {:?}",
+        field_knobs.difference(&knob_set).collect::<Vec<_>>(),
+        knob_set.difference(&field_knobs).collect::<Vec<_>>()
+    );
+
+    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs");
+    let validate_body = config_validate_body(&types);
+    assert!(!validate_body.is_empty(), "failed to extract Config::validate body from types.rs");
+    assert!(
+        has_ident(&validate_body, "metrics_port"),
+        "validate body extraction broke (missing metrics_port)"
+    );
+
+    let unvalidated: HashSet<&str> = UNVALIDATED.iter().map(|&(p, _)| p).collect();
+    assert_eq!(unvalidated.len(), UNVALIDATED.len(), "duplicate UNVALIDATED entries");
+
+    for &(path, _) in UNVALIDATED {
+        assert!(
+            fields.iter().any(|f| f.path == path),
+            "UNVALIDATED entry `{path}` is not a section-struct field path"
+        );
+    }
+
+    for f in &fields {
+        if !unvalidated.contains(f.path.as_str()) {
+            continue;
+        }
+        assert!(
+            !path_mentioned_in_validate(&f.path, &f.knob, &validate_body),
+            "UNVALIDATED entry `{}` appears in Config::validate — remove it from the list \
+             (shrinking-only)",
+            f.path
+        );
+    }
+
+    let violations = unvalidated_violations(&fields, &validate_body, &unvalidated);
+    assert!(violations.is_empty(), "ARCH-P1-1 / G-2 clause (iii):\n  {}", violations.join("\n  "));
+}
+
+#[test]
+fn unvalidated_list_is_shrinking_only() {
+    let mut seen = HashSet::new();
+    let mut prev: Option<&str> = None;
+    for &(path, reason) in UNVALIDATED {
+        assert!(!reason.trim().is_empty(), "UNVALIDATED::{path} missing reason");
+        assert!(seen.insert(path), "duplicate UNVALIDATED entry: {path}");
+        if let Some(p) = prev {
+            assert!(p < path, "UNVALIDATED must stay sorted by path; {p:?} precedes {path}");
+        }
+        prev = Some(path);
+    }
+    assert!(
+        UNVALIDATED.len() >= 40,
+        "UNVALIDATED unexpectedly small ({}); table parse/seed failed?",
+        UNVALIDATED.len()
     );
 }
 
-/// String literals inside `OPERATOR_KNOB_NAMES`.
-fn operator_knob_names(src: &str) -> Vec<String> {
-    let marker = "pub const OPERATOR_KNOB_NAMES";
-    let start = src.find(marker).expect("OPERATOR_KNOB_NAMES must exist");
-    let rest = &src[start..];
-    let open = rest.find('[').expect("OPERATOR_KNOB_NAMES array");
-    let close = rest.find("];").expect("OPERATOR_KNOB_NAMES terminator");
-    rest[open + 1..close]
-        .lines()
-        .filter_map(|line| {
-            let t = line.trim().trim_end_matches(',');
-            t.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
-        })
-        .collect()
+#[test]
+fn unvalidated_detector_flags_an_unlist_field() {
+    let fields = vec![
+        SectionField { path: "server.metrics_port".into(), knob: "metrics_port".into() },
+        SectionField { path: "server.brand_new_knob".into(), knob: "brand_new_knob".into() },
+        SectionField { path: "network.graffiti".into(), knob: "graffiti".into() },
+    ];
+    let validate_body =
+        "if self.metrics_port == 0 { ... } if let Some(ref graffiti) = self.graffiti";
+    let unvalidated: HashSet<&str> = HashSet::new();
+    let violations = unvalidated_violations(&fields, validate_body, &unvalidated);
+    assert!(
+        violations.iter().any(|v| v.contains("brand_new_knob")),
+        "unlist + unvalidated field must be flagged: {violations:?}"
+    );
+    assert!(
+        !violations.iter().any(|v| v.contains("metrics_port")),
+        "validated field must not be flagged: {violations:?}"
+    );
+
+    let mut listed = HashSet::new();
+    listed.insert("server.brand_new_knob");
+    let ok = unvalidated_violations(&fields, validate_body, &listed);
+    assert!(ok.is_empty(), "listed field must pass: {ok:?}");
 }
 
 // ---------------------------------------------------------------------------
-// Non-vacuous matcher unit tests (synthetic RED / acceptance)
+// Live gate — clause (iv)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn struct_fields_extracts_and_skips_attributes() {
+fn no_clap_field_has_both_a_default_value_and_a_non_option_type() {
     let src = r#"
 #[derive(Args, Debug)]
-pub struct BeaconArgs {
-    /// Beacon node URL
-    #[arg(long)]
-    pub beacon_url: Option<String>,
+pub struct ServerArgs {
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
 
-    #[arg(long, value_delimiter = ',')]
-    pub beacon_nodes: Option<Vec<String>>,
+    #[arg(long)]
+    pub name: Option<String>,
+
+    #[arg(long)]
+    pub threads: u16,
 }
 "#;
-    assert_eq!(struct_fields(src, "BeaconArgs"), vec!["beacon_url", "beacon_nodes"]);
-}
+    let found = defaulted_non_option_fields(src);
+    assert!(
+        found.iter().any(|(st, f)| st == "ServerArgs" && f == "port"),
+        "synthetic default_value + non-Option must be flagged, got {found:?}"
+    );
+    assert!(!found.iter().any(|(_, f)| f == "name"), "Option field must not be flagged: {found:?}");
+    assert!(
+        !found.iter().any(|(_, f)| f == "threads"),
+        "non-Option without default_value must not be flagged: {found:?}"
+    );
 
-#[test]
-fn expand_flatten_bindings_includes_nested_groups() {
-    let src = r#"
-pub struct StartArgs {
-    #[command(flatten)]
-    pub keys: KeysArgs,
-}
-
-pub struct KeysArgs {
-    #[arg(long)]
-    pub keystore_path: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub secret_provider: SecretProviderArgs,
-}
-
-pub struct SecretProviderArgs {
-    #[arg(long)]
-    pub providers: Option<String>,
-
-    #[command(flatten)]
-    pub gcp: GcpSecretArgs,
-}
-
-pub struct GcpSecretArgs {
-    #[arg(long)]
-    pub project_id: Option<String>,
+    // F2: `serde(skip_serializing_if)` is not `#[serde(skip)]`.
+    let skip_if = r#"
+pub struct ServerArgs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
 }
 "#;
-    let start = flatten_bindings(src);
-    assert_eq!(start.len(), 1);
-    let all = expand_flatten_bindings(src, &start);
-    assert_eq!(all.get("keys").map(String::as_str), Some("KeysArgs"));
-    assert_eq!(all.get("secret_provider").map(String::as_str), Some("SecretProviderArgs"));
-    assert_eq!(all.get("gcp").map(String::as_str), Some("GcpSecretArgs"));
-    assert_eq!(leaf_struct_fields(src, "KeysArgs"), vec!["keystore_path"]);
-    assert_eq!(leaf_struct_fields(src, "SecretProviderArgs"), vec!["providers"]);
-    assert_eq!(leaf_struct_fields(src, "GcpSecretArgs"), vec!["project_id"]);
-}
+    let found = defaulted_non_option_section_fields(skip_if);
+    assert!(
+        found.iter().any(|(_, f)| f == "port"),
+        "valued default_value + skip_serializing_if must still be flagged, got {found:?}"
+    );
 
-#[test]
-fn flatten_bindings_extracts_start_args_groups() {
-    let src = r#"
-pub struct StartArgs {
-    pub config: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub beacon: BeaconArgs,
-
-    #[command(flatten)]
-    pub keys: KeysArgs,
+    let valued_skip = r#"
+pub struct ServerArgs {
+    #[serde(skip)]
+    #[arg(long, default_value = "8080")]
+    pub port: u16,
 }
 "#;
-    let b = flatten_bindings(src);
-    assert_eq!(b.len(), 2);
-    assert_eq!(b.get("beacon").map(String::as_str), Some("BeaconArgs"));
-    assert_eq!(b.get("keys").map(String::as_str), Some("KeysArgs"));
+    let found = defaulted_non_option_section_fields(valued_skip);
+    assert!(
+        found.iter().any(|(_, f)| f == "port"),
+        "valued default_value + exact serde(skip) must still be flagged, got {found:?}"
+    );
+
+    let present_only = r#"
+pub struct SafetyArgs {
+    #[arg(long = "allow-unsupported-fork", default_value_t = false)]
+    #[serde(skip)]
+    pub allow_unsupported_fork: bool,
 }
-
-#[test]
-fn seam_alpha_detector_flags_an_unread_field() {
-    // Mandatory RED: synthetic group with a field the From impl ignores.
-    let mut bindings = BTreeMap::new();
-    bindings.insert("beacon".into(), "BeaconArgs".into());
-    let mut fields = BTreeMap::new();
-    fields.insert("BeaconArgs".into(), vec!["beacon_url".into(), "unread_field".into()]);
-    let body = "beacon.beacon_url";
-    let bypass = HashSet::new();
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert_eq!(checked, 2);
-    assert!(
-        violations.iter().any(|v| v.contains("unread_field")),
-        "expected unread_field to be flagged, got {violations:?}"
-    );
-    assert!(!violations.iter().any(|v| v.contains("beacon_url")), "read field must not be flagged");
-}
-
-#[test]
-fn seam_alpha_detector_accepts_a_bypassed_field() {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("beacon".into(), "BeaconArgs".into());
-    let mut fields = BTreeMap::new();
-    fields
-        .insert("BeaconArgs".into(), vec!["beacon_url".into(), "block_production_timeout".into()]);
-    let body = "beacon.beacon_url";
-    let mut bypass = HashSet::new();
-    bypass.insert(("BeaconArgs", "block_production_timeout"));
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert_eq!(checked, 2);
-    assert!(violations.is_empty(), "bypassed field must not be flagged: {violations:?}");
-}
-
-#[test]
-fn seam_alpha_detector_accepts_an_aliased_field() {
-    // 1:1 negated rename — source field is still read as binding.field (override name differs).
-    let mut bindings = BTreeMap::new();
-    bindings.insert("safety".into(), "SafetyArgs".into());
-    let mut fields = BTreeMap::new();
-    fields.insert("SafetyArgs".into(), vec!["no_doppelganger_detection".into()]);
-    let body = "safety.no_doppelganger_detection";
-    let bypass = HashSet::new();
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert_eq!(checked, 1);
-    assert!(violations.is_empty(), "1:1 alias source read as binding.field: {violations:?}");
-    // Override target name alone is not a substitute for the clap field access.
-    let body_wrong = "safety.doppelganger_detection";
-    let (_, violations) = seam_alpha_unread(&bindings, &fields, body_wrong, &bypass);
-    assert!(
-        violations.iter().any(|v| v.contains("no_doppelganger_detection")),
-        "must require clap field name, not override name: {violations:?}"
-    );
-
-    // 2:1 collapse — both clap sources must appear; only no_keymanager is on ALIASES.
-    let mut bindings = BTreeMap::new();
-    bindings.insert("keymanager".into(), "KeymanagerArgs".into());
-    let mut fields = BTreeMap::new();
-    fields
-        .insert("KeymanagerArgs".into(), vec!["no_keymanager".into(), "keymanager_enabled".into()]);
-    let body = "keymanager.no_keymanager\nkeymanager.keymanager_enabled";
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert_eq!(checked, 2);
-    assert!(violations.is_empty(), "2:1 collapse: both source fields read: {violations:?}");
-    // Missing either half is a violation (ALIASES documents the rename; does not skip the read).
-    let body_half = "keymanager.keymanager_enabled";
-    let (_, violations) = seam_alpha_unread(&bindings, &fields, body_half, &bypass);
-    assert!(
-        violations.iter().any(|v| v.contains("no_keymanager")),
-        "2:1 source no_keymanager must still be read: {violations:?}"
-    );
-}
-
-/// Prefix collision false-green: longer sibling must not satisfy shorter field (M1 / H3).
-#[test]
-fn seam_alpha_detector_rejects_prefix_only_field_access() {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("logging".into(), "LoggingArgs".into());
-    let mut fields = BTreeMap::new();
-    fields.insert("LoggingArgs".into(), vec!["logfile".into(), "logfile_max_size".into()]);
-    // Only the longer access is present — `logfile` must still be flagged.
-    let body = "logfile_max_size: logging.logfile_max_size,";
-    let bypass = HashSet::new();
-    let (checked, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert_eq!(checked, 2);
-    assert!(
-        violations.iter().any(|v| v.contains("LoggingArgs::logfile") || v.contains("logfile ")),
-        "logfile must not be satisfied by logfile_max_size: {violations:?}"
-    );
-    assert!(
-        !violations.iter().any(|v| v.contains("logfile_max_size")),
-        "longer sibling is present and must pass: {violations:?}"
-    );
-
-    // Same class: secret_provider vs secret_provider_strict.
-    let mut bindings = BTreeMap::new();
-    bindings.insert("keys".into(), "KeysArgs".into());
-    let mut fields = BTreeMap::new();
-    fields
-        .insert("KeysArgs".into(), vec!["secret_provider".into(), "secret_provider_strict".into()]);
-    let body = "keys.secret_provider_strict";
-    let (_, violations) = seam_alpha_unread(&bindings, &fields, body, &bypass);
-    assert!(
-        violations.iter().any(|v| v.contains("secret_provider")),
-        "secret_provider must not be satisfied by secret_provider_strict: {violations:?}"
-    );
-}
-
-/// Comment-only / string-only mentions must not count as wiring (H2).
-#[test]
-fn seam_alpha_detector_ignores_comment_and_string_only_mentions() {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("beacon".into(), "BeaconArgs".into());
-    let mut fields = BTreeMap::new();
-    fields.insert("BeaconArgs".into(), vec!["evil_timeout".into()]);
-    let bypass = HashSet::new();
-
-    let body_comment = "// remember to wire beacon.evil_timeout later\nSelf {}";
-    let (_, violations) = seam_alpha_unread(&bindings, &fields, body_comment, &bypass);
-    assert!(
-        violations.iter().any(|v| v.contains("evil_timeout")),
-        "comment-only mention must still be unread: {violations:?}"
-    );
-
-    let body_string = r#"let msg = "forgot beacon.evil_timeout"; Self {}"#;
-    let (_, violations) = seam_alpha_unread(&bindings, &fields, body_string, &bypass);
-    assert!(
-        violations.iter().any(|v| v.contains("evil_timeout")),
-        "string-only mention must still be unread: {violations:?}"
-    );
-}
-
-#[test]
-fn has_field_access_is_identifier_bounded() {
-    let compact = compact_ws("logging.logfile_max_size, logging.logfile,");
-    assert!(has_field_access(&compact, "logging", "logfile"));
-    assert!(has_field_access(&compact, "logging", "logfile_max_size"));
-    let prefix_only = compact_ws("logging.logfile_max_size");
-    assert!(!has_field_access(&prefix_only, "logging", "logfile"));
-    assert!(has_field_access(&prefix_only, "logging", "logfile_max_size"));
-}
-
-#[test]
-fn from_impl_body_extracts_live_cli_rs() {
-    let root = workspace_root();
-    let types = std::fs::read_to_string(root.join(TYPES_RS)).unwrap();
-    let body = apply_cli_body(&types);
-    assert!(!body.is_empty());
-    assert!(body.contains("beacon"));
-    assert!(has_field_access(&scan_text(&body), "beacon", "url"));
-}
-
-// ---------------------------------------------------------------------------
-// Live gate — clause (iv) CLAP_DEFAULT_CLOBBERS
-// ---------------------------------------------------------------------------
-
-#[test]
-fn clap_default_clobbers_list_matches_the_source() {
-    let root = workspace_root();
-    let start = std::fs::read_to_string(root.join(START_RS)).expect("start.rs");
-    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs");
-    let groups = group_args_source(&root);
-    let bindings = flatten_bindings(&start);
-    let body = apply_cli_body(&types);
-    let found = detect_clap_default_clobbers(&body, &groups, &bindings);
-
-    let allowed: Vec<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
-    let allowed_set: HashSet<&str> = allowed.iter().copied().collect();
-
-    // ARCH-6b: list is empty; detector must find no live clobbers.
-    assert!(
-        CLAP_DEFAULT_CLOBBERS.is_empty(),
-        "CLAP_DEFAULT_CLOBBERS must be empty after ARCH-6b; got {} entries",
-        CLAP_DEFAULT_CLOBBERS.len()
-    );
+"#;
+    let found = defaulted_non_option_section_fields(present_only);
     assert!(
         found.is_empty(),
-        "detector must find zero clap-default clobbers after ARCH-6b; got {found:?}"
+        "present-only bool + default_value_t + exact serde(skip) is excluded, got {found:?}"
     );
-
-    let growth = clobber_growth(&found, &allowed_set);
+    let raw = defaulted_non_option_fields(present_only);
     assert!(
-        growth.is_empty(),
-        "CLAP_DEFAULT_CLOBBERS is shrinking-only; new clobber(s) not on the list (ADR-009):\n  {}",
-        growth.join("\n  ")
+        raw.iter().any(|(_, f)| f == "allow_unsupported_fork"),
+        "unfiltered matcher must still see the present-only bool, got {raw:?}"
     );
+}
 
-    let stale = clobber_stale(&found, &allowed);
+#[test]
+fn rvc_config_has_no_defaulted_non_option_clap_field() {
+    let root = workspace_root();
+    let src = rvc_config_sections_source(&root);
+    let found = defaulted_non_option_section_fields(&src);
     assert!(
-        stale.is_empty(),
-        "CLAP_DEFAULT_CLOBBERS lists fields the detector no longer finds (list/source drift):\n  {}",
-        stale.join("\n  ")
+        found.is_empty(),
+        "no clap::Args field in rvc-config may have both default_value and a non-Option type \
+         (ADR-009 / G-2 iv): {found:?}"
     );
-
-    // Exact set equality (order independent).
-    let found_set: HashSet<&str> = found.iter().map(String::as_str).collect();
-    assert_eq!(
-        found_set, allowed_set,
-        "CLAP_DEFAULT_CLOBBERS must match detector output exactly;\n  found: {found:?}\n  list:  {allowed:?}"
+    assert!(
+        CLAP_DEFAULT_CLOBBERS.is_empty(),
+        "CLAP_DEFAULT_CLOBBERS must stay empty after ARCH-6b / ARCH-4k; got {} entries",
+        CLAP_DEFAULT_CLOBBERS.len()
     );
 }
 
 #[test]
 fn every_clobber_entry_carries_a_reason() {
-    // Empty list is valid post-ARCH-6b; non-empty entries still need reasons + sort order.
     let mut seen = HashSet::new();
     let mut prev: Option<&str> = None;
     for &(field, reason) in CLAP_DEFAULT_CLOBBERS {
@@ -1413,149 +1008,133 @@ fn every_clobber_entry_carries_a_reason() {
     }
 }
 
-#[test]
-fn clap_default_clobber_detector_flags_a_tenth_instance() {
-    // Mandatory synthetic RED: a new Some(binding.field) with default_value must be flagged
-    // even when (especially when) the real list is empty after ARCH-6b.
-    let cli_src = r#"
-#[derive(Args, Debug)]
-pub struct ServerArgs {
-    #[arg(long, default_value_t = 8080)]
-    pub metrics_port: u16,
-
-    #[arg(long, default_value_t = 9999)]
-    pub some_new_flag: u16,
-}
-
-pub struct StartArgs {
-    #[command(flatten)]
-    pub server: ServerArgs,
-}
-"#;
-    let from_body = r#"
-        Self {
-            metrics_port: Some(server.metrics_port),
-            some_new_flag: Some(server.some_new_flag),
-        }
-"#;
-    let mut bindings = BTreeMap::new();
-    bindings.insert("server".into(), "ServerArgs".into());
-    let found = detect_clap_default_clobbers(from_body, cli_src, &bindings);
-    assert!(
-        found.iter().any(|f| f == "some_new_flag"),
-        "synthetic tenth clobber must be flagged, got {found:?}"
-    );
-    assert!(
-        found.iter().any(|f| f == "metrics_port"),
-        "known clobber shape must still be detected, got {found:?}"
-    );
-
-    // With only the nine-name allow-list (no some_new_flag), growth must surface the tenth.
-    let allowed: HashSet<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
-    let growth = clobber_growth(&found, &allowed);
-    assert!(
-        growth.iter().any(|f| f == "some_new_flag"),
-        "tenth instance must appear as growth against CLAP_DEFAULT_CLOBBERS: {growth:?}"
-    );
-
-    // Empty allow-list (post-ARCH-6b shape) still flags reintroduction.
-    let empty: HashSet<&str> = HashSet::new();
-    let growth_empty = clobber_growth(&found, &empty);
-    assert!(
-        growth_empty.iter().any(|f| f == "some_new_flag"),
-        "empty CLAP_DEFAULT_CLOBBERS must still flag synthetic reintroduction: {growth_empty:?}"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// Live gate — clause (iii) UNVALIDATED
+// Retirement + CLI-only inventory
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_cli_override_field_is_validated_or_listed() {
-    let root = workspace_root();
-    let types =
-        std::fs::read_to_string(root.join(TYPES_RS)).expect("crates/rvc/src/config/types.rs");
-    let knobs = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
-    let override_fields = operator_knob_names(&knobs);
+fn retired_clauses_are_absent() {
+    let src = include_str!("config_drift.rs");
+    // Build needles so this test does not mention the retired `const` tables.
+    let bypass = format!("const {}:", "BYPASS");
+    let aliases = format!("const {}:", "ALIASES");
+    assert!(
+        !src.contains(&bypass),
+        "clause (ii) bypass table must be deleted with seam α (ARCH-4k)"
+    );
+    assert!(
+        !src.contains(&aliases),
+        "clause (ii) aliases table must be deleted with seam α (ARCH-4k)"
+    );
+    let bindings_nv = format!("bindings.len(), {}", 13);
+    let checked_nv = format!("checked, {}", 74);
+    assert!(!src.contains(&bindings_nv), "clause (ii) non-vacuity bindings.len()==13 must be gone");
+    assert!(!src.contains(&checked_nv), "clause (ii) non-vacuity checked==74 must be gone");
+}
+
+#[test]
+fn cli_only_args_are_documented() {
     assert_eq!(
-        override_fields.len(),
-        69,
-        "OPERATOR_KNOB_NAMES count drifted; update UNVALIDATED / clause iii"
+        CLI_ONLY_ARGS,
+        &["enable_log_reload", "log_format", "strict_permissions", "strict_slashing_semantics",]
+    );
+    let root = workspace_root();
+    let src = group_args_source(&root);
+    let logging = struct_fields(&src, "LoggingArgs");
+    let slashing = struct_fields(&src, "SlashingArgs");
+    assert!(logging.iter().any(|f| f == "log_format"), "log_format missing on LoggingArgs");
+    assert!(
+        logging.iter().any(|f| f == "enable_log_reload"),
+        "enable_log_reload missing on LoggingArgs"
+    );
+    assert!(
+        slashing.iter().any(|f| f == "strict_permissions"),
+        "strict_permissions missing on SlashingArgs"
+    );
+    assert!(
+        slashing.iter().any(|f| f == "strict_slashing_semantics"),
+        "strict_slashing_semantics missing on SlashingArgs"
     );
 
-    let validate_body = config_validate_body(&types);
-    assert!(!validate_body.is_empty(), "failed to extract Config::validate body from types.rs");
+    // Second-leg: CLI-only flags must still be consumed in bin/rvc (run/logging).
+    let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs");
+    let cli_scan = scan_text(&cli);
     assert!(
-        has_ident(&validate_body, "metrics_port"),
-        "validate body extraction broke (missing metrics_port)"
+        has_field_access(&cli_scan, "logging", "log_format"),
+        "CLI_ONLY log_format has no second-leg read as logging.log_format in cli.rs"
     );
-
-    let unvalidated: HashSet<&str> = UNVALIDATED.iter().map(|&(f, _)| f).collect();
-    assert_eq!(unvalidated.len(), UNVALIDATED.len(), "duplicate UNVALIDATED entries");
-
-    // Hygiene: every UNVALIDATED entry must exist on CliOverrides.
-    for &(field, _) in UNVALIDATED {
-        assert!(
-            override_fields.iter().any(|f| f == field),
-            "UNVALIDATED entry `{field}` is not an OPERATOR_KNOB_NAMES entry"
-        );
-    }
-
-    // Hygiene: listed fields must NOT also appear in validate (list should shrink when checked).
-    for &(field, _) in UNVALIDATED {
-        assert!(
-            !has_ident(&validate_body, field),
-            "UNVALIDATED entry `{field}` appears in Config::validate — remove it from the list \
-             (shrinking-only)"
-        );
-    }
-
-    let violations = unvalidated_violations(&override_fields, &validate_body, &unvalidated);
-    assert!(violations.is_empty(), "ARCH-P1-1 / G-2 clause (iii):\n  {}", violations.join("\n  "));
-}
-
-#[test]
-fn unvalidated_list_is_shrinking_only() {
-    let mut seen = HashSet::new();
-    let mut prev: Option<&str> = None;
-    for &(field, reason) in UNVALIDATED {
-        assert!(!reason.trim().is_empty(), "UNVALIDATED::{field} missing reason");
-        assert!(seen.insert(field), "duplicate UNVALIDATED entry: {field}");
-        if let Some(p) = prev {
-            assert!(p < field, "UNVALIDATED must stay sorted by field; {p:?} precedes {field}");
-        }
-        prev = Some(field);
-    }
-    // Non-vacuity: HEAD has many unvalidated knobs; an empty accidental wipe is a bug.
     assert!(
-        UNVALIDATED.len() >= 40,
-        "UNVALIDATED unexpectedly small ({}); table parse/seed failed?",
-        UNVALIDATED.len()
+        has_field_access(&cli_scan, "logging", "enable_log_reload"),
+        "CLI_ONLY enable_log_reload has no second-leg read as logging.enable_log_reload in cli.rs"
+    );
+    assert!(
+        has_field_access(&cli_scan, "slashing", "strict_permissions"),
+        "CLI_ONLY strict_permissions has no second-leg read as slashing.strict_permissions in cli.rs"
+    );
+    assert!(
+        has_field_access(&cli_scan, "slashing", "strict_slashing_semantics"),
+        "CLI_ONLY strict_slashing_semantics has no second-leg read as \
+         slashing.strict_slashing_semantics in cli.rs"
     );
 }
 
 #[test]
-fn unvalidated_detector_flags_an_unlist_field() {
-    let override_fields = vec!["metrics_port".into(), "brand_new_knob".into(), "graffiti".into()];
-    // metrics_port and graffiti appear; brand_new_knob does not.
-    let validate_body =
-        "if self.metrics_port == 0 { ... } if let Some(ref graffiti) = self.graffiti";
-    let unvalidated: HashSet<&str> = HashSet::new();
-    let violations = unvalidated_violations(&override_fields, validate_body, &unvalidated);
+fn apply_cli_presence_scan_flags_an_unread_field() {
+    let leaves = vec![("beacon".into(), "url".into()), ("beacon".into(), "unread_field".into())];
+    let body = "if let Some(v) = &beacon.url { self.beacon_url = v.clone(); }";
+    let cli_only = HashSet::new();
+    let violations = apply_cli_unread(&leaves, body, &cli_only);
     assert!(
-        violations.iter().any(|v| v.contains("brand_new_knob")),
-        "unlist + unvalidated field must be flagged: {violations:?}"
+        violations.iter().any(|v| v.contains("unread_field")),
+        "unread clap leaf must be flagged, got {violations:?}"
     );
     assert!(
-        !violations.iter().any(|v| v.contains("metrics_port")),
-        "validated field must not be flagged: {violations:?}"
+        !violations.iter().any(|v| v.contains("beacon.url") && !v.contains("unread")),
+        "read field must not be flagged: {violations:?}"
     );
 
-    let mut listed = HashSet::new();
-    listed.insert("brand_new_knob");
-    let ok = unvalidated_violations(&override_fields, validate_body, &listed);
-    assert!(ok.is_empty(), "listed field must pass: {ok:?}");
+    let mut cli_only = HashSet::new();
+    cli_only.insert("log_format");
+    let leaves = vec![("logging".into(), "log_format".into())];
+    let ok = apply_cli_unread(&leaves, body, &cli_only);
+    assert!(ok.is_empty(), "CLI_ONLY field must not require apply_cli: {ok:?}");
+
+    let body_comment = "// remember to wire beacon.unread_field later\nbeacon.url";
+    let leaves = vec![("beacon".into(), "unread_field".into())];
+    let empty = HashSet::new();
+    let violations = apply_cli_unread(&leaves, body_comment, &empty);
+    assert!(
+        violations.iter().any(|v| v.contains("unread_field")),
+        "comment-only mention must still be unread: {violations:?}"
+    );
+}
+
+#[test]
+fn every_clap_leaf_is_read_by_apply_cli_or_is_cli_only() {
+    let root = workspace_root();
+    let groups = group_args_source(&root);
+    let leaves = collect_clap_leaves_from(&groups);
+    assert!(
+        leaves.len() > 60,
+        "apply_cli presence scan walked too few clap leaves ({}); extractor broke?",
+        leaves.len()
+    );
+
+    let types = std::fs::read_to_string(root.join(TYPES_RS)).expect("types.rs");
+    let body = apply_cli_body(&types);
+    assert!(!body.is_empty(), "failed to extract Config::apply_cli body from types.rs");
+    assert!(
+        has_field_access(&scan_text(&body), "beacon", "url"),
+        "apply_cli body extraction broke (missing beacon.url)"
+    );
+
+    let cli_only: HashSet<&str> = CLI_ONLY_ARGS.iter().copied().collect();
+    let violations = apply_cli_unread(&leaves, &body, &cli_only);
+    assert!(
+        violations.is_empty(),
+        "G-2 apply_cli presence scan (unread clap leaf):\n  {}",
+        violations.join("\n  ")
+    );
 }
 
 #[test]
@@ -1591,4 +1170,52 @@ fn walk_rs(dir: &Path, hits: &mut Vec<String>) {
             hits.push(path.display().to_string());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Matcher unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn struct_fields_extracts_and_skips_attributes() {
+    let src = r#"
+#[derive(Args, Debug)]
+pub struct BeaconArgs {
+    /// Beacon node URL
+    #[arg(long)]
+    pub beacon_url: Option<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    pub beacon_nodes: Option<Vec<String>>,
+}
+"#;
+    assert_eq!(struct_fields(src, "BeaconArgs"), vec!["beacon_url", "beacon_nodes"]);
+}
+
+#[test]
+fn section_field_paths_use_clap_id_and_skip_flatten() {
+    let src = r#"
+pub struct BeaconArgs {
+    #[arg(id = "beacon_url", long = "beacon-url")]
+    pub url: Option<String>,
+
+    #[command(flatten)]
+    pub nested: OtherArgs,
+}
+
+pub struct LoggingArgs {
+    #[arg(long)]
+    pub log_level: Option<String>,
+
+    #[arg(long, default_value = "pretty")]
+    pub log_format: String,
+}
+"#;
+    let fields = collect_section_fields_from(src);
+    let paths: Vec<&str> = fields.iter().map(|f| f.path.as_str()).collect();
+    assert!(paths.contains(&"beacon.url"), "got {paths:?}");
+    assert!(fields.iter().any(|f| f.path == "beacon.url" && f.knob == "beacon_url"));
+    assert!(paths.contains(&"logging.log_level"), "got {paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("nested")));
+    assert!(!paths.iter().any(|p| p.contains("log_format")));
 }

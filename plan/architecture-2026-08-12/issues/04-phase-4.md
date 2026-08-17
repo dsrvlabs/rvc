@@ -994,13 +994,13 @@ whole gate taxonomy exists to avoid. They must be **deleted, not left green**.
 
 **Acceptance criteria.**
 
-- [ ] Clauses (i)/(ii) and their tables deleted; the file's module doc records the retirement and its
+- [x] Clauses (i)/(ii) and their tables deleted; the file's module doc records the retirement and its
       cause (seam α no longer exists).
-- [ ] Clause (iii) re-aimed at section-struct field paths, still non-vacuous.
-- [ ] Clause (iv) reformulated as the structural `default_value` + non-`Option` scan, RED-demonstrated
+- [x] Clause (iii) re-aimed at section-struct field paths, still non-vacuous.
+- [x] Clause (iv) reformulated as the structural `default_value` + non-`Option` scan, RED-demonstrated
       on synthetic input; `CLAP_DEFAULT_CLOBBERS` empty.
-- [ ] The four surviving CLI-only args are documented.
-- [ ] `arch-gates` green.
+- [x] The four surviving CLI-only args are documented.
+- [x] `arch-gates` green.
 
 ---
 
