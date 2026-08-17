@@ -395,14 +395,14 @@ checks — the gate would be worse than useless, because it would look green.
 
 **Acceptance criteria.**
 
-- [ ] Four classes implemented; anything unmatched fails, naming file and variable.
-- [ ] `DYNAMIC_READS` exists, contains exactly one entry (`crates/crypto/src/insecure.rs:168`) with a
+- [x] Four classes implemented; anything unmatched fails, naming file and variable.
+- [x] `DYNAMIC_READS` exists, contains exactly one entry (`crates/crypto/src/insecure.rs:168`) with a
       reason string and the in-flowing constant names; a dynamic read elsewhere fails.
-- [ ] Class-3 doc comment states **config-else-env** explicitly and cites `types.rs:438`, `:447`.
-- [ ] Class 2 annotated shrinking-only; contains exactly `RVC_LOG_FORMAT`.
-- [ ] `cargo nextest run -p rvc-architecture-tests` green on `develop`.
-- [ ] RED output for `unsanctioned_env_read_fails_naming_file_and_variable` pasted into the PR.
-- [ ] **C3 discharged in text**: the gate file states that adopting a figment-style `Env` layer would
+- [x] Class-3 doc comment states **config-else-env** explicitly and cites `types.rs:438`, `:447`.
+- [x] Class 2 annotated shrinking-only; contains exactly `RVC_LOG_FORMAT`.
+- [x] `cargo nextest run -p rvc-architecture-tests` green on `develop`.
+- [x] RED output for `unsanctioned_env_read_fails_naming_file_and_variable` pasted into the PR.
+- [x] **C3 discharged in text**: the gate file states that adopting a figment-style `Env` layer would
       violate this gate, and that ADR-008 avoids it by not taking the dependency at all.
 
 ---

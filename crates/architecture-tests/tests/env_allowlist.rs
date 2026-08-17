@@ -1,11 +1,36 @@
-//! G-3 / ARCH-4a: extract `std::env::var` / `var_os` call sites and `*_ENV` /
-//! `*_ENV_VAR` constants. Classification (the four-class allow-list) is ARCH-4b.
+//! G-3 / ARCH-4b: four-class allow-list over the ARCH-4a extractor.
 //!
 //! The gate scans **call sites and named constants**, not the `RVC_` prefix.
 //! A prefix scan was measured at **438 hits across 57 files**, ~95 % Prometheus
 //! metric-name constants, and it misses live reads of `RUST_LOG` and both
 //! `OTEL_*` variables (ADR-010). That mechanism is rejected; do not "simplify"
 //! this scanner back to a prefix match.
+//!
+//! Four classes (ADR-010), plus the VD-4.5 [`DYNAMIC_READS`] table:
+//!
+//! 1. [`SECURITY_OPT_OUT`] — sanctioned `RVC_*_ALLOW_*` names, via **constants
+//!    and** inline literals.
+//! 2. [`GRANDFATHERED`] — shrinking-only non-security (`RVC_LOG_FORMAT`).
+//! 3. [`ECOSYSTEM_CONFIG_WINS`] — `RUST_LOG` / `OTEL_*`. Precedence is
+//!    **config-else-env** (config wins, env fills `None`; `types.rs:438`
+//!    `or_else`, `:447` `None =>`). This is the **opposite** of figment's
+//!    idiomatic `Env` layer. Adopting a figment-style `Env` layer would
+//!    violate this gate; ADR-008 avoids it by not taking the dependency at
+//!    all (C3).
+//! 4. Anything else — **fail**, naming file and variable.
+//!
+//! [`DYNAMIC_READS`] is an allow-list of **exprs** at a file:line, not a skip
+//! (VD-4.5). The one sanctioned indirect site is
+//! `crates/crypto/src/insecure.rs:168` (`self.env_var`). Names that reach it
+//! are classified at every production `InsecureGate::new` / `with_predicate`
+//! first argument (string literal or joined ident) via [`class_for_name`].
+//! A `Dynamic` whose expr is a simple ident is **joined** to a `*_ENV` /
+//! `*_ENV_VAR` constant of that name (VD-4.4: `LOG_FORMAT_ENV` at
+//! `format.rs:89`). Any other dynamic read fails.
+//!
+//! The hit set is measured **post-Phase-0**. The orphan trees carried their
+//! own reads (`crates/rvc-signer/src/main.rs:1122, :1213`;
+//! `crates/rvc/src/main.rs:992, :997`) and must not be allow-listed.
 //!
 //! Three shapes land in one [`EnvRead`]:
 //!
@@ -38,8 +63,10 @@
 //! No external dependency (Phase-1 rule P6): hand-rolled walk, same idiom as
 //! `kat_policy.rs`.
 //!
-//! Cross-ref: architecture §6 G-3; ADR-010; plan issue ARCH-4a / VD-4.4 / VD-4.5.
+//! Cross-ref: architecture §6 G-3; ADR-008; ADR-010; plan ARCH-4a / ARCH-4b /
+//! VD-4.4 / VD-4.5 / C3.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +74,96 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 const THIS_GATE: &str = "crates/architecture-tests/tests/env_allowlist.rs";
+
+// ---------------------------------------------------------------------------
+// Four-class allow-list + DYNAMIC_READS (ARCH-4b). Reason string required.
+// ---------------------------------------------------------------------------
+
+/// Class 1 — sanctioned security opt-outs. Reached via `*_ENV` / `*_ENV_VAR`
+/// constants **and** inline `env::var("…")` literals; both routes must classify.
+const SECURITY_OPT_OUT: &[(&str, &str)] = &[
+    (
+        "RVC_ALLOW_INSECURE",
+        "operator opt-in for insecure / slashing-off paths (`types.rs`, `signer-server` slashing config)",
+    ),
+    (
+        "RVC_ALLOW_NON_WAL_SLASHING_DB",
+        "operator opt-in when WAL cannot be enabled (`slashing/src/db/open.rs`); class-1 without touching the slashing-DB critical section (C1)",
+    ),
+    (
+        "RVC_METRICS_ALLOW_NON_LOOPBACK",
+        "operator opt-in for a non-loopback metrics bind (L-10 / `METRICS_ALLOW_NON_LOOPBACK_ENV`)",
+    ),
+    (
+        "RVC_REMOTE_SIGNER_ALLOW_INSECURE",
+        "operator opt-in for plaintext remote-signer URLs (`REMOTE_SIGNER_INSECURE_ENV_VAR`)",
+    ),
+    (
+        "RVC_SIGNER_ALLOW_INSECURE",
+        "operator opt-in for `--insecure` signer bind (`INSECURE_ENV_VAR`)",
+    ),
+];
+
+/// Class 2 — grandfathered non-security. Exactly `RVC_LOG_FORMAT`.
+///
+/// **Shrinking-only:** entries may be **removed**, never **added**. Prefer
+/// deleting the env knob (CLI already wins in `telemetry/src/format.rs`) over
+/// growing this list. See module docs + `kat_policy.rs` `EXEMPTIONS`.
+const GRANDFATHERED: &[(&str, &str)] = &[(
+    "RVC_LOG_FORMAT",
+    "non-security console-format fallback; CLI wins (`telemetry/src/format.rs`); grandfathered until the env path is deleted",
+)];
+
+/// Class 3 — ecosystem-standard **config-else-env** fallbacks.
+///
+/// Precedence is **config-else-env**: config wins, env only fills a `None`
+/// (`types.rs:438` `or_else`, `:447` `None =>`). This is the **opposite** of
+/// figment's idiomatic `Env` layer (env-wins overlay). Adopting a figment-style
+/// `Env` layer would violate this gate; ADR-008 avoids it by not taking the
+/// dependency at all (C3).
+const ECOSYSTEM_CONFIG_WINS: &[(&str, &str)] = &[
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTLP endpoint; config-else-env (`types.rs:438` `or_else`)"),
+    ("OTEL_TRACES_SAMPLER_ARG", "OTLP sampler; config-else-env (`types.rs:447` `None =>`)"),
+    (
+        "RUST_LOG",
+        "tracing-subscriber filter; ecosystem default, env fills unset (`telemetry/src/init.rs`)",
+    ),
+];
+
+/// One shrinking-only row: file, 1-based line, allowed expr, constructor-arg
+/// idents that flow in, reason.
+struct DynamicRead {
+    file: &'static str,
+    line: usize,
+    expr: &'static str,
+    flows: &'static [&'static str],
+    reason: &'static str,
+}
+
+/// VD-4.5: dynamic `env::var(<not-a-literal>)` sites that cannot be joined to a
+/// `*_ENV` / `*_ENV_VAR` constant. An allow-list of **exprs**, **not** a skip.
+///
+/// **Shrinking-only:** entries may be **removed**, never **added**. A new
+/// dynamic read at any other file:line, or a different expr at this site, fails.
+/// [`flows`](DynamicRead::flows) must equal the production `InsecureGate`
+/// first-arg ident set.
+const DYNAMIC_READS: &[DynamicRead] = &[DynamicRead {
+    file: "crates/crypto/src/insecure.rs",
+    line: 168,
+    expr: "self.env_var",
+    flows: &[
+        "INSECURE_ENV_VAR",
+        "METRICS_ALLOW_NON_LOOPBACK_ENV",
+        "REMOTE_SIGNER_INSECURE_ENV_VAR",
+    ],
+    reason: "InsecureGate::check reads env::var(self.env_var). Class-1 names \
+             that flow in: REMOTE_SIGNER_INSECURE_ENV_VAR \
+             (RVC_REMOTE_SIGNER_ALLOW_INSECURE), INSECURE_ENV_VAR \
+             (RVC_SIGNER_ALLOW_INSECURE), METRICS_ALLOW_NON_LOOPBACK_ENV \
+             (RVC_METRICS_ALLOW_NON_LOOPBACK). RVC_ALLOW_INSECURE and \
+             RVC_ALLOW_NON_WAL_SLASHING_DB are inline literals and do not \
+             pass through this site.",
+}];
 
 // ---------------------------------------------------------------------------
 // Records
@@ -491,7 +608,7 @@ fn env_method_at(src: &str, env_at: usize) -> Option<(&str, usize)> {
     Some((method, method_start + method.len()))
 }
 
-fn parse_env_constant(code: &str) -> Option<(String, String)> {
+fn parse_str_constant(code: &str) -> Option<(String, String)> {
     let mut t = code.trim();
     if let Some(rest) = t.strip_prefix("pub") {
         let rest = rest.trim_start();
@@ -508,9 +625,6 @@ fn parse_env_constant(code: &str) -> Option<(String, String)> {
         return None;
     }
     let ident = &t[..ident_len];
-    if !(ident.ends_with("_ENV_VAR") || ident.ends_with("_ENV")) {
-        return None;
-    }
     t = t[ident_len..].trim_start();
     if let Some(rest) = t.strip_prefix(':') {
         t = rest.trim_start();
@@ -522,6 +636,15 @@ fn parse_env_constant(code: &str) -> Option<(String, String)> {
     t = t.trim_end().trim_end_matches(';').trim();
     let value = parse_string_literal(t)?;
     Some((ident.to_string(), value.to_string()))
+}
+
+fn parse_env_constant(code: &str) -> Option<(String, String)> {
+    let (ident, value) = parse_str_constant(code)?;
+    if ident.ends_with("_ENV_VAR") || ident.ends_with("_ENV") {
+        Some((ident, value))
+    } else {
+        None
+    }
 }
 
 fn extract_env_constants(file: &str, src: &str) -> Vec<EnvRead> {
@@ -597,10 +720,130 @@ fn extract_env_reads(file: &str, src: &str) -> Vec<EnvRead> {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateArg {
+    Literal { name: String },
+    Ident { ident: String },
+    Other { expr: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateCtor {
+    file: String,
+    line: usize,
+    arg: GateArg,
+}
+
+fn first_call_arg(src: &str, open: usize) -> Option<&str> {
+    let close = close_paren(src, open)?;
+    let inside = &src[open + 1..close];
+    let bytes = inside.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return Some(inside[..i].trim()),
+            _ => {}
+        }
+        i += 1;
+    }
+    let t = inside.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+fn parse_gate_arg(arg: &str) -> GateArg {
+    if let Some(name) = parse_string_literal(arg) {
+        return GateArg::Literal { name: name.to_string() };
+    }
+    let collapsed = collapse_ws(arg);
+    if is_simple_ident(&collapsed) {
+        return GateArg::Ident { ident: collapsed };
+    }
+    if let Some(ident) = collapsed.rsplit("::").next() {
+        if is_simple_ident(ident) && collapsed.bytes().all(|b| is_ident_char(b) || b == b':') {
+            return GateArg::Ident { ident: ident.to_string() };
+        }
+    }
+    GateArg::Other { expr: collapsed }
+}
+
+fn extract_insecure_gate_ctors(file: &str, src: &str) -> Vec<GateCtor> {
+    let mut out = Vec::new();
+    for needle in ["InsecureGate::new", "InsecureGate::with_predicate"] {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if hit_is_in_comment(src, at) {
+                continue;
+            }
+            if from < src.len() && is_ident_char(src.as_bytes()[from]) {
+                continue;
+            }
+            let open = skip_ws(src, from);
+            if open >= src.len() || src.as_bytes()[open] != b'(' {
+                continue;
+            }
+            let Some(arg) = first_call_arg(src, open) else {
+                continue;
+            };
+            out.push(GateCtor {
+                file: file.to_string(),
+                line: line_at(src, at),
+                arg: parse_gate_arg(arg),
+            });
+        }
+    }
+    out
+}
+
+fn file_str_consts(file: &str, src: &str) -> HashMap<String, String> {
+    if is_tests_path(file) {
+        return HashMap::new();
+    }
+    let spans = cfg_test_item_spans(src);
+    let mut out = HashMap::new();
+    for (i, line) in src.lines().enumerate() {
+        if is_comment_only_line(line) {
+            continue;
+        }
+        let Some((ident, value)) = parse_str_constant(code_portion(line)) else {
+            continue;
+        };
+        let line_no = i + 1;
+        if spans.iter().any(|&(s, e)| line_no >= s && line_no <= e) {
+            continue;
+        }
+        out.insert(ident, value);
+    }
+    out
+}
+
 #[derive(Debug)]
 struct Partitioned {
     production: Vec<EnvRead>,
     test: Vec<EnvRead>,
+    production_ctors: Vec<GateCtor>,
 }
 
 fn scan_source(file: &str, src: &str) -> Partitioned {
@@ -613,27 +856,159 @@ fn scan_source(file: &str, src: &str) -> Partitioned {
             production.push(read);
         }
     }
-    Partitioned { production, test }
+    let mut production_ctors = Vec::new();
+    for ctor in extract_insecure_gate_ctors(file, src) {
+        if !is_test_region(file, src, ctor.line) {
+            production_ctors.push(ctor);
+        }
+    }
+    Partitioned { production, test, production_ctors }
 }
 
 struct WorkspaceScan {
     files: Vec<PathBuf>,
     production: Vec<EnvRead>,
+    gate_ctors: Vec<GateCtor>,
+    str_consts: HashMap<String, String>,
 }
 
 fn scan_workspace() -> WorkspaceScan {
     let root = workspace_root();
     let files = workspace_rs_files(&root);
     let mut production = Vec::new();
+    let mut gate_ctors = Vec::new();
+    let mut str_consts = HashMap::new();
     for file in &files {
         let rel = file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
         if rel == THIS_GATE {
             continue;
         }
         let src = std::fs::read_to_string(file).unwrap_or_default();
-        production.extend(scan_source(&rel, &src).production);
+        let scan = scan_source(&rel, &src);
+        production.extend(scan.production);
+        gate_ctors.extend(scan.production_ctors);
+        str_consts.extend(file_str_consts(&rel, &src));
     }
-    WorkspaceScan { files, production }
+    WorkspaceScan { files, production, gate_ctors, str_consts }
+}
+
+// ---------------------------------------------------------------------------
+// Classification (ARCH-4b)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    SecurityOptOut,
+    Grandfathered,
+    EcosystemConfigWins,
+    DynamicAllowlisted,
+}
+
+fn name_in(table: &[(&str, &str)], name: &str) -> bool {
+    table.iter().any(|(n, _)| *n == name)
+}
+
+fn class_for_name(name: &str) -> Option<Class> {
+    if name_in(SECURITY_OPT_OUT, name) {
+        Some(Class::SecurityOptOut)
+    } else if name_in(GRANDFATHERED, name) {
+        Some(Class::Grandfathered)
+    } else if name_in(ECOSYSTEM_CONFIG_WINS, name) {
+        Some(Class::EcosystemConfigWins)
+    } else {
+        None
+    }
+}
+
+fn is_simple_ident(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|&c| is_ident_char(c))
+}
+
+fn dynamic_row(file: &str, line: usize) -> Option<&'static DynamicRead> {
+    DYNAMIC_READS.iter().find(|d| d.file == file && d.line == line)
+}
+
+fn constant_map(reads: &[EnvRead]) -> HashMap<&str, &str> {
+    reads
+        .iter()
+        .filter_map(|r| match &r.shape {
+            Shape::Constant { ident, value } => Some((ident.as_str(), value.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unsanctioned(read: &EnvRead) -> String {
+    format!("{} (not on the G-3 allow-list)", read.diagnostic())
+}
+
+fn unsanctioned_name(file: &str, line: usize, name: &str) -> String {
+    format!("{file}:{line}: env read `{name}` (not on the G-3 allow-list)")
+}
+
+fn classify_read(read: &EnvRead, constants: &HashMap<&str, &str>) -> Result<Class, String> {
+    match &read.shape {
+        Shape::Literal { name } => class_for_name(name).ok_or_else(|| unsanctioned(read)),
+        Shape::Constant { value, .. } => class_for_name(value).ok_or_else(|| unsanctioned(read)),
+        Shape::Dynamic { expr } => {
+            if let Some(row) = dynamic_row(&read.file, read.line) {
+                if expr == row.expr {
+                    return Ok(Class::DynamicAllowlisted);
+                }
+                return Err(unsanctioned(read));
+            }
+            // VD-4.4: join `env::var(LOG_FORMAT_ENV)` to the constant's value.
+            if is_simple_ident(expr) {
+                if let Some(value) = constants.get(expr.as_str()) {
+                    return class_for_name(value).ok_or_else(|| unsanctioned(read));
+                }
+            }
+            Err(unsanctioned(read))
+        }
+    }
+}
+
+fn classify_ctor(ctor: &GateCtor, constants: &HashMap<String, String>) -> Result<Class, String> {
+    match &ctor.arg {
+        GateArg::Literal { name } => {
+            class_for_name(name).ok_or_else(|| unsanctioned_name(&ctor.file, ctor.line, name))
+        }
+        GateArg::Ident { ident } => match constants.get(ident) {
+            Some(value) => {
+                class_for_name(value).ok_or_else(|| unsanctioned_name(&ctor.file, ctor.line, value))
+            }
+            None => Err(unsanctioned_name(&ctor.file, ctor.line, ident)),
+        },
+        GateArg::Other { expr } => Err(unsanctioned_name(&ctor.file, ctor.line, expr)),
+    }
+}
+
+fn classify_all(reads: &[EnvRead]) -> Vec<Result<Class, String>> {
+    let constants = constant_map(reads);
+    reads.iter().map(|r| classify_read(r, &constants)).collect()
+}
+
+fn classify_violations(reads: &[EnvRead]) -> Vec<String> {
+    classify_all(reads).into_iter().filter_map(Result::err).collect()
+}
+
+fn classify_ctor_violations(file: &str, src: &str) -> Vec<String> {
+    let scan = scan_source(file, src);
+    let consts = file_str_consts(file, src);
+    scan.production_ctors.iter().filter_map(|c| classify_ctor(c, &consts).err()).collect()
+}
+
+fn classify_workspace(scan: &WorkspaceScan) -> Vec<String> {
+    let mut violations = classify_violations(&scan.production);
+    for ctor in &scan.gate_ctors {
+        if let Err(e) = classify_ctor(ctor, &scan.str_consts) {
+            violations.push(e);
+        }
+    }
+    violations
 }
 
 // ---------------------------------------------------------------------------
@@ -894,5 +1269,262 @@ fn scanner_is_non_vacuous_over_the_real_workspace() {
         }),
         "workspace walk must see init.rs RUST_LOG; got {:?}",
         scan.production
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Classification (ARCH-4b) — RED first on the unsanctioned name
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unsanctioned_env_read_fails_naming_file_and_variable() {
+    let src = r#"
+fn prod() {
+    let _ = std::env::var("RVC_TOTALLY_NEW_KNOB");
+}
+"#;
+    let file = "crates/example/src/lib.rs";
+    let scan = scan_source(file, src);
+    assert_eq!(scan.production.len(), 1, "expected one production read; got {scan:?}");
+    let violations = classify_violations(&scan.production);
+    assert_eq!(violations.len(), 1, "unsanctioned knob must fail; got {violations:?}");
+    let msg = &violations[0];
+    assert!(msg.contains(file), "failure must name file; got {msg}");
+    assert!(msg.contains("RVC_TOTALLY_NEW_KNOB"), "failure must name variable; got {msg}");
+
+    let src = r#"
+fn prod() {
+    let _ = InsecureGate::new("RVC_TOTALLY_NEW_KNOB", addr, InsecureMode::Refuse);
+}
+"#;
+    let violations = classify_ctor_violations(file, src);
+    assert!(!violations.is_empty(), "InsecureGate literal must fail; got {violations:?}");
+    let msg = violations.join("\n");
+    assert!(msg.contains(file), "failure must name file; got {msg}");
+    assert!(msg.contains("RVC_TOTALLY_NEW_KNOB"), "failure must name variable; got {msg}");
+
+    let src = r#"
+const FOO: &str = "RVC_TOTALLY_NEW_KNOB";
+fn prod() {
+    let _ = InsecureGate::new(FOO, addr, InsecureMode::Refuse);
+}
+"#;
+    let violations = classify_ctor_violations(file, src);
+    assert!(!violations.is_empty(), "non-suffix const FOO must fail; got {violations:?}");
+    let msg = violations.join("\n");
+    assert!(msg.contains(file), "failure must name file; got {msg}");
+    assert!(msg.contains("RVC_TOTALLY_NEW_KNOB"), "failure must name variable; got {msg}");
+}
+
+#[test]
+fn dynamic_read_not_on_the_table_fails() {
+    let src = r#"
+fn prod() {
+    let _ = env::var(other.var_name);
+}
+"#;
+    let file = "crates/example/src/elsewhere.rs";
+    assert!(
+        !DYNAMIC_READS.iter().any(|d| d.file == file),
+        "fixture file must be absent from DYNAMIC_READS"
+    );
+    let scan = scan_source(file, src);
+    assert_eq!(scan.production.len(), 1, "expected one dynamic read; got {scan:?}");
+    let violations = classify_violations(&scan.production);
+    assert!(
+        !violations.is_empty(),
+        "dynamic read off DYNAMIC_READS must fail (allow-list, not a skip); got {violations:?}"
+    );
+    let msg = violations.join("\n");
+    assert!(msg.contains(file), "failure must name file; got {msg}");
+    assert!(msg.contains("other.var_name"), "failure must name the expression; got {msg}");
+}
+
+#[test]
+fn dynamic_read_wrong_expr_at_allowlisted_site_fails() {
+    let file = DYNAMIC_READS[0].file;
+    let mut src = String::new();
+    for _ in 1..DYNAMIC_READS[0].line {
+        src.push('\n');
+    }
+    src.push_str("let _ = std::env::var(other.var_name);\n");
+    let scan = scan_source(file, &src);
+    assert!(
+        scan.production.iter().any(|r| {
+            r.line == DYNAMIC_READS[0].line
+                && matches!(&r.shape, Shape::Dynamic { expr } if expr == "other.var_name")
+        }),
+        "expected dynamic other.var_name at allowlisted line; got {scan:?}"
+    );
+    let violations = classify_violations(&scan.production);
+    assert!(
+        !violations.is_empty(),
+        "different expr at DYNAMIC_READS site must fail; got {violations:?}"
+    );
+    let msg = violations.join("\n");
+    assert!(msg.contains(file), "failure must name file; got {msg}");
+    assert!(msg.contains("other.var_name"), "failure must name the expression; got {msg}");
+}
+
+#[test]
+fn all_five_security_opt_outs_classify_via_constant_and_literal() {
+    assert_eq!(
+        SECURITY_OPT_OUT.len(),
+        5,
+        "class 1 is the five sanctioned opt-outs; got {SECURITY_OPT_OUT:?}"
+    );
+    for (i, &(name, reason)) in SECURITY_OPT_OUT.iter().enumerate() {
+        assert!(!reason.trim().is_empty(), "{name} missing reason");
+        let ident = format!("KNOB_{i}_ENV_VAR");
+        let src = format!(
+            "pub const {ident}: &str = \"{name}\";\nfn f() {{ let _ = std::env::var(\"{name}\"); }}\n"
+        );
+        let scan = scan_source("crates/example/src/opt_out.rs", &src);
+        assert_eq!(scan.production.len(), 2, "{name}: expected constant + literal; got {scan:?}");
+        let classes = classify_all(&scan.production);
+        assert_eq!(
+            classes.len(),
+            2,
+            "{name}: classifier must return one result per read; got {classes:?}"
+        );
+        for (read, class) in scan.production.iter().zip(&classes) {
+            match class {
+                Ok(Class::SecurityOptOut) => {}
+                other => panic!(
+                    "{name}: {read:?} must be class 1 via constant and literal; got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn real_workspace_is_green() {
+    assert_eq!(DYNAMIC_READS.len(), 1, "DYNAMIC_READS is shrinking-only; HEAD has one site");
+    assert_eq!(DYNAMIC_READS[0].file, "crates/crypto/src/insecure.rs");
+    assert_eq!(DYNAMIC_READS[0].line, 168);
+    assert_eq!(DYNAMIC_READS[0].expr, "self.env_var");
+    assert!(!DYNAMIC_READS[0].reason.trim().is_empty(), "DYNAMIC_READS reason required");
+    assert!(
+        !DYNAMIC_READS[0].flows.is_empty(),
+        "DYNAMIC_READS must name the constants that flow in"
+    );
+
+    let scan = scan_workspace();
+    let violations = classify_workspace(&scan);
+    assert!(
+        violations.is_empty(),
+        "G-3: unsanctioned production env read(s):\n  {}",
+        violations.join("\n  ")
+    );
+
+    let mut actual_flows: Vec<&str> = scan
+        .gate_ctors
+        .iter()
+        .map(|c| match &c.arg {
+            GateArg::Ident { ident } => ident.as_str(),
+            GateArg::Literal { name } => name.as_str(),
+            GateArg::Other { expr } => expr.as_str(),
+        })
+        .collect();
+    actual_flows.sort_unstable();
+    actual_flows.dedup();
+    let mut expected_flows: Vec<&str> = DYNAMIC_READS[0].flows.to_vec();
+    expected_flows.sort_unstable();
+    assert_eq!(
+        actual_flows, expected_flows,
+        "DYNAMIC_READS.flows must equal the production InsecureGate first-arg set"
+    );
+    for flow in DYNAMIC_READS[0].flows {
+        let value = scan
+            .str_consts
+            .get(*flow)
+            .unwrap_or_else(|| panic!("DYNAMIC_READS flow `{flow}` has no production const"));
+        assert_eq!(
+            class_for_name(value),
+            Some(Class::SecurityOptOut),
+            "flow `{flow}` = `{value}` must be class 1"
+        );
+    }
+
+    let names: HashSet<&str> = scan
+        .production
+        .iter()
+        .filter_map(|r| match &r.shape {
+            Shape::Literal { name } => Some(name.as_str()),
+            Shape::Constant { value, .. } => Some(value.as_str()),
+            Shape::Dynamic { .. } => None,
+        })
+        .collect();
+    for &(name, _) in SECURITY_OPT_OUT {
+        assert!(names.contains(name), "class 1 `{name}` missing from production scan");
+    }
+    for &(name, _) in GRANDFATHERED {
+        assert!(names.contains(name), "class 2 `{name}` missing from production scan");
+    }
+    for &(name, _) in ECOSYSTEM_CONFIG_WINS {
+        assert!(names.contains(name), "class 3 `{name}` missing from production scan");
+    }
+
+    assert!(
+        scan.production.iter().any(|r| {
+            r.file == DYNAMIC_READS[0].file
+                && r.line == DYNAMIC_READS[0].line
+                && matches!(&r.shape, Shape::Dynamic { expr } if expr == "self.env_var")
+        }),
+        "DYNAMIC_READS site missing from production scan; got {:?}",
+        scan.production
+    );
+
+    let idents: HashSet<&str> = scan
+        .production
+        .iter()
+        .filter_map(|r| match &r.shape {
+            Shape::Constant { ident, .. } => Some(ident.as_str()),
+            _ => None,
+        })
+        .collect();
+    for flow in DYNAMIC_READS[0].flows {
+        assert!(
+            idents.contains(flow),
+            "DYNAMIC_READS flow `{flow}` is not a production *_ENV constant"
+        );
+    }
+
+    let insecure = std::fs::read_to_string(workspace_root().join(DYNAMIC_READS[0].file))
+        .expect("insecure.rs readable");
+    let line =
+        insecure.lines().nth(DYNAMIC_READS[0].line - 1).expect("DYNAMIC_READS line in range");
+    assert!(
+        line.contains("self.env_var") && line.contains("env::var"),
+        "DYNAMIC_READS line drifted: {line}"
+    );
+}
+
+#[test]
+fn grandfathered_table_is_documented_shrinking_only() {
+    assert_eq!(GRANDFATHERED.len(), 1, "class 2 is exactly RVC_LOG_FORMAT");
+    assert_eq!(GRANDFATHERED[0].0, "RVC_LOG_FORMAT");
+    assert!(!GRANDFATHERED[0].1.trim().is_empty(), "GRANDFATHERED reason required");
+
+    let src = include_str!("env_allowlist.rs");
+    let at = src.find("const GRANDFATHERED").expect("GRANDFATHERED table");
+    let window = &src[at.saturating_sub(800)..at];
+    assert!(
+        window.contains("**Shrinking-only:** entries may be **removed**, never **added**"),
+        "GRANDFATHERED must use the kat_policy EXEMPTIONS shrinking-only wording; window={window}"
+    );
+
+    let at = src.find("const ECOSYSTEM_CONFIG_WINS").expect("class 3 table");
+    let window = &src[at.saturating_sub(1200)..at];
+    assert!(
+        window.contains("config-else-env"),
+        "class 3 must state config-else-env; window={window}"
+    );
+    assert!(window.contains("types.rs:438"), "class 3 must cite types.rs:438; window={window}");
+    assert!(window.contains(":447"), "class 3 must cite :447; window={window}");
+    assert!(
+        window.contains("figment") && window.contains("ADR-008"),
+        "C3: class 3 must say a figment Env layer would violate this gate and ADR-008 avoids the dep; window={window}"
     );
 }
