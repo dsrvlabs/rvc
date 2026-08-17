@@ -528,13 +528,13 @@ afterwards, it tests the migration against itself.
 
 **Acceptance criteria.**
 
-- [ ] Corpus exists with at least the five fixture classes above.
-- [ ] `every_knob_appears_in_the_parity_corpus` covers all **65** knob names and is green.
-- [ ] Snapshots of the parsed `Config` are committed and are the contract for `ARCH-4f`…`4i`.
-- [ ] Flat-wins precedence, the dual `logfile` shape, and `defaults < file < CLI` each have a test.
-- [ ] No test name ends in `_root`; `kat_policy.rs` stays green with **no new `EXEMPTIONS` entry**
+- [x] Corpus exists with at least the five fixture classes above.
+- [x] `every_knob_appears_in_the_parity_corpus` covers all **65** knob names and is green.
+- [x] Snapshots of the parsed `Config` are committed and are the contract for `ARCH-4f`…`4i`.
+- [x] Flat-wins precedence, the dual `logfile` shape, and `defaults < file < CLI` each have a test.
+- [x] No test name ends in `_root`; `kat_policy.rs` stays green with **no new `EXEMPTIONS` entry**
       (the list is shrinking-only).
-- [ ] The PR description states, in one sentence, that this harness is the **binding prerequisite**
+- [x] The PR description states, in one sentence, that this harness is the **binding prerequisite**
       for every later Stream-A issue in this phase.
 
 ---
