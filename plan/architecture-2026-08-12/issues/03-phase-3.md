@@ -981,15 +981,15 @@ task — and only *then* a trigger. Two knock-on facts the PR must state:
 5. `test_sse_drop_counter_is_labelled_expected`: no `error!`, no failure metric on drop or failover.
 
 **Acceptance criteria.**
-- [ ] An SSE subscriber runs in production, started at bootstrap and **registered** with Phase 2's
+- [x] An SSE subscriber runs in production, started at bootstrap and **registered** with Phase 2's
       executor at tier `Background` with a name — no raw `tokio::spawn`; G-4 green.
-- [ ] A bounded bridge exists; no `unbounded_channel` anywhere in the path (C9 anchor 6), and the
+- [x] A bounded bridge exists; no `unbounded_channel` anywhere in the path (C9 anchor 6), and the
       divergence from ADR-013's "no channel" wording is stated in the PR with the C7 reasoning.
-- [ ] Drops and failover produce **no** `error!` and **no** failure metric; the drop counter is
+- [x] Drops and failover produce **no** `error!` and **no** failure metric; the drop counter is
       labelled expected-path (C7).
-- [ ] The task shuts down within its tier budget on cancellation.
-- [ ] Feature-disabled / unconfigured case uses `register_opt`, so the running-task gauge is honest.
-- [ ] A note is filed back to Phase 2 recording that **both** vacuous `register` rows became real
+- [x] The task shuts down within its tier budget on cancellation.
+- [x] Feature-disabled / unconfigured case uses `register_opt`, so the running-task gauge is honest.
+- [x] A note is filed back to Phase 2 recording that **both** vacuous `register` rows became real
       here — `manager.rs:313` (outer spawn) and `sse.rs:174` (inner dispatch task).
 
 ---

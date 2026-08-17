@@ -366,6 +366,23 @@ lazy_static! {
         gauge
     };
 
+    /// Head events superseded on the latest-wins watch bridge (C7).
+    ///
+    /// Const-labelled `expected="true"` so this can never be a failure metric.
+    /// Counts `send_replace` overwrites of a previous `Some` head only; the
+    /// `sse.rs` mpsc overflow path is not hooked here (bn-manager ownership).
+    pub static ref RVC_SSE_EVENTS_DROPPED_TOTAL: IntCounter = {
+        let opts = Opts::new(
+            "rvc_sse_events_dropped_total",
+            "Head SSE events superseded by a later event on the latest-wins watch bridge"
+        ).const_label("expected", "true");
+        let counter = IntCounter::with_opts(opts)
+            .expect("Failed to create rvc_sse_events_dropped_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_sse_events_dropped_total metric");
+        counter
+    };
+
     /// Counter for registered task exits by outcome (TaskExecutor).
     ///
     /// Labels: `task` (static name), `outcome` ∈ {ok, panic, cancelled}.
@@ -414,6 +431,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
     lazy_static::initialize(&RVC_TASKS_RUNNING);
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
+    lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
 }
 
 /// Attestation status label values.
@@ -530,6 +548,7 @@ mod tests {
         RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.001);
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
+        RVC_SSE_EVENTS_DROPPED_TOTAL.inc();
 
         let metrics = REGISTRY.gather();
         let metric_names: Vec<&str> = metrics.iter().map(|m| m.name()).collect();
@@ -549,6 +568,10 @@ mod tests {
         assert!(
             metric_names.contains(&"rvc_slashing_protection_checks_total"),
             "rvc_slashing_protection_checks_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_sse_events_dropped_total"),
+            "rvc_sse_events_dropped_total should be registered"
         );
     }
 

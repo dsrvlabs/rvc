@@ -9,6 +9,7 @@ pub(crate) mod block_proposal;
 mod coordinator;
 pub(crate) mod duty_management;
 mod error;
+pub mod head_events;
 pub(crate) mod slot_context;
 pub(crate) mod sync_committee;
 pub(crate) mod utils;
@@ -19,6 +20,7 @@ pub use coordinator::{
     PubkeyMap,
 };
 pub use error::OrchestratorError;
+pub use head_events::{HeadEventGate, TriggerReason};
 // Re-export so callers that already depend on `rvc::orchestrator` can reach the
 // shared index registry without a second import path.
 pub use crate::pubkey_index::{

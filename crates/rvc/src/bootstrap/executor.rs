@@ -117,10 +117,10 @@ struct Registered {
 /// - [`spawn`](Self::spawn) — root owns the future (`tokio::spawn` inside).
 /// - [`register`](Self::register) — primitive; wrap an existing [`JoinHandle`].
 ///
-/// `register` has zero live *Infra-crate* callers at HEAD (VD-2d): the four ADR-001
-/// Infra sites either have no production caller or are per-pubkey/C5-owned. In-crate
-/// callers land in ARCH-2g (metrics server, keymanager API, liveness loop, slashing
-/// monitor). Infra rows become live in Phase 3 (ADR-013) when SSE is wired in.
+/// `register` wraps Infra `JoinHandle`s at the composition root (DAG). ARCH-3l
+/// registers `BnManager::start_sse`'s handle as `"bn.sse"`; a separate
+/// `"bn.sse.cancel"` forwarder maps the process token onto `watch<bool>`.
+/// Sync-monitor remains unwired; `keymanager-api` lifecycle is per-pubkey/C5-owned.
 pub struct TaskExecutor {
     token: CancellationToken,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
@@ -173,10 +173,9 @@ impl TaskExecutor {
     ///
     /// # Call-site status (VD-2d)
     ///
-    /// Ships with **zero live Infra-crate callers**. ADR-001's DAG argument for the
-    /// shape stands, but `bn-manager` SSE/sync-monitor have no production caller at
-    /// HEAD and `keymanager-api` lifecycle is per-pubkey/C5-owned. ARCH-2g registers
-    /// four in-crate handles; Phase 3 (ADR-013) is where Infra rows become live.
+    /// ARCH-3l calls `register("bn.sse", Background, start_sse_handle)` at the
+    /// call site so `bn-manager` stays Infra. Sync-monitor is still unwired;
+    /// `keymanager-api` lifecycle is per-pubkey/C5-owned.
     ///
     /// # Monitor / registry split
     ///
@@ -362,7 +361,7 @@ impl TaskExecutor {
     }
 
     #[cfg(test)]
-    fn registry_entries(&self) -> Vec<(&'static str, ShutdownTier)> {
+    pub(crate) fn registry_entries(&self) -> Vec<(&'static str, ShutdownTier)> {
         self.registry.lock().iter().map(|r| (r.name, r.tier)).collect()
     }
 

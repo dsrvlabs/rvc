@@ -15,7 +15,7 @@ use tonic::transport::Server;
 use tracing::{error, info, warn};
 
 use super::executor::{ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
-use super::tasks::spawn_background_tasks;
+use super::tasks::{spawn_background_tasks, spawn_sse_subscriber};
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
@@ -160,7 +160,7 @@ pub async fn run(
 
     let BeaconHandles {
         beacon_client,
-        bn_manager: _,
+        bn_manager,
         genesis_validators_root,
         genesis_validators_root_hex: _,
         genesis_time: _,
@@ -326,6 +326,10 @@ pub async fn run(
         pubkey_map.clone(),
         validator_store.clone(),
     )?;
+
+    // ARCH-3l: register the start_sse JoinHandle as Background "bn.sse".
+    // Gate is held so the watch receiver stays alive for ARCH-3m.
+    let _head_event_gate = spawn_sse_subscriber(Some(Arc::clone(&bn_manager)), &executor);
 
     // Log broadcast topics if non-default (T3.4)
     {
@@ -618,6 +622,11 @@ mod tests {
             body.contains("grpc_healthz"),
             "gRPC healthz must be registered as Ingress grpc_healthz (C8)"
         );
+        assert!(
+            body.contains("spawn_sse_subscriber"),
+            "ARCH-3l must start the SSE subscriber from production run()"
+        );
+        assert!(body.contains("bn.sse"), "ARCH-3l must name the registered SSE task bn.sse");
     }
 
     /// ARCH-2h: gRPC serve_with_shutdown must be token-only (no redundant signal arm).

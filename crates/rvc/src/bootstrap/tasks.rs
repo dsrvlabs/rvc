@@ -1,4 +1,4 @@
-//! Bootstrap phase: metrics, monitoring, and proposer-config background tasks.
+//! Bootstrap phase: metrics, monitoring, proposer-config, and BN SSE tasks.
 //!
 //! Extracted from the former `run_validator` tail so the ISSUE-4.10 metrics bind
 //! gate and task cancel/drain sequence can be unit-tested without the full
@@ -8,14 +8,23 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bn_manager::BnManager;
 use metrics::{serve_metrics_with_health, SharedHealthStatus};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 use validator_store::ValidatorStore;
 
 use super::executor::{ShutdownTier, TaskExecutor};
 use super::BootstrapError;
 use crate::config::{redact_url, Config};
+use crate::orchestrator::head_events::HeadEventGate;
 use crate::orchestrator::PubkeyMap;
+
+/// Executor name for the BN SSE subscriber (ARCH-3l).
+pub const SSE_TASK_NAME: &str = "bn.sse";
+
+/// Cancel-forwarder that maps the process token onto `start_sse`'s `watch<bool>`.
+pub const SSE_CANCEL_TASK_NAME: &str = "bn.sse.cancel";
 
 /// Env var that opts in to non-loopback metrics binds (ISSUE-4.10 / L-10).
 pub const METRICS_ALLOW_NON_LOOPBACK_ENV: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
@@ -161,6 +170,40 @@ pub fn spawn_background_tasks(
     Ok(())
 }
 
+/// Register the BN SSE subscriber at tier [`ShutdownTier::Background`].
+///
+/// `None` / unconfigured uses [`TaskExecutor::register_opt`] so
+/// `rvc_tasks_running{task="bn.sse"}` stays honest. `start_sse` is Infra and
+/// cannot depend on the executor (DAG): its `JoinHandle` is passed to
+/// [`TaskExecutor::register`]. A small [`SSE_CANCEL_TASK_NAME`] forwarder maps
+/// the process token onto `start_sse`'s `watch<bool>` and then aborts the
+/// Infra handle so drain does not wait on `sse.rs`'s uninterruptible reconnect
+/// sleep. A panic in that handle is `ShutdownReason::Failure("bn.sse")`.
+pub fn spawn_sse_subscriber(
+    bn_manager: Option<Arc<BnManager>>,
+    executor: &TaskExecutor,
+) -> Option<HeadEventGate> {
+    let Some(bn_manager) = bn_manager else {
+        executor.register_opt::<()>(SSE_TASK_NAME, ShutdownTier::Background, None);
+        return None;
+    };
+
+    let (bridge, gate) = HeadEventGate::pair();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    info!("Starting beacon-node SSE subscriber");
+    let sse_handle = bn_manager.start_sse(bridge.into_callback(), shutdown_rx);
+    let sse_abort = sse_handle.abort_handle();
+    executor.register(SSE_TASK_NAME, ShutdownTier::Background, sse_handle);
+
+    let token = executor.token();
+    executor.spawn(SSE_CANCEL_TASK_NAME, ShutdownTier::Background, async move {
+        token.cancelled().await;
+        let _ = shutdown_tx.send(true);
+        sse_abort.abort();
+    });
+    Some(gate)
+}
+
 #[cfg(test)]
 // RF5-10: env-var contract tests use set_var/remove_var under a lock.
 #[allow(unsafe_code)]
@@ -177,7 +220,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use validator_store::ValidatorConfig;
 
-    use super::super::executor::TierBudget;
+    use super::super::executor::{ShutdownReason, TierBudget};
     use crate::keymanager_adapters::KeystoreManagerAdapter;
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -418,6 +461,128 @@ mod tests {
             live_monitoring_counts(&pubkey_map, &validator_store),
             (2, 1),
             "disabled validator must reduce active without changing total loaded"
+        );
+    }
+
+    fn test_bn_manager() -> Arc<BnManager> {
+        Arc::new(
+            BnManager::new(bn_manager::BnManagerConfig::new(vec!["http://127.0.0.1:9".into()]))
+                .expect("test BnManager"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_head_event_subscriber_is_started_at_bootstrap() {
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let gate = spawn_sse_subscriber(Some(test_bn_manager()), &executor);
+        assert!(gate.is_some(), "configured SSE must return a HeadEventGate");
+        let names = executor.registered_names();
+        assert!(
+            names.contains(&SSE_TASK_NAME),
+            "missing registered task {SSE_TASK_NAME}: {names:?}"
+        );
+        assert!(
+            names.contains(&SSE_CANCEL_TASK_NAME),
+            "missing cancel-forwarder {SSE_CANCEL_TASK_NAME}: {names:?}"
+        );
+        let entries = executor.registry_entries();
+        assert!(
+            entries.contains(&(SSE_TASK_NAME, ShutdownTier::Background)),
+            "bn.sse must be Background, got {entries:?}"
+        );
+        assert!(
+            entries.contains(&(SSE_CANCEL_TASK_NAME, ShutdownTier::Background)),
+            "bn.sse.cancel must be Background, got {entries:?}"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_unconfigured_uses_register_opt() {
+        use metrics::definitions::RVC_TASKS_RUNNING;
+
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let before = RVC_TASKS_RUNNING.with_label_values(&[SSE_TASK_NAME]).get();
+        let gate = spawn_sse_subscriber(None, &executor);
+        assert!(gate.is_none());
+        assert!(
+            !executor.registered_names().contains(&SSE_TASK_NAME),
+            "unconfigured SSE must not register {SSE_TASK_NAME}"
+        );
+        assert!(
+            !executor.registered_names().contains(&SSE_CANCEL_TASK_NAME),
+            "unconfigured SSE must not register {SSE_CANCEL_TASK_NAME}"
+        );
+        assert_eq!(
+            RVC_TASKS_RUNNING.with_label_values(&[SSE_TASK_NAME]).get(),
+            before,
+            "register_opt(None) must not touch rvc_tasks_running{{task={SSE_TASK_NAME}}}"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sse_task_stops_on_cancellation_within_its_tier_budget() {
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let _gate = spawn_sse_subscriber(Some(test_bn_manager()), &executor);
+
+        let budget = TierBudget::new([
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        ]);
+        let start = std::time::Instant::now();
+        let outcome = executor.shutdown(budget).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            outcome.joined.contains(&SSE_TASK_NAME) || outcome.aborted.contains(&SSE_TASK_NAME),
+            "bn.sse must finish within Background budget (abort-on-cancel; sse.rs reconnect sleep is uninterruptible), joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "SSE cancel took {elapsed:?}, expected inside Background budget"
+        );
+    }
+
+    /// `BnManager::start_sse` cannot be forced to panic without editing bn-manager.
+    /// The production path is `executor.register(SSE_TASK_NAME, …, start_sse_handle)`,
+    /// so a panic in that handle is `ShutdownReason::Failure("bn.sse")`.
+    #[tokio::test]
+    async fn test_registered_sse_handle_panic_surfaces_failure_reason() {
+        let (executor, mut rx) = TaskExecutor::new(CancellationToken::new());
+        executor.register(
+            SSE_TASK_NAME,
+            ShutdownTier::Background,
+            tokio::spawn(async { panic!("injected start_sse JoinHandle panic") }),
+        );
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for ShutdownReason")
+            .expect("channel closed without reason");
+        assert_eq!(reason, ShutdownReason::Failure(SSE_TASK_NAME));
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[test]
+    fn test_spawn_sse_subscriber_registers_the_start_sse_handle() {
+        let src = include_str!("tasks.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body");
+        assert!(
+            body.contains("executor.register(SSE_TASK_NAME") && body.contains("sse_handle"),
+            "ARCH-3l must register the start_sse JoinHandle as bn.sse"
+        );
+        assert!(
+            body.contains("executor.spawn(SSE_CANCEL_TASK_NAME"),
+            "token→watch mapping must be a named cancel-forwarder, not the bn.sse work"
+        );
+        assert!(
+            !body.contains("executor.spawn(SSE_TASK_NAME"),
+            "bn.sse must not be an adapter wrapper around start_sse"
         );
     }
 }

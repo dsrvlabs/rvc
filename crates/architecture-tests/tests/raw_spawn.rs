@@ -19,8 +19,8 @@
 //!
 //! | Out-of-scope site | Reason |
 //! |---|---|
-//! | `crates/bn-manager/src/manager.rs` (`start_sse`) | Infra crate; cannot depend on the composition-root executor without violating the DAG gate. **No production caller at HEAD**; becomes live in Phase 3 (ADR-013), which registers the returned handle. |
-//! | `crates/bn-manager/src/sse.rs` | Same, plus: nested inside `subscribe_events`, whose handle is **discarded**. Making it registrable requires an API change owned by Phase 3. |
+//! | `crates/bn-manager/src/manager.rs` (`start_sse`) | Infra crate; cannot depend on the composition-root executor without violating the DAG gate. ARCH-3l `register`s the returned `JoinHandle` from `bootstrap/tasks.rs` (`"bn.sse"`). |
+//! | `crates/bn-manager/src/sse.rs` | Same, plus: nested inside `subscribe_events`, whose handle is **discarded**. ARCH-3l makes the subscriber live (the inner dispatch task still exits when `subscribe_events` returns). |
 //! | `crates/bn-manager/src/sync_status.rs` (`start_sync_monitor`) | Same; **no production caller at HEAD**. |
 //! | `crates/keymanager-api/src/lifecycle.rs` | Live, but **per-pubkey/per-import**: a `&'static str`-named registry entry per key is the wrong shape, and its cancellation is the C5 `stop_monitoring`/`cancel_monitoring` contract, unguarded until **G-6 lands in Phase 7**. |
 //!
