@@ -397,13 +397,13 @@ naive before/after would show **no change at all** and the milestone would be un
   reopened rather than the baseline being averaged into meaninglessness.
 
 **Acceptance criteria**
-- [ ] `plan/architecture-2026-08-12/measurements/m3-baseline-0ae9a09.md` exists, is non-empty, and
+- [x] `plan/architecture-2026-08-12/measurements/m3-baseline-0ae9a09.md` exists, is non-empty, and
       records three runs + median for p50/p95/p99/max, the achieved concurrency, the DB pragmas,
       and the exact harness invocation.
-- [ ] The observation-window decision is **stated with its consequence for
+- [x] The observation-window decision is **stated with its consequence for
       `tx_hold_metric.rs`** — which of the two series each of that file's assertions binds to.
-- [ ] The per-sign budget is derived from A-9 with the arithmetic shown, not asserted.
-- [ ] Phase entry criterion **E2 is now satisfiable**; the file is linked from the phase's PR.
+- [x] The per-sign budget is derived from A-9 with the arithmetic shown, not asserted.
+- [x] Phase entry criterion **E2 is now satisfiable**; the file is linked from the phase's PR.
 
 ---
 
