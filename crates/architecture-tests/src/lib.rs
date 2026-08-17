@@ -230,7 +230,8 @@ pub fn load_workspace_graph() -> WorkspaceGraph {
     build_workspace_graph(packages)
 }
 
-fn classification_map() -> HashMap<&'static str, (Layer, &'static str, &'static str)> {
+/// Package name → (layer, short label, one-line blurb).
+pub fn classification_map() -> HashMap<&'static str, (Layer, &'static str, &'static str)> {
     CLASSIFICATION
         .iter()
         .map(|(name, layer, label, blurb)| (*name, (*layer, *label, *blurb)))

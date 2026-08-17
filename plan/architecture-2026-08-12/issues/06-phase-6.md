@@ -395,16 +395,16 @@ Phase-1 rule P6 as in `no_rvc_prefix.rs:11`): for every package whose `CLASSIFIC
 
 **Acceptance criteria.**
 
-- [ ] `layer_edges.rs` exists and implements G-5a as "Base may depend only on Base" (A-P2), with the
+- [x] `layer_edges.rs` exists and implements G-5a as "Base may depend only on Base" (A-P2), with the
       literal zero-out-edge wording explicitly rejected in the file's `//!` header **naming VD-P5 and
       `crates/crypto/Cargo.toml:19-26` as the reason**.
-- [ ] The failure message names both packages **and** both layers.
-- [ ] The synthetic RED test exists and passes (i.e. it proves the gate fires); the real-tree RED
+- [x] The failure message names both packages **and** both layers.
+- [x] The synthetic RED test exists and passes (i.e. it proves the gate fires); the real-tree RED
       output is pasted in the PR.
-- [ ] The non-vacuity assertion exists.
-- [ ] `ZERO_OUT_EDGE_IF_PRESENT` is still byte-unchanged and still enforced.
-- [ ] G-5a is green on `develop` with `crypto` classified `Infra`.
-- [ ] `cargo nextest run -p rvc-architecture-tests` green in the Phase-0 `arch-gates` job.
+- [x] The non-vacuity assertion exists.
+- [x] `ZERO_OUT_EDGE_IF_PRESENT` is still byte-unchanged and still enforced.
+- [x] G-5a is green on `develop` with `crypto` classified `Infra`.
+- [x] `cargo nextest run -p rvc-architecture-tests` green in the Phase-0 `arch-gates` job.
 
 ---
 
