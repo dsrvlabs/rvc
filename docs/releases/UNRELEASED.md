@@ -210,3 +210,16 @@ duty_fetch_timeout = 14
 
 The same four keys also parse as top-level flat keys (`block_production_timeout`,
 …). A value of `0` is rejected from both the file and the CLI.
+
+---
+
+## Slashing: ADR-005 does not deliver G6 on the VC path
+
+ARCH-P1-5 (`reserve_then_sign`) shortens the slashing-DB critical section on
+the **signer-server** path. It does **not** make slashable signing scale to
+the target validator count on the validator-client path. Attestation in
+`crates/rvc/src/orchestrator/attestation.rs` is still a sequential
+`for duty in duties { … .await }` loop; 200 keys × 200 ms remote-sign
+latency is **40 s (ten mainnet slots) with a free slashing DB**. VC-path
+attestation concurrency is a separate, unscheduled requirement. Do not read
+this cycle as delivering G6.

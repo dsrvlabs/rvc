@@ -7,6 +7,9 @@ Checked-in baselines for success metrics that later phases must improve against.
 - **M3 (Phase 5 entry E2):** recorded under **ARCH-5b** against the ARCH-5a
   `signer-server` load harness on develop `11bb569` (architecture baseline name
   `0ae9a09`). Gates every issue from `ARCH-5i` onward.
+- **M3 post-ADR-005 (Phase 5 X6/X7/X8):** recorded under **ARCH-5m** on
+  `b68d32b` against the same ARCH-5a profile. Cites the baseline measured
+  commit `11bb5696b6025ee8dd19b17a2c1dbbf066e25c2b`.
 
 | File | Metric | Role |
 |---|---|---|
@@ -14,9 +17,7 @@ Checked-in baselines for success metrics that later phases must improve against.
 | [`m2-slot-phase0-offset.md`](./m2-slot-phase0-offset.md) | **M2** `rvc_slot_phase_block_start_offset_ms` p99 warm/cold | Separate warm/cold p99 for A-5 targets (≤1 s / ≤2 s) |
 | [`m1-m2-post-phase3.md`](./m1-m2-post-phase3.md) | **M1/M2 after ADR-004** (ARCH-3k) | M1 = 0 at 60 s and 80 s; M2 p99 0 ms at slot start (≤1 s / ≤2 s) |
 | [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) | **M3** slashing tx-hold (ARCH-5a / ARCH-5b) | Three-run median; concurrency = 1; observation-window decision (keep current series, add reserve-tx in 5l); per-sign budget = 3999/200 = 19.995 ms |
-
-Post-ADR-005 counterpart (not this task): `m3-post-adr005.md` (**ARCH-5m**). That
-file must cite the measured commit hash recorded in `m3-baseline-0ae9a09.md`.
+| [`m3-post-adr005.md`](./m3-post-adr005.md) | **M3 after ADR-005** (ARCH-5m) | Three-run median under **both** windows; X6 unmet (reserve-tx p99 917 ms ≫ 19.995 ms); fsync named; group commit filed; X7 rollback; X8 no G6 |
 
 ---
 
@@ -70,14 +71,18 @@ cargo nextest run -p rvc-signer-server --run-ignored ignored-only --no-capture \
 ```
 
 Run **three** times. Record all three plus the median; do not keep a single run.
-Compare against [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md). Capture
-`achieved_concurrency`, `effective_concurrency`, wall and
-`rvc_signer_slashing_tx_hold_duration_ms` p50/p95/p99/max, and the DB pragmas
+Compare against [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) and, after
+the ADR-005 switchover, [`m3-post-adr005.md`](./m3-post-adr005.md). Capture
+`achieved_concurrency`, `effective_concurrency`, wall,
+`rvc_signer_slashing_tx_hold_duration_ms` p50/p95/p99/max,
+`rvc_slashing_reserve_tx_hold_duration_ms` p50/p95/p99/max,
+`rvc_slashing_reconcile_total{outcome="failed"}`, and the DB pragmas
 object. A p99 spread **> 20 %** across the three runs is a harness defect
 (reopen ARCH-5a), not a number to average.
 
-This profile targets **`signer-server` / `SigningGate`**, not the VC
-attestation loop (X8).
+Judge X6 against **3999 / 200 = 19.995 ms**, not against "faster than
+baseline." This profile targets **`signer-server` / `SigningGate`**, not the
+VC attestation loop (X8).
 
 ---
 
@@ -88,9 +93,9 @@ attestation loop (X8).
 | M1 miss rate | virtual-time matrix | exact match both runs (ARCH-7c) | **±0 slots / ±0.0 %** |
 | M2 offset | MockSlotClock multi-slot | exact 9000 ms both runs | **±0 ms** |
 | M2 offset | SystemSlotClock + D=2 s | exact 8000 ms mean both runs | **±2000 ms** mean; must stay **≥ D** |
-| M3 tx-hold p99 | ARCH-5a 200×200 ms, `test` profile | three runs, 0.209 % p99 spread (ARCH-5b) | **±5 %** on this host; **> 20 %** reopens ARCH-5a |
+| M3 tx-hold p99 | ARCH-5a 200×200 ms, `test` profile | three runs, 0.209 % p99 spread (ARCH-5b); post-ADR-005 1.51 % / 1.81 % (ARCH-5m, both series) | **±5 %** on this host; **> 20 %** reopens ARCH-5a |
 
-**RED (reproducibility):** hand this README to a second person (or clean clone), re-run the commands, and compare against the tables in `m1-*.md` / `m2-*.md` / `m3-baseline-0ae9a09.md`. If numbers fall outside the tolerance band, fix the README (or document a harness/fixture change) — do not silently “fix” a baseline by reordering the slot loop (that is Phase 3 / ADR-004) or by redefining the M3 observation window (that is ARCH-5b's recorded decision; the series add is ARCH-5l).
+**RED (reproducibility):** hand this README to a second person (or clean clone), re-run the commands, and compare against the tables in `m1-*.md` / `m2-*.md` / `m3-baseline-0ae9a09.md` / `m3-post-adr005.md`. If numbers fall outside the tolerance band, fix the README (or document a harness/fixture change) — do not silently “fix” a baseline by reordering the slot loop (that is Phase 3 / ADR-004) or by redefining the M3 observation window (that is ARCH-5b's recorded decision; the series add is ARCH-5l). Do not declare X6 met because total wall fits in 3999 ms — X6 is p99 vs 19.995 ms.
 
 ---
 

@@ -14,7 +14,9 @@
 //! | Injected BLS latency | 200 ms `tokio::time::sleep` on [`helpers::SlowSigner`] |
 //! | DB | real [`slashing::SlashingDb::open`] temp file |
 //! | Pragmas in force | `journal_mode=WAL`, `synchronous=EXTRA`, `fullfsync=ON` (macOS) |
-//! | Metric | `rvc_signer_slashing_tx_hold_duration_ms{kind="attestation"}` |
+//! | Metrics | `rvc_signer_slashing_tx_hold_duration_ms{kind="attestation"}` (kept window);
+//!            `rvc_slashing_reserve_tx_hold_duration_ms{kind="attestation"}` (reserve-only);
+//!            `rvc_slashing_reconcile_total{kind="attestation",outcome}` (A-5.5) |
 //!
 //! # Invocation
 //!
@@ -43,10 +45,15 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use metrics::definitions::{tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS};
+use metrics::definitions::{
+    reconcile_outcome, tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
+    RVC_SLASHING_RECONCILE_TOTAL, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
+};
+use prometheus::Histogram;
 use tonic::Request;
 
 use signer_server::proto::signer_v2 as sv2;
@@ -83,6 +90,12 @@ struct LoadSummary {
     tx_hold: Percentiles,
     tx_hold_count: u64,
     tx_hold_sum_ms: f64,
+    reserve_tx_hold: Percentiles,
+    reserve_tx_hold_count: u64,
+    reserve_tx_hold_sum_ms: f64,
+    reconcile_deleted: u64,
+    reconcile_not_applicable: u64,
+    reconcile_failed: u64,
 }
 
 impl LoadSummary {
@@ -97,7 +110,11 @@ impl LoadSummary {
              \"successes\": {ok},\n  \"failures\": {fail},\n  \"total_wall_ms\": {total:.3},\n  \
              \"wall_ms\": {{ \"p50\": {wp50:.3}, \"p95\": {wp95:.3}, \"p99\": {wp99:.3}, \"max\": {wmax:.3} }},\n  \
              \"tx_hold_ms\": {{ \"p50\": {hp50:.3}, \"p95\": {hp95:.3}, \"p99\": {hp99:.3}, \"max\": {hmax:.3}, \
-             \"count\": {hcount}, \"sum\": {hsum:.3} }}\n}}\n",
+             \"count\": {hcount}, \"sum\": {hsum:.3} }},\n  \
+             \"reserve_tx_hold_ms\": {{ \"p50\": {rp50:.3}, \"p95\": {rp95:.3}, \"p99\": {rp99:.3}, \"max\": {rmax:.3}, \
+             \"count\": {rcount}, \"sum\": {rsum:.3} }},\n  \
+             \"reconcile_total\": {{ \"kind\": \"attestation\", \"deleted\": {rdel}, \
+             \"not_applicable\": {rna}, \"failed\": {rfail} }}\n}}\n",
             keys = self.keys,
             inj = self.injected_latency_ms,
             fsync = if cfg!(target_os = "macos") { "ON" } else { "n/a" },
@@ -116,6 +133,15 @@ impl LoadSummary {
             hmax = self.tx_hold.max,
             hcount = self.tx_hold_count,
             hsum = self.tx_hold_sum_ms,
+            rp50 = self.reserve_tx_hold.p50,
+            rp95 = self.reserve_tx_hold.p95,
+            rp99 = self.reserve_tx_hold.p99,
+            rmax = self.reserve_tx_hold.max,
+            rcount = self.reserve_tx_hold_count,
+            rsum = self.reserve_tx_hold_sum_ms,
+            rdel = self.reconcile_deleted,
+            rna = self.reconcile_not_applicable,
+            rfail = self.reconcile_failed,
         )
     }
 }
@@ -140,6 +166,75 @@ fn percentiles_of(mut samples: Vec<f64>) -> Percentiles {
         p99: percentile(&samples, 0.99),
         max: samples[samples.len() - 1],
     }
+}
+
+fn empty_percentiles() -> Percentiles {
+    Percentiles { p50: 0.0, p95: 0.0, p99: 0.0, max: 0.0 }
+}
+
+/// Pull exact per-observation deltas from a histogram via `sample_sum` /
+/// `sample_count` (same method as ARCH-5b — not a bucket quantile).
+fn drain_histogram_samples(
+    hist: &Histogram,
+    prev_count: &mut u64,
+    prev_sum: &mut f64,
+    out: &mut Vec<f64>,
+) {
+    let count = hist.get_sample_count();
+    let sum = hist.get_sample_sum();
+    let delta_n = count.saturating_sub(*prev_count);
+    if delta_n == 1 {
+        out.push(sum - *prev_sum);
+    } else if delta_n > 1 {
+        let avg = (sum - *prev_sum) / delta_n as f64;
+        out.extend(std::iter::repeat_n(avg, delta_n as usize));
+    }
+    *prev_count = count;
+    *prev_sum = sum;
+}
+
+struct HistCursor {
+    hist: Histogram,
+    start_count: u64,
+    start_sum: f64,
+    prev_count: u64,
+    prev_sum: f64,
+    samples: Vec<f64>,
+}
+
+impl HistCursor {
+    fn new(hist: Histogram) -> Self {
+        let start_count = hist.get_sample_count();
+        let start_sum = hist.get_sample_sum();
+        Self {
+            hist,
+            start_count,
+            start_sum,
+            prev_count: start_count,
+            prev_sum: start_sum,
+            samples: Vec::new(),
+        }
+    }
+
+    fn drain(&mut self) {
+        drain_histogram_samples(
+            &self.hist,
+            &mut self.prev_count,
+            &mut self.prev_sum,
+            &mut self.samples,
+        );
+    }
+
+    fn finish(mut self) -> (Vec<f64>, u64, f64) {
+        self.drain();
+        let count = self.prev_count.saturating_sub(self.start_count);
+        let sum = self.prev_sum - self.start_sum;
+        (self.samples, count, sum)
+    }
+}
+
+fn reconcile_count(kind: &str, outcome: &str) -> u64 {
+    RVC_SLASHING_RECONCILE_TOTAL.with_label_values(&[kind, outcome]).get()
 }
 
 fn output_path_from_cli() -> Option<PathBuf> {
@@ -210,12 +305,41 @@ async fn drive_concurrent_attestations(
     injected_latency_ms: f64,
     slow: &helpers::SlowSigner,
 ) -> LoadSummary {
-    let hist =
+    let tx_hist =
         RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS.with_label_values(&[tx_hold_kind::ATTESTATION]);
-    let start_count = hist.get_sample_count();
-    let start_sum = hist.get_sample_sum();
-    let mut prev_count = start_count;
-    let mut prev_sum = start_sum;
+    let reserve_hist =
+        RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS.with_label_values(&[tx_hold_kind::ATTESTATION]);
+
+    let kind = tx_hold_kind::ATTESTATION;
+    let rec_deleted_start = reconcile_count(kind, reconcile_outcome::DELETED);
+    let rec_na_start = reconcile_count(kind, reconcile_outcome::NOT_APPLICABLE);
+    let rec_failed_start = reconcile_count(kind, reconcile_outcome::FAILED);
+
+    // Reserve observations fire at reserve-return, before the RPC completes.
+    // Poll both series so concurrent sign completions still yield per-sample
+    // deltas (exact sum, not a bucket quantile — same method as ARCH-5b).
+    let tx_cursor = Arc::new(Mutex::new(HistCursor::new(tx_hist)));
+    let reserve_cursor = Arc::new(Mutex::new(HistCursor::new(reserve_hist)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let tx_cursor = Arc::clone(&tx_cursor);
+        let reserve_cursor = Arc::clone(&reserve_cursor);
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_micros(200));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                tx_cursor.lock().expect("tx-hold cursor").drain();
+                reserve_cursor.lock().expect("reserve-tx cursor").drain();
+                if stop.load(Ordering::Acquire) {
+                    tx_cursor.lock().expect("tx-hold cursor").drain();
+                    reserve_cursor.lock().expect("reserve-tx cursor").drain();
+                    break;
+                }
+            }
+        })
+    };
 
     let svc = Arc::new(service);
     let mut set = tokio::task::JoinSet::new();
@@ -234,7 +358,6 @@ async fn drive_concurrent_attestations(
     }
 
     let mut walls = Vec::with_capacity(pubkeys.len());
-    let mut holds = Vec::with_capacity(pubkeys.len());
     let mut successes = 0usize;
     let mut first_error: Option<String> = None;
     while let Some(joined) = set.join_next().await {
@@ -245,19 +368,10 @@ async fn drive_concurrent_attestations(
         } else if first_error.is_none() {
             first_error = err;
         }
-
-        let count = hist.get_sample_count();
-        let sum = hist.get_sample_sum();
-        let delta_n = count.saturating_sub(prev_count);
-        if delta_n == 1 {
-            holds.push(sum - prev_sum);
-        } else if delta_n > 1 {
-            let avg = (sum - prev_sum) / delta_n as f64;
-            holds.extend(std::iter::repeat_n(avg, delta_n as usize));
-        }
-        prev_count = count;
-        prev_sum = sum;
     }
+
+    stop.store(true, Ordering::Release);
+    poller.await.expect("histogram poller panicked");
 
     let total_wall_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     let failures = pubkeys.len() - successes;
@@ -265,14 +379,18 @@ async fn drive_concurrent_attestations(
         eprintln!("load-profile first error ({failures} failures): {err}");
     }
 
+    let tx_cursor = Arc::try_unwrap(tx_cursor).unwrap_or_else(|_| panic!("tx cursor still shared"));
+    let reserve_cursor =
+        Arc::try_unwrap(reserve_cursor).unwrap_or_else(|_| panic!("reserve cursor still shared"));
+    let (holds, tx_hold_count, tx_hold_sum_ms) =
+        tx_cursor.into_inner().expect("tx cursor").finish();
+    let (reserve_holds, reserve_tx_hold_count, reserve_tx_hold_sum_ms) =
+        reserve_cursor.into_inner().expect("reserve cursor").finish();
+
     let wall = percentiles_of(walls);
-    let tx_hold = if holds.is_empty() {
-        Percentiles { p50: 0.0, p95: 0.0, p99: 0.0, max: 0.0 }
-    } else {
-        percentiles_of(holds)
-    };
-    let tx_hold_count = hist.get_sample_count().saturating_sub(start_count);
-    let tx_hold_sum_ms = hist.get_sample_sum() - start_sum;
+    let tx_hold = if holds.is_empty() { empty_percentiles() } else { percentiles_of(holds) };
+    let reserve_tx_hold =
+        if reserve_holds.is_empty() { empty_percentiles() } else { percentiles_of(reserve_holds) };
     let effective_concurrency = if total_wall_ms > 0.0 {
         (pubkeys.len() as f64) * injected_latency_ms / total_wall_ms
     } else {
@@ -291,6 +409,15 @@ async fn drive_concurrent_attestations(
         tx_hold,
         tx_hold_count,
         tx_hold_sum_ms,
+        reserve_tx_hold,
+        reserve_tx_hold_count,
+        reserve_tx_hold_sum_ms,
+        reconcile_deleted: reconcile_count(kind, reconcile_outcome::DELETED)
+            .saturating_sub(rec_deleted_start),
+        reconcile_not_applicable: reconcile_count(kind, reconcile_outcome::NOT_APPLICABLE)
+            .saturating_sub(rec_na_start),
+        reconcile_failed: reconcile_count(kind, reconcile_outcome::FAILED)
+            .saturating_sub(rec_failed_start),
     }
 }
 
@@ -319,6 +446,35 @@ fn test_percentile_nearest_rank_on_known_samples() {
     let p = percentiles_of(vec![10.0, 20.0, 30.0]);
     assert_eq!(p.max, 30.0);
     assert!(p.p50 >= 10.0 && p.p50 <= 30.0);
+}
+
+/// ARCH-5m: the ignored profile JSON must carry both hold series and the
+/// A-5.5 reconcile-failed counter (not just the pre-ADR-005 tx-hold window).
+#[test]
+fn test_load_summary_json_includes_reserve_series_and_reconcile_failed() {
+    let summary = LoadSummary {
+        keys: 200,
+        injected_latency_ms: 200.0,
+        achieved_concurrency: 8,
+        effective_concurrency: 1.5,
+        successes: 200,
+        failures: 0,
+        total_wall_ms: 1000.0,
+        wall: Percentiles { p50: 1.0, p95: 2.0, p99: 3.0, max: 4.0 },
+        tx_hold: Percentiles { p50: 5.0, p95: 6.0, p99: 7.0, max: 8.0 },
+        tx_hold_count: 200,
+        tx_hold_sum_ms: 100.0,
+        reserve_tx_hold: Percentiles { p50: 9.0, p95: 10.0, p99: 11.0, max: 12.0 },
+        reserve_tx_hold_count: 200,
+        reserve_tx_hold_sum_ms: 50.0,
+        reconcile_deleted: 0,
+        reconcile_not_applicable: 0,
+        reconcile_failed: 0,
+    };
+    let json = summary.to_json();
+    assert!(json.contains("\"reserve_tx_hold_ms\""), "missing reserve-tx series: {json}");
+    assert!(json.contains("\"reconcile_total\""), "missing reconcile object: {json}");
+    assert!(json.contains("\"failed\": 0"), "missing reconcile failed count: {json}");
 }
 
 /// 1 key, 200 ms injected: the tx-hold histogram must record ≥ 200 ms so the
@@ -359,8 +515,11 @@ async fn test_slow_signer_delays_are_observed_through_the_blocking_bridge() {
 }
 
 /// 200 concurrent `sign_attestation` calls. Ignored so workspace nextest stays
-/// fast. Asserts the harness detects full slashing-mutex serialization.
-#[ignore = "ARCH-5a load profile (~40s+); see file header for nextest invocation"]
+/// fast. Name kept for the ARCH-5a/5b/5m `--exact` invocation. After ADR-005
+/// the slashing mutex no longer spans the sign; non-vacuity is overlapping
+/// `SlowSigner` calls plus both hold series, not the pre-switchover
+/// serialized floor.
+#[ignore = "ARCH-5a/5m load profile (full A-9); see file header for invocation"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_load_profile_reports_p99_above_serialized_floor() {
     let fixture = make_load_fixture();
@@ -382,36 +541,18 @@ async fn test_load_profile_reports_p99_above_serialized_floor() {
         summary.failures
     );
     assert!(
-        summary.achieved_concurrency <= 2,
-        "harness must observe slashing-mutex serialization (SlowSigner max_in_flight ≤ 2); got {}",
+        summary.achieved_concurrency > 2,
+        "ADR-005 must let SlowSigner calls overlap (max_in_flight > 2); got {}",
         summary.achieved_concurrency
-    );
-    assert!(
-        p99_meets_serialized_floor(
-            summary.wall.p99,
-            keys,
-            injected_ms,
-            summary.achieved_concurrency
-        ),
-        "wall p99 {} ms must be ≥ ({} × {} ms) / {} minus one injected quantum",
-        summary.wall.p99,
-        keys,
-        injected_ms,
-        summary.achieved_concurrency
-    );
-    assert!(
-        p99_meets_serialized_floor(
-            summary.tx_hold.p99,
-            keys,
-            injected_ms,
-            summary.achieved_concurrency
-        ),
-        "tx-hold p99 {} ms must be ≥ serialized floor (histogram must not look like a free DB)",
-        summary.tx_hold.p99
     );
     assert!(
         summary.tx_hold_count >= keys as u64,
-        "histogram must record one observation per sign; count={}",
+        "kept-window histogram must record one observation per sign; count={}",
         summary.tx_hold_count
+    );
+    assert!(
+        summary.reserve_tx_hold_count >= keys as u64,
+        "reserve-tx histogram must record one observation per reserve; count={}",
+        summary.reserve_tx_hold_count
     );
 }

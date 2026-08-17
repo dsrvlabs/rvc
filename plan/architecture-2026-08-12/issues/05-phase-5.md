@@ -1282,14 +1282,14 @@ is where the phase's **honest scope limit** is written down rather than buried.
   the two numbers cannot be from different trees.
 
 **Acceptance criteria**
-- [ ] `m3-post-adr005.md` records three runs + median under **both** metric definitions, alongside
+- [x] `m3-post-adr005.md` records three runs + median under **both** metric definitions, alongside
       the baseline, citing its commit hash (X6).
-- [ ] X6 is judged against the derived per-sign budget with the arithmetic shown; if unmet, fsync
+- [x] X6 is judged against the derived per-sign budget with the arithmetic shown; if unmet, fsync
       is named as the next wall and group commit is filed as a new requirement.
-- [ ] Reconcile failure count under load is reported.
-- [ ] The rollback plan is written, including *"re-run all three proof surfaces, not just the
+- [x] Reconcile failure count under load is reported.
+- [x] The rollback plan is written, including *"re-run all three proof surfaces, not just the
       vectors"* and the no-migration statement (X7).
-- [ ] **VC-path attestation concurrency is filed as a separate, unscheduled requirement**, with
+- [x] **VC-path attestation concurrency is filed as a separate, unscheduled requirement**, with
       the 40 s arithmetic and the `attestation.rs:171-192` citation. G6 is **not** claimed (X8).
 
 ---
