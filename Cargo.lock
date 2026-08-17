@@ -4557,6 +4557,7 @@ dependencies = [
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-grpc-signer",
+ "rvc-metrics",
  "rvc-observability",
  "rvc-signer",
  "rvc-signer-proto",

@@ -107,6 +107,8 @@ tracing-subscriber = { workspace = true, features = ["registry"] }
 parking_lot.workspace = true
 rvc-test-support.workspace = true
 tempfile.workspace = true
+# ARCH-5a load harness reads `rvc_signer_slashing_tx_hold_duration_ms`.
+metrics.workspace = true
 proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true

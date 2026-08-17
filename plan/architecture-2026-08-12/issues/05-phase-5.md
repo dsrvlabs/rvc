@@ -336,14 +336,14 @@ sequential `for duty in duties { … .await }` loop.
 - **KAT note (A-5.10):** no test in this issue may be named `*_root`; none needs to be.
 
 **Acceptance criteria**
-- [ ] A single command runs the 200-key / 200 ms profile against `signer-server` and prints
+- [x] A single command runs the 200-key / 200 ms profile against `signer-server` and prints
       p50/p95/p99/max for both wall-clock latency and the tx-hold histogram.
-- [ ] The harness is `#[ignore]`d and does not lengthen `cargo nextest run --workspace`.
-- [ ] The non-vacuity test proves the harness detects serialization (RED demonstrated on an
+- [x] The harness is `#[ignore]`d and does not lengthen `cargo nextest run --workspace`.
+- [x] The non-vacuity test proves the harness detects serialization (RED demonstrated on an
       artificially free DB).
-- [ ] No production file under `crates/signer/src/` or `crates/signer-server/src/` is modified;
+- [x] No production file under `crates/signer/src/` or `crates/signer-server/src/` is modified;
       `git diff --stat` in the PR shows tests-only.
-- [ ] Header documents: key count, injected latency, DB pragmas in force, and that the profile
+- [x] Header documents: key count, injected latency, DB pragmas in force, and that the profile
       targets `signer-server` **because the VC path's wall is its sequential loop, not the mutex**
       (X8).
 

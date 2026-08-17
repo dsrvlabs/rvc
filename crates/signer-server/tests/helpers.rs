@@ -3,15 +3,24 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use crypto::{KeyManager, SecretKey};
-use eth_types::encode_beacon_block_ssz;
+use crypto::{KeyManager, LocalSigner, SecretKey, Signature, Signer, SigningError};
+use eth_types::{encode_beacon_block_ssz, Root};
+use signer::{SigningEnablement, SigningGate, ValidatorLockMap};
 use slashing::SlashingDb;
 
 use signer_server::backend::{SigningBackend, SigningBackendError};
 use signer_server::proto::signer_v2::ForkInfo;
 use signer_server::service::SignerServiceImpl;
+
+/// Default injected BLS latency for the ARCH-5a signer-server load profile (A-9).
+pub const LOAD_PROFILE_INJECTED_LATENCY: Duration = Duration::from_millis(200);
+
+/// Default key count for the ARCH-5a signer-server load profile (A-9).
+pub const LOAD_PROFILE_KEY_COUNT: usize = 200;
 
 /// The BLS secret key used in all happy-path tests.
 /// Derived via EIP-2333 from a fixed seed for reproducibility.
@@ -98,6 +107,134 @@ impl SigningBackend for TestBackend {
     fn public_keys(&self) -> Vec<[u8; 48]> {
         self.km.list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
     }
+}
+
+// ── ARCH-5a load fixture ──────────────────────────────────────────────────────
+
+/// Deterministic secret key for load-profile validator `index`.
+pub fn load_profile_secret_key(index: u32) -> SecretKey {
+    use crypto::eip2333::derive_master_sk;
+    let mut seed = [0xA9u8; 32];
+    seed[28..32].copy_from_slice(&index.to_be_bytes());
+    derive_master_sk(&seed).expect("derive load-profile sk")
+}
+
+/// `crypto::Signer` wrapping [`LocalSigner`] with an async sleep before each sign.
+///
+/// Sleeps on the *async* side so `Handle::block_on(timeout(...))` in
+/// `SlashableSignSession::stage_then_sign` observes the delay the same way a
+/// remote signer would. Do not replace this with `std::thread::sleep`.
+pub struct SlowSigner {
+    inner: LocalSigner,
+    sleep: Duration,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl SlowSigner {
+    /// Wrap `inner` and sleep `sleep` before every `sign`.
+    ///
+    /// Default profile latency is [`LOAD_PROFILE_INJECTED_LATENCY`] (200 ms).
+    pub fn new(inner: LocalSigner, sleep: Duration) -> Self {
+        Self { inner, sleep, in_flight: AtomicUsize::new(0), max_in_flight: AtomicUsize::new(0) }
+    }
+
+    /// Peak number of overlapping `sign` calls observed so far.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::SeqCst)
+    }
+}
+
+struct InFlightGuard<'a> {
+    current: &'a AtomicUsize,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Signer for SlowSigner {
+    async fn sign(
+        &self,
+        signing_root: &Root,
+        pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let _guard = InFlightGuard { current: &self.in_flight };
+        tokio::time::sleep(self.sleep).await;
+        self.inner.sign(signing_root, pubkey).await
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        self.inner.public_keys()
+    }
+}
+
+/// Always-allow enablement for the load fixture (standalone signer semantics).
+struct LoadEnablement;
+
+impl SigningEnablement for LoadEnablement {
+    fn is_signing_enabled(&self, _pubkey: &crypto::PublicKey) -> bool {
+        true
+    }
+}
+
+/// signer-server load-profile fixture: N keys, [`SlowSigner`], real `SlashingDb::open`.
+pub struct LoadFixture {
+    pub service: SignerServiceImpl,
+    pub db_path: PathBuf,
+    pub pubkeys: Vec<[u8; 48]>,
+    pub slow: Arc<SlowSigner>,
+    pub injected_latency: Duration,
+    pub key_count: usize,
+}
+
+/// 200-key / 200 ms load fixture (A-9 defaults).
+pub fn make_load_fixture() -> LoadFixture {
+    make_load_fixture_with(LOAD_PROFILE_KEY_COUNT, LOAD_PROFILE_INJECTED_LATENCY)
+}
+
+/// Load fixture with explicit key count and injected BLS latency.
+///
+/// Uses the public `SigningGate::new_with_raw_signer` +
+/// `SignerServiceImpl::new_v2_with_gate` seams so the injector is a
+/// `crypto::Signer` (no production edit). The slashing DB is opened via the
+/// real on-disk `SlashingDb::open` path (WAL + `synchronous=EXTRA` +
+/// `fullfsync=ON` on macOS).
+pub fn make_load_fixture_with(key_count: usize, injected_latency: Duration) -> LoadFixture {
+    assert!(key_count > 0, "load fixture requires at least one key");
+
+    let mut km_local = KeyManager::new();
+    let mut pubkeys = Vec::with_capacity(key_count);
+    for i in 0..key_count {
+        let sk = load_profile_secret_key(i as u32);
+        pubkeys.push(sk.public_key().to_bytes());
+        km_local.insert(sk);
+    }
+
+    let slow = Arc::new(SlowSigner::new(LocalSigner::new(km_local), injected_latency));
+    let db_path = make_temp_db_path();
+    let db = Arc::new(SlashingDb::open(&db_path).expect("open load-profile slashing db"));
+    let gate = SigningGate::new_with_raw_signer(
+        Arc::clone(&db),
+        Arc::new(LoadEnablement),
+        Arc::clone(&slow) as Arc<dyn Signer>,
+        Arc::new(ValidatorLockMap::new()),
+        Duration::from_secs(4),
+    );
+    // Slashable RPCs sign through the gate's SlowSigner. The service still
+    // requires a SigningBackend; an empty one is enough for this profile.
+    let backend = Arc::new(TestBackend { km: Arc::new(KeyManager::new()) });
+    let service = SignerServiceImpl::new_v2_with_gate(
+        backend as Arc<dyn SigningBackend>,
+        "load-harness".to_string(),
+        Arc::new(gate),
+    );
+    LoadFixture { service, db_path, pubkeys, slow, injected_latency, key_count }
 }
 
 // ── SSZ helpers ───────────────────────────────────────────────────────────────
