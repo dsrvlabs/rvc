@@ -13,7 +13,7 @@
 //!    [`TimeoutPolicy::DiscardStagedRow`] (in-process / gate backends):
 //!    - acquire the per-pubkey async lock;
 //!    - **re-check** enablement under the lock (Safe→Detected TOCTOU);
-//!    - `spawn_blocking` stage → sign (with timeout) → commit/discard;
+//!    - `spawn_blocking` reserve → sign (with timeout) → reconcile;
 //!    - record the standard RVC slashable metric families via
 //!      [`crate::core::StandardSlashableHooks`].
 //!
@@ -227,10 +227,11 @@ impl SigningGate {
     ///
     /// 1. Outer `gate_decision` — fails closed on false (unknown pubkey → denied).
     /// 2. [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`]: lock →
-    ///    re-check enablement under lock → stage → sign (timeout) → commit/discard.
-    ///    On stage error → `SlashingBlocked`. On commit error → `CommitFailed`
-    ///    (nothing written; same-root retry safe). On timeout with Discard →
-    ///    `discard()` (no phantom row). On other sign errors today → discard.
+    ///    re-check enablement under lock → reserve → sign (timeout) → reconcile.
+    ///    On reserve error → `SlashingBlocked`. On reserve-time persist failure →
+    ///    `CommitFailed` (nothing written; same-root retry safe). On timeout /
+    ///    unambiguous no-signature with Discard → `reconcile_unsigned` (a failed
+    ///    delete retains). See [`SigningGateError::SigningFailed`].
     ///    Records standard RVC slashable metrics.
     pub async fn sign_block(
         &self,
@@ -293,11 +294,12 @@ impl SigningGate {
     ///
     /// Identical flow to `sign_block`: outer `gate_decision` →
     /// [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`].
-    /// On stage error → `SlashingBlocked` (epoch consumed).
-    /// On commit error → `CommitFailed` (nothing written; same-root retry safe).
-    /// On timeout or ambiguous sign errors with Discard → `discard()` (no phantom
-    /// row). Discard applies to the full [`crate::TimeoutPolicy`] scope on the
-    /// gate path (in-process backends).
+    /// On reserve error → `SlashingBlocked` (epoch consumed).
+    /// On reserve-time persist failure → `CommitFailed` (nothing written;
+    /// same-root retry safe). On timeout or ambiguous sign errors with Discard →
+    /// `reconcile_unsigned` (a failed delete retains). See
+    /// [`SigningGateError::SigningFailed`]. Discard applies to the full
+    /// [`crate::TimeoutPolicy`] scope on the gate path (in-process backends).
     pub async fn sign_attestation(
         &self,
         pubkey: &PublicKey,

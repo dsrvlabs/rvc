@@ -3,6 +3,7 @@
 //! After abandonment the reserved row is present and a conflicting sign is refused.
 //! Cancellation before reserve leaves no row. Same-root re-sign remains allowed.
 //! Test names avoid the `*_root` KAT scanner (A-5.10).
+#![allow(deprecated)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

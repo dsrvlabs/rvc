@@ -23,9 +23,11 @@ mod test_utils;
 pub use crypto::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
+#[allow(deprecated)]
+pub use core::StagedRow;
 pub use core::{
     sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
-    SignSlashableRequest, SlashableKind, SlashableSignSession, StagedRow, StandardSlashableHooks,
+    SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
     TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 pub use doppelganger::SigningEnablement;

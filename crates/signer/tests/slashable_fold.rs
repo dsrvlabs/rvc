@@ -1,8 +1,9 @@
-//! ARCH-5d: one production `stage_then_sign` consumer; gate and service pass data.
+//! ARCH-5d / ARCH-5l: one production `reserve_then_sign` consumer; gate and
+//! service pass data.
 //!
 //! `SigningGate` and `SignerService` must not each own a slashable `body`
-//! closure. The switchover (ARCH-5l) flips one site. These source-text and
-//! row-identity assertions are the pin that issue relies on.
+//! closure. After the switchover there is exactly one production
+//! `.reserve_then_sign(` and zero production `.stage_then_sign(`.
 
 mod common;
 
@@ -25,44 +26,45 @@ fn production_text(source: &str) -> &str {
     source.split("#[cfg(test)]").next().unwrap_or(source)
 }
 
-fn count_session_stage_then_sign(source: &str) -> Vec<String> {
+fn count_lines_containing(source: &str, needle: &str) -> Vec<String> {
     source
         .lines()
         .enumerate()
-        .filter(|(_, line)| line.contains("session.stage_then_sign"))
+        .filter(|(_, line)| line.contains(needle))
         .map(|(idx, line)| format!("{}: {}", idx + 1, line.trim()))
         .collect()
 }
 
-/// `rg -n 'session\.stage_then_sign' crates/signer/src/gate.rs crates/signer/src/lib.rs`
-/// must return 0. The sole production caller lives in `core.rs` outside `#[cfg(test)]`.
+/// After ARCH-5l: exactly one production `.reserve_then_sign(` and zero
+/// production `.stage_then_sign(`. `spawn_blocking` + `fail_closed_max` stay.
 #[test]
-fn test_single_production_stage_then_sign_call_site() {
+fn test_single_production_reserve_then_sign_call_site() {
     let src = signer_src_dir();
     let gate = std::fs::read_to_string(src.join("gate.rs")).expect("read gate.rs");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs");
     let core = std::fs::read_to_string(src.join("core.rs")).expect("read core.rs");
 
-    let gate_hits = count_session_stage_then_sign(&gate);
-    let lib_hits = count_session_stage_then_sign(&lib);
-    assert!(
-        gate_hits.is_empty(),
-        "ARCH-5d: gate.rs must not call session.stage_then_sign; found:\n{}",
-        gate_hits.join("\n")
-    );
-    assert!(
-        lib_hits.is_empty(),
-        "ARCH-5d: lib.rs must not call session.stage_then_sign; found:\n{}",
-        lib_hits.join("\n")
-    );
+    for (name, text) in [("gate.rs", gate.as_str()), ("lib.rs", lib.as_str())] {
+        let stage_hits = count_lines_containing(text, ".stage_then_sign(");
+        let reserve_hits = count_lines_containing(text, ".reserve_then_sign(");
+        assert!(
+            stage_hits.is_empty(),
+            "ARCH-5l: {name} must not call .stage_then_sign(; found:\n{}",
+            stage_hits.join("\n")
+        );
+        assert!(
+            reserve_hits.is_empty(),
+            "ARCH-5l: {name} must not call .reserve_then_sign(; found:\n{}",
+            reserve_hits.join("\n")
+        );
+    }
 
     let core_prod = production_text(&core);
-    let core_hits = count_session_stage_then_sign(core_prod);
-    assert_eq!(
-        core_hits.len(),
-        1,
-        "ARCH-5d: expected exactly one production session.stage_then_sign in core.rs; found:\n{}",
-        core_hits.join("\n")
+    let core_stage = count_lines_containing(core_prod, ".stage_then_sign(");
+    assert!(
+        core_stage.is_empty(),
+        "ARCH-5l: expected zero production .stage_then_sign( in core.rs; found:\n{}",
+        core_stage.join("\n")
     );
 
     assert!(
@@ -74,8 +76,6 @@ fn test_single_production_stage_then_sign_call_site() {
         "SEC-1: TimeoutPolicySource::fail_closed_max must stay on the slashable path"
     );
 
-    // ARCH-5i: `rg 'reserve_then_sign' crates/signer/src` — declaration only,
-    // no production `.reserve_then_sign(` in any src file (not just core.rs).
     let mut saw_decl = false;
     let mut reserve_calls = Vec::new();
     let mut staged_row_impls = Vec::new();
@@ -96,9 +96,10 @@ fn test_single_production_stage_then_sign_call_site() {
         }
     }
     assert!(saw_decl, "ARCH-5i: fn reserve_then_sign must exist in crates/signer/src");
-    assert!(
-        reserve_calls.is_empty(),
-        "ARCH-5i: no production caller of reserve_then_sign yet; found:\n{}",
+    assert_eq!(
+        reserve_calls.len(),
+        1,
+        "ARCH-5l: expected exactly one production .reserve_then_sign(; found:\n{}",
         reserve_calls.join("\n")
     );
     assert!(

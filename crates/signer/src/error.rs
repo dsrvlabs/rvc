@@ -48,9 +48,9 @@ pub enum SigningGateError {
 
     /// Slashing-protection persist failed; no new history row was written.
     ///
-    /// Production `stage_then_sign` emits this when `commit()` fails after a
-    /// successful BLS sign. The additive `reserve_then_sign` path also maps
-    /// reserve-time `ReserveCommitFailed` here (no sign is attempted).
+    /// Production `reserve_then_sign` maps reserve-time `ReserveCommitFailed`
+    /// here (no sign is attempted). The retained `stage_then_sign` path emits
+    /// this when `commit()` fails after a successful BLS sign.
     ///
     /// See module-level **CommitFailed** retry contract: same-root retry is safe;
     /// `signing_root` is the only root a caller may retry with.  Any BLS
@@ -68,27 +68,26 @@ pub enum SigningGateError {
 
     /// The BLS signing backend failed, timed out, or the blocking task panicked.
     ///
-    /// # Staged-row fate (do not assume discard)
+    /// # Reserved-row fate (do not assume discard)
     ///
-    /// Whether a staged slashing-DB row was discarded depends on **how** this
-    /// variant was produced by [`crate::sign_slashable`]:
+    /// Production [`crate::sign_slashable`] commits the history row **before**
+    /// the sign (`reserve_then_sign`). Fate of that row:
     ///
-    /// | Cause | `stage_then_sign` (today) | `reserve_then_sign` (ADR-005) |
-    /// |---|---|---|
-    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | Discarded (ROLLBACK) | `reconcile_unsigned` (failed delete **retains**) |
-    /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded | `reconcile_unsigned` |
-    /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (fail-closed history; slot/epoch consumed) | row already committed (no action) |
-    /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded | `reconcile_unsigned` |
-    /// | Ambiguous backend error + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (remote may have signed) | row already committed (no action) |
-    /// | Panic of the blocking task after stage/reserve | Unspecified — treat history as possibly written | row already committed; sign never released |
+    /// | Cause | Row fate |
+    /// |---|---|
+    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | `reconcile_unsigned` (failed delete **retains**) |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | `reconcile_unsigned` (failed delete **retains**) |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | row already committed (no action) |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | `reconcile_unsigned` (failed delete **retains**) |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::RetainStagedRow`] | row already committed (no action) |
+    /// | Panic of the blocking task after reserve | row already committed; sign never released |
     ///
-    /// This table is the ARCH-5i truth for row fate. On `reserve_then_sign`, a
-    /// failed compensating delete **retains** the row (C1) for every class that
-    /// calls `reconcile_unsigned`, not only unambiguous-no-signature.
+    /// A failed compensating delete **retains** the row (C1) for every class
+    /// that calls `reconcile_unsigned`.
     ///
     /// Callers **must not** treat `SigningFailed` as “slot free / different-root
     /// retry safe.” After a retain path, a conflicting different-root retry is
-    /// blocked by stage (EIP-3076); only same-root re-sign may apply.
+    /// blocked by reserve (EIP-3076); only same-root re-sign may apply.
     /// [`SigningGateError::permits_retry_with_root`] does **not** special-case
     /// this variant (it only authorizes `CommitFailed` same-root retry).
     ///
@@ -99,10 +98,9 @@ pub enum SigningGateError {
 
     /// The signing backend has no key for the requested pubkey.
     ///
-    /// No signature was produced. Production `stage_then_sign` discards the
-    /// staged row. On `reserve_then_sign` the reserved row is reconciled; a
-    /// failed delete retains it (see the table on [`Self::SigningFailed`]).
-    /// Not used for retain-on-timeout.
+    /// No signature was produced. Production `reserve_then_sign` reconciles
+    /// the reserved row; a failed delete retains it (see the table on
+    /// [`Self::SigningFailed`]). Not used for retain-on-timeout.
     #[error("key not found in signing backend")]
     KeyNotFound,
 

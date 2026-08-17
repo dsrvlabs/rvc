@@ -1216,19 +1216,19 @@ no production caller remains.** Retiring the old staging API — `stage_*` + `st
 - **KAT note (A-5.10):** no new test named `*_root`.
 
 **Acceptance criteria**
-- [ ] Exactly **one** production call site changed; `stage_then_sign` / `StagedRow` **retained and
+- [x] Exactly **one** production call site changed; `stage_then_sign` / `StagedRow` **retained and
       `#[deprecated]`**, with no production caller (asserted). Their deletion — together with
       `stage_*` and the 6 `core.rs` unit tests that exercise them — is filed as a follow-up.
-- [ ] `crates/signer/tests/phantom_row_m1.rs` green, **unchanged**, and quoted in the PR (X4).
-- [ ] The three proof surfaces are green on this commit (X2); the PR links their runs.
-- [ ] EIP-3076 conformance vectors green, and the PR records them as *necessary and insufficient*
+- [x] `crates/signer/tests/phantom_row_m1.rs` green, **unchanged**, and quoted in the PR (X4).
+- [x] The three proof surfaces are green on this commit (X2); the PR links their runs.
+- [x] EIP-3076 conformance vectors green, and the PR records them as *necessary and insufficient*
       (X3).
-- [ ] `stage_api_scope.rs` lands, is RED-demonstrated locally, has a non-vacuity assertion,
+- [x] `stage_api_scope.rs` lands, is RED-demonstrated locally, has a non-vacuity assertion,
       excludes the orphan trees (**C10**), and runs in the `arch-gates` job.
-- [ ] Single wiring site + `CompositeSigner` grep gate green (**C9 anchor 5**, X5).
-- [ ] `spawn_blocking` retained at `core.rs:542` (**C9 anchor 7**, X9).
-- [ ] `SigningGateError::SigningFailed`'s doc table reflects the new design.
-- [ ] This PR is **independently revertible** (NFR-4): reverting it restores `stage_then_sign` and
+- [x] Single wiring site + `CompositeSigner` grep gate green (**C9 anchor 5**, X5).
+- [x] `spawn_blocking` retained at `core.rs:542` (**C9 anchor 7**, X9).
+- [x] `SigningGateError::SigningFailed`'s doc table reflects the new design.
+- [x] This PR is **independently revertible** (NFR-4): reverting it restores `stage_then_sign` and
       leaves `reserve_*` unused but present.
 
 ---

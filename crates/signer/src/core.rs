@@ -3,7 +3,7 @@
 //!
 //! Both `SigningGate` (remote-signer path) and `SignerService` (VC path)
 //! delegate here so timeout, enablement, and (on the slashable path) the
-//! stage → sign → commit/discard triple stay in one place.
+//! reserve → sign → reconcile flow stay in one place.
 //!
 //! # Timeout policy (fail-closed for remote backends)
 //!
@@ -12,12 +12,12 @@
 //!
 //! - [`TimeoutPolicy::DiscardStagedRow`] — intended for **in-process** backends where
 //!   cancelling/dropping the sign future means no externally durable slashable
-//!   signature was produced; discard (ROLLBACK) the staged row on **timeout**.
+//!   signature was produced; **reconcile** the reserved row on **timeout** (a
+//!   failed delete retains — see [`SigningGateError::SigningFailed`]).
 //! - [`TimeoutPolicy::RetainStagedRow`] — remote / unknown backends: the signer may
-//!   already have signed when the client times out; **commit** the staged row so a
-//!   conflicting retry is impossible. The error is still
-//!   `SigningFailed("signer timed out")` — history is **retained**, not discarded
-//!   (see [`SigningGateError::SigningFailed`] docs).
+//!   already have signed when the client times out; leave the already-committed
+//!   row. The error is still `SigningFailed("signer timed out")` — history is
+//!   **retained**, not discarded (see [`SigningGateError::SigningFailed`] docs).
 //!
 //! ## Scope of `TimeoutPolicy`
 //!
@@ -27,10 +27,11 @@
 //! 2. **Ambiguous non-timeout signer errors** (e.g. `RemoteSignerError`,
 //!    transport/HTTP failures, invalid remote signature) — outcomes where the
 //!    remote **may** already have signed. Under
-//!    [`TimeoutPolicy::RetainStagedRow`] the staged row is **committed**
-//!    (fail-closed). Under [`TimeoutPolicy::DiscardStagedRow`] it is rolled back.
+//!    [`TimeoutPolicy::RetainStagedRow`] the reserved row stays committed
+//!    (fail-closed). Under [`TimeoutPolicy::DiscardStagedRow`] it is reconciled
+//!    (failed delete retains).
 //!
-//! Unambiguous **no-signature** outcomes always discard regardless of policy:
+//! Unambiguous **no-signature** outcomes reconcile under both policies:
 //! `KeyNotFound`, `LocalRejected` (e.g. gRPC raw-root without remote I/O), and
 //! `UnsupportedSigningType`.
 //!
@@ -154,10 +155,10 @@ pub async fn sign_nonslashable_core(
 /// - **Timeout** (`tokio::time::timeout` elapses).
 /// - **Ambiguous non-timeout signer errors** (`RemoteSignerError`,
 ///   `InvalidRemoteSignature`, …) — remote may already have signed. Under
-///   [`TimeoutPolicy::RetainStagedRow`] these **commit** the staged row.
+///   [`TimeoutPolicy::RetainStagedRow`] these leave the reserved row committed.
 ///
-/// Unambiguous no-signature errors always discard (`KeyNotFound`,
-/// `LocalRejected`, `UnsupportedSigningType`).
+/// Unambiguous no-signature errors reconcile under both policies (`KeyNotFound`,
+/// `LocalRejected`, `UnsupportedSigningType`). A failed delete retains.
 ///
 /// # Error surface on retain
 ///
@@ -168,14 +169,15 @@ pub async fn sign_nonslashable_core(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutPolicy {
     /// In-process backend: dropping the timed-out future is treated as “no
-    /// signature produced.” Discard (ROLLBACK) the staged row so the slot/epoch
-    /// remains free. Only sound when the backend cannot complete a durable
-    /// slashable sign after the client future is dropped (pure in-process BLS).
+    /// signature produced.” Production `reserve_then_sign` **reconciles** the
+    /// reserved row (a failed delete retains). Only sound when the backend
+    /// cannot complete a durable slashable sign after the client future is
+    /// dropped (pure in-process BLS). See [`SigningGateError::SigningFailed`].
     DiscardStagedRow,
     /// Remote / unknown backend: the signer may already have signed when the
-    /// timeout fires. **Commit** the staged row so a conflicting retry is
-    /// impossible; the caller receives `SigningFailed("signer timed out")` with
-    /// **history retained** (not discarded).
+    /// timeout fires. Leave the already-committed reserved row so a conflicting
+    /// retry is impossible; the caller receives `SigningFailed("signer timed
+    /// out")` with **history retained**. See [`SigningGateError::SigningFailed`].
     RetainStagedRow,
 }
 
@@ -187,7 +189,7 @@ pub enum TimeoutPolicy {
 pub enum TimeoutPolicySource {
     /// Fixed policy chosen at the call site (gate / pure in-process backends).
     Fixed(TimeoutPolicy),
-    /// Evaluated **under** the per-validator lock immediately before stage, and
+    /// Evaluated **under** the per-validator lock immediately before reserve, and
     /// re-checked immediately before BLS sign (fail-closed: Retain wins).
     ResolveUnderLock(Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>),
 }
@@ -207,6 +209,9 @@ impl TimeoutPolicySource {
 // ── Staged row trait ──────────────────────────────────────────────────────────
 
 /// Minimal commit/discard surface shared by [`StagedBlock`] and [`StagedAttestation`].
+#[deprecated(
+    note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
+)]
 pub trait StagedRow {
     /// Persist the staged row (or close an idempotent re-sign txn).
     fn commit_row(self) -> Result<(), SlashingError>;
@@ -214,6 +219,7 @@ pub trait StagedRow {
     fn discard_row(self);
 }
 
+#[allow(deprecated)]
 impl StagedRow for StagedBlock<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -223,6 +229,7 @@ impl StagedRow for StagedBlock<'_> {
     }
 }
 
+#[allow(deprecated)]
 impl StagedRow for StagedAttestation<'_> {
     fn commit_row(self) -> Result<(), SlashingError> {
         self.commit()
@@ -235,6 +242,7 @@ impl StagedRow for StagedAttestation<'_> {
 /// ARCH-1a compile bridge: `PubkeyScopedDb::stage_*` returns `(staged, PendingAudit)`.
 /// Emit the deferred audit only after commit/discard releases the connection mutex
 /// so a DB-reading tracing subscriber cannot deadlock (ADR-006 / C2).
+#[allow(deprecated)]
 impl<S: StagedRow> StagedRow for (S, PendingAudit) {
     fn commit_row(self) -> Result<(), SlashingError> {
         let result = self.0.commit_row();
@@ -244,27 +252,6 @@ impl<S: StagedRow> StagedRow for (S, PendingAudit) {
     fn discard_row(self) {
         self.0.discard_row();
         self.1.emit();
-    }
-}
-
-/// Type-erased staged guard so the core consumer has one `stage_then_sign` site.
-enum AnyStaged<'db> {
-    Block(StagedBlock<'db>),
-    Attestation(StagedAttestation<'db>),
-}
-
-impl StagedRow for AnyStaged<'_> {
-    fn commit_row(self) -> Result<(), SlashingError> {
-        match self {
-            Self::Block(row) => row.commit(),
-            Self::Attestation(row) => row.commit(),
-        }
-    }
-    fn discard_row(self) {
-        match self {
-            Self::Block(row) => row.discard(),
-            Self::Attestation(row) => row.discard(),
-        }
     }
 }
 
@@ -352,10 +339,9 @@ impl SignHooks for StandardSlashableHooks {
 
 /// State for finishing a staged or reserved sign inside `spawn_blocking`.
 ///
-/// Created by [`sign_slashable`]. Production stages through the single core
-/// consumer; unit tests may still call [`SlashableSignSession::stage_then_sign`]
-/// directly (ARCH-5d keeps this method). [`Self::reserve_then_sign`] is the
-/// additive ADR-005 sibling (ARCH-5i) — no production caller yet.
+/// Created by [`sign_slashable`]. Production reserves through the single core
+/// consumer. Unit tests may still call [`SlashableSignSession::stage_then_sign`]
+/// directly (deprecated; retained for pre/post comparison).
 pub struct SlashableSignSession {
     handle: tokio::runtime::Handle,
     signer: Arc<dyn Signer>,
@@ -370,9 +356,13 @@ pub struct SlashableSignSession {
     policy_recheck: Option<Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>>,
     hooks: Arc<dyn SignHooks>,
     op_name: &'static str,
-    /// Used by [`Self::reserve_then_sign`] to run `reconcile_unsigned`. Unused
-    /// by [`Self::stage_then_sign`].
+    /// Used by [`Self::reserve_then_sign`] to build [`PubkeyScopedDb`] for
+    /// `reconcile_unsigned` (C2 / ARCH-5g). Unused by [`Self::stage_then_sign`].
     slashing_db: Arc<SlashingDb>,
+    /// Audit CN for scoped compensate (gate: caller mTLS CN; VC: `"local-vc"`).
+    client_cn: String,
+    /// Genesis validators root for the scoped handle (M-6 pin; unused by delete).
+    gvr: Root,
 }
 
 impl SlashableSignSession {
@@ -405,6 +395,9 @@ impl SlashableSignSession {
             hooks,
             op_name,
             slashing_db,
+            // Tests that pass a raw db still reconcile via a scoped handle.
+            client_cn: "test".to_string(),
+            gvr: [0u8; 32],
         }
     }
 
@@ -412,6 +405,10 @@ impl SlashableSignSession {
     ///
     /// `stage` is invoked on this blocking thread and must return a staged guard
     /// that lives only for the duration of this call (the `!Send` constraint).
+    #[deprecated(
+        note = "superseded by reserve_then_sign (ADR-005); retained only for the pre/post comparison tests"
+    )]
+    #[allow(deprecated)]
     pub fn stage_then_sign<S, F>(mut self, stage: F) -> Result<Vec<u8>, SigningGateError>
     where
         S: StagedRow,
@@ -500,10 +497,10 @@ impl SlashableSignSession {
 
     /// Reserve (commit) a history row, then sign, then dispatch on architecture §5.3.
     ///
-    /// Additive sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
+    /// Sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
     /// [`StagedRow`] impl (VD-5.4): `discard_row` returns `()`, which would drop
-    /// the compensating-delete failure signal. Production still calls
-    /// [`Self::stage_then_sign`]; this method is test-driven until ARCH-5l.
+    /// the compensating-delete failure signal. Production calls this method
+    /// (ARCH-5l). Compensation goes through [`PubkeyScopedDb::reconcile_unsigned`].
     ///
     /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → sign →
     /// §5.3 table. `on_tx_hold_ms` keeps the ARCH-5b window (reserve-start →
@@ -597,7 +594,9 @@ impl SlashableSignSession {
 
     /// `false` on Failed so a follow-up log cannot claim the row was removed.
     fn reconcile_reservation(&self, reservation: &CommittedReservation) -> bool {
-        match self.slashing_db.reconcile_unsigned(reservation) {
+        let scoped =
+            PubkeyScopedDb::new(Arc::clone(&self.slashing_db), self.client_cn.clone(), self.gvr);
+        match scoped.reconcile_unsigned(reservation) {
             ReconcileOutcome::Deleted | ReconcileOutcome::NotApplicable => true,
             ReconcileOutcome::Failed(ref e) => {
                 error!(
@@ -675,6 +674,7 @@ impl SlashableSignSession {
         }
     }
 
+    #[allow(deprecated)]
     fn finish_timeout<S: StagedRow>(
         self,
         staged: S,
@@ -708,6 +708,7 @@ impl SlashableSignSession {
     }
 
     /// Ambiguous non-timeout signer failure: discard or retain per policy.
+    #[allow(deprecated)]
     fn finish_ambiguous_error<S: StagedRow>(
         self,
         staged: S,
@@ -741,6 +742,7 @@ impl SlashableSignSession {
     }
 
     /// Commit staged row then return `SigningFailed` (history retained, not discarded).
+    #[allow(deprecated)]
     fn retain_staged_row<S: StagedRow>(
         self,
         staged: S,
@@ -784,10 +786,10 @@ impl SlashableSignSession {
 
 // ── Public core entry ─────────────────────────────────────────────────────────
 
-/// Which slashable duty to stage inside [`sign_slashable`].
+/// Which slashable duty to reserve inside [`sign_slashable`].
 ///
-/// Call sites pass this data instead of a `body` closure so ARCH-5l's
-/// switchover flips one `stage_then_sign` site.
+/// Call sites pass this data instead of a `body` closure so the switchover
+/// flips one production consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashableKind {
     /// Beacon block proposal at `slot`.
@@ -821,7 +823,7 @@ static ATTESTATION_STAGE_TRACE_CTR: AtomicU64 = AtomicU64::new(0);
 ///
 /// Policy is required with **no default** — every call site must choose
 /// [`TimeoutPolicySource`] deliberately (fixed or resolve-under-lock).
-/// Staging is data (`slashing_db` / `client_cn` / `gvr` / [`SlashableKind`]),
+/// Reserve inputs are data (`slashing_db` / `client_cn` / `gvr` / [`SlashableKind`]),
 /// not a caller-supplied `body` closure (ARCH-5d).
 pub struct SignSlashableRequest<'a> {
     pub locks: &'a ValidatorLockMap,
@@ -840,7 +842,7 @@ pub struct SignSlashableRequest<'a> {
     pub client_cn: String,
     /// Genesis validators root for the M-6 pin.
     pub gvr: Root,
-    /// Block vs attestation staging parameters.
+    /// Block vs attestation reserve parameters.
     pub kind: SlashableKind,
 }
 
@@ -851,59 +853,50 @@ pub struct SignSlashableRequest<'a> {
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
-/// 4. `spawn_blocking`: build `PubkeyScopedDb`, stage per [`SlashableKind`],
-///    then [`SlashableSignSession::stage_then_sign`] signs with timeout and
-///    commit/discards per policy.
+/// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
+///    then [`SlashableSignSession::reserve_then_sign`] signs with timeout and
+///    reconciles per policy.
 ///
 /// # Errors
 ///
-/// Propagates [`SigningGateError`] variants from enablement, stage, sign, commit,
-/// and join failures. On success, records `hooks.on_success` with the full
-/// wall-clock duration of the operation.
+/// Propagates [`SigningGateError`] variants from enablement, reserve, sign,
+/// reconcile, and join failures. On success, records `hooks.on_success` with
+/// the full wall-clock duration of the operation.
 pub async fn sign_slashable(req: SignSlashableRequest<'_>) -> Result<Vec<u8>, SigningGateError> {
-    let slashing_db = Arc::clone(&req.slashing_db);
-    let client_cn = req.client_cn.clone();
-    let gvr = req.gvr;
     let kind = req.kind;
     let span = tracing::Span::current();
     sign_slashable_with_body(req, move |session| {
         let _enter = span.enter();
-        stage_then_sign_duty(session, slashing_db, client_cn, gvr, kind)
+        reserve_then_sign_duty(session, kind)
     })
     .await
 }
 
-/// Sole production `stage_then_sign` consumer (ARCH-5d). Must run on the
-/// `spawn_blocking` thread: staged guards are `!Send`.
-fn stage_then_sign_duty(
+/// Sole production `reserve_then_sign` consumer (ARCH-5l).
+fn reserve_then_sign_duty(
     session: SlashableSignSession,
-    slashing_db: Arc<SlashingDb>,
-    client_cn: String,
-    gvr: Root,
     kind: SlashableKind,
 ) -> Result<Vec<u8>, SigningGateError> {
     emit_stage_trace(kind);
     let pubkey_hex = session.pubkey_hex.clone();
     let signing_root = session.signing_root;
-    let scoped = PubkeyScopedDb::new(slashing_db, client_cn, gvr);
-    session.stage_then_sign(|| match kind {
-        SlashableKind::Block { slot } => {
-            let (staged, audit) = scoped
-                .stage_block(&pubkey_hex, slot, Some(hex::encode(signing_root)))
-                .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e))?;
-            Ok((AnyStaged::Block(staged), audit))
-        }
-        SlashableKind::Attestation { source_epoch, target_epoch } => {
-            let (staged, audit) = scoped
-                .stage_attestation(
-                    &pubkey_hex,
-                    source_epoch,
-                    target_epoch,
-                    Some(hex::encode(signing_root)),
-                )
-                .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e))?;
-            Ok((AnyStaged::Attestation(staged), audit))
-        }
+    let scoped = PubkeyScopedDb::new(
+        Arc::clone(&session.slashing_db),
+        session.client_cn.clone(),
+        session.gvr,
+    );
+    session.reserve_then_sign(|| match kind {
+        SlashableKind::Block { slot } => scoped
+            .reserve_block(&pubkey_hex, slot, Some(hex::encode(signing_root)))
+            .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e)),
+        SlashableKind::Attestation { source_epoch, target_epoch } => scoped
+            .reserve_attestation(
+                &pubkey_hex,
+                source_epoch,
+                target_epoch,
+                Some(hex::encode(signing_root)),
+            )
+            .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e)),
     })
 }
 
@@ -917,12 +910,12 @@ fn emit_stage_trace(kind: SlashableKind) {
                 )
             {
                 tracing::trace!(
-                    "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
+                    "reserving attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
                 );
             }
         }
         SlashableKind::Block { .. } => {
-            tracing::trace!("staging block slashing-protection record on blocking thread");
+            tracing::trace!("reserving block slashing-protection record on blocking thread");
         }
     }
 }
@@ -976,9 +969,9 @@ where
     //
     // Moved into `spawn_blocking` so dropping the caller at
     // `spawn_blocking(...).await` cannot release it while the body still runs.
-    // After reserve, SQLite is no longer the serializer (COMMIT already
-    // released the connection mutex). Holding the lock until the body returns
-    // is also fail-safe for today's stage path.
+    // After reserve, SQLite is no longer the sign-span serializer (COMMIT
+    // already released the connection mutex). The lock stays held until the
+    // blocking body returns.
     let guard = req.locks.lock(&pubkey_bytes).await;
 
     // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
@@ -1000,7 +993,7 @@ where
         }
     };
 
-    // Step 4: stage → sign → commit/discard inside spawn_blocking.
+    // Step 4: reserve → sign → reconcile inside spawn_blocking.
     let handle = tokio::runtime::Handle::current();
     let hooks_for_success = Arc::clone(&req.hooks);
     let session = SlashableSignSession {
@@ -1015,6 +1008,8 @@ where
         hooks: req.hooks,
         op_name,
         slashing_db: Arc::clone(&req.slashing_db),
+        client_cn: req.client_cn,
+        gvr: req.gvr,
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1415,7 +1410,7 @@ mod tests {
         assert_ne!(TimeoutPolicy::DiscardStagedRow, TimeoutPolicy::RetainStagedRow);
     }
 
-    // ── ARCH-5i: reserve_then_sign (additive; no production caller) ───────────
+    // ── ARCH-5i: reserve_then_sign (additive sibling; now production) ──────────
 
     use slashing::{BlockSlashingViolation, CommittedReservation};
 
@@ -1484,6 +1479,8 @@ mod tests {
             hooks,
             op_name: "test_reserve_then_sign",
             slashing_db,
+            client_cn: "test".to_string(),
+            gvr: GVR,
         }
     }
 

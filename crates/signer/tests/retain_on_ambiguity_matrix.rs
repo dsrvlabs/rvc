@@ -9,6 +9,7 @@
 //! the stricter unambiguous + Retain + failed-delete cell.
 //!
 //! No test name matches `.*(tree_hash|signing_root|_root)$` (A-5.10).
+#![allow(deprecated)]
 
 mod common;
 
