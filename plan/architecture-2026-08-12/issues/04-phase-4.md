@@ -1051,12 +1051,12 @@ before it merges.
 
 **Acceptance criteria.**
 
-- [ ] Release note exists at the repo's conventional location, covering all four points above.
-- [ ] Every example TOML in the note was landed as a corpus fixture by `ARCH-4j` and parses — this
+- [x] Release note exists at the repo's conventional location, covering all four points above.
+- [x] Every example TOML in the note was landed as a corpus fixture by `ARCH-4j` and parses — this
       issue **cites** that fixture, it does not add it.
-- [ ] No deprecation window is announced for the flat legacy keys.
-- [ ] The note states that no knob was removed, renamed or re-defaulted, and cites the parity harness.
-- [ ] No file outside the release-note path is modified (stream disjointness).
+- [x] No deprecation window is announced for the flat legacy keys.
+- [x] The note states that no knob was removed, renamed or re-defaulted, and cites the parity harness.
+- [x] No file outside the release-note path is modified (stream disjointness).
 
 ---
 
