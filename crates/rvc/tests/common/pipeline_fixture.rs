@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AttestationData as BeaconAttestationData, AttesterDuty, BeaconError, BlockRootData,
+    AttestationData as BeaconAttestationData, AttesterDuty, BeaconError,
     Checkpoint as BeaconCheckpoint, DataResponse, SubmitAttestationResult, VersionedAttestation,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
@@ -239,10 +239,9 @@ impl PipelineBeacon {
         let duty_pubkey = Arc::clone(&self.duty_pubkey);
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
+        let head_slot = duty_slots.iter().copied().max().unwrap_or(0);
         MockBeaconNodeClient::new()
-            .with_get_block_root(|_block_id| {
-                Ok(DataResponse { data: BlockRootData { root: root_hex(0xbb) } })
-            })
+            .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
             .with_get_attester_duties(move |epoch, _indices| {
                 let duty_pubkey = duty_pubkey.lock().unwrap().clone();
                 let data: Vec<AttesterDuty> = duty_slots

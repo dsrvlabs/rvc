@@ -597,14 +597,14 @@ Enumerate them in the PR description; "silently adjusted" is not acceptable.
 3. No new test is added by this issue — it changes fixtures only. Its regression pin **is** 3g.
 
 **Acceptance criteria.**
-- [ ] All seven call sites use a spec-honest stub; no stub returns `Ok` for a slot-qualified id that
+- [x] All seven call sites use a spec-honest stub; no stub returns `Ok` for a slot-qualified id that
       cannot have a block, and no stub returns an error for *every* id.
-- [ ] Sites 1 and 3 still distinguish `"head"` from slot-qualified ids (L-5 and H-5 pins intact).
-- [ ] `test_messages_and_contributions_share_head_root` still green, name unchanged (A-3.7); if its
+- [x] Sites 1 and 3 still distinguish `"head"` from slot-qualified ids (L-5 and H-5 pins intact).
+- [x] `test_messages_and_contributions_share_head_root` still green, name unchanged (A-3.7); if its
       `get_block_root` call count moved, the cause is diagnosed in the PR rather than the number
       silently updated (VD-37).
-- [ ] Every test that changed status is listed in the PR with a one-line disposition.
-- [ ] `cargo nextest run --workspace` green at the end of the issue.
+- [x] Every test that changed status is listed in the PR with a one-line disposition.
+- [x] `cargo nextest run --workspace` green at the end of the issue.
 
 ---
 

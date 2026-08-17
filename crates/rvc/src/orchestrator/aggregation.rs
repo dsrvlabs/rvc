@@ -561,9 +561,7 @@ mod tests {
         Arc,
     };
 
-    use beacon::{
-        BlockRootData, DataResponse, DependentRootResponse, VersionedAggregateAttestation,
-    };
+    use beacon::{DataResponse, DependentRootResponse, VersionedAggregateAttestation};
     use bn_manager::MockBeaconNodeClient;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
@@ -606,13 +604,8 @@ mod tests {
         submit_agg_calls: Arc<AtomicUsize>,
     ) -> MockBeaconNodeClient {
         MockBeaconNodeClient::new()
-            .with_get_block_root(|_id| {
-                Ok(DataResponse {
-                    data: BlockRootData {
-                        root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                            .to_string(),
-                    },
-                })
+            .with_slot_aware_block_root(0, &[], |_queried| {
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
             })
             .with_get_attester_duties(move |_epoch, _indices| {
                 Ok(DependentRootResponse {

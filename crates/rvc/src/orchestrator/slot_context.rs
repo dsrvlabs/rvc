@@ -154,10 +154,16 @@ mod tests {
     };
     use tracing_test::traced_test;
 
-    fn slot_vs_head_beacon(slot_root: String, head_root: String) -> MockBeaconNodeClient {
-        MockBeaconNodeClient::new().with_get_block_root(move |block_id| {
-            let root = if block_id == "head" { head_root.clone() } else { slot_root.clone() };
-            Ok(DataResponse { data: BlockRootData { root } })
+    fn slot_vs_head_beacon(
+        head_slot: Slot,
+        slot_root: String,
+        head_root: String,
+    ) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_slot_aware_block_root(head_slot, &[], move |queried| {
+            match queried {
+                None => head_root.clone(),
+                Some(_) => slot_root.clone(),
+            }
         })
     }
 
@@ -192,6 +198,19 @@ mod tests {
         })
     }
 
+    fn not_found_beacon(head_slot: Slot) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new().with_slot_aware_block_root(head_slot, &[], |queried| {
+            match queried {
+                None => {
+                    "0x2222222222222222222222222222222222222222222222222222222222222222".to_string()
+                }
+                Some(_) => {
+                    "0x1111111111111111111111111111111111111111111111111111111111111111".to_string()
+                }
+            }
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -207,10 +226,9 @@ mod tests {
         let head_root =
             "0x2222222222222222222222222222222222222222222222222222222222222222".to_string();
 
-        let beacon = slot_vs_head_beacon(slot_root.clone(), head_root);
-
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
+        let beacon = slot_vs_head_beacon(slot, slot_root.clone(), head_root);
 
         let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
@@ -256,6 +274,23 @@ mod tests {
         assert!(
             ctx.head_root.is_none(),
             "BN error must yield head_root = None, not a panic or propagated error"
+        );
+
+        // 404 sibling: a missing current-slot block is not a transport error.
+        // slot-1 still resolves; phase-2 capture_head falls back to parent.
+        let slot: Slot = 200;
+        let epoch: Epoch = slot / 32;
+        let beacon = not_found_beacon(slot);
+        let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+        assert!(
+            ctx.parent_root.is_some(),
+            "spec 404 at the current slot must still resolve slot-1"
+        );
+        assert!(ctx.head_root.is_none());
+        ctx.capture_head(&beacon).await;
+        assert_eq!(
+            ctx.head_root, ctx.parent_root,
+            "phase-2 capture_head falls back to parent when the current slot 404s"
         );
     }
 

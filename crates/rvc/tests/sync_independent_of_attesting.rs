@@ -26,8 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    BeaconError, BlockRootData, DataResponse, ExecutionOptimisticResponse, SubmitAttestationResult,
-    VersionedAttestation,
+    BeaconError, ExecutionOptimisticResponse, SubmitAttestationResult, VersionedAttestation,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, Propagator};
@@ -44,6 +43,9 @@ use validator_store::{ValidatorConfig, ValidatorStore};
 // ── constants ────────────────────────────────────────────────────────────────
 
 const TEST_GENESIS_TIME: u64 = 1_606_824_023;
+/// Current slot for the integration clock. Slot 0's parent query is also
+/// `"0"` (`saturating_sub`); a slot-aware stub with `head_slot = 0` 404s it.
+const FIXTURE_SLOT: Slot = 1;
 
 // ── test helpers ─────────────────────────────────────────────────────────────
 
@@ -72,7 +74,7 @@ fn create_test_config() -> OrchestratorConfig {
 // ── Sync test beacon (shared mock builder, RF4-24) ───────────────────────────
 //
 // A configurable MockBeaconNodeClient that:
-//   - Returns a valid block root so `SlotContext::capture` succeeds.
+//   - Serves a spec-honest block root: current slot 404s; parent and `"head"` resolve.
 //   - Serves sync-committee duties for `duty_pubkey`.
 //   - Captures any sync-committee message submissions via an AtomicUsize counter
 //     and a oneshot channel (fires on the first submission).
@@ -81,16 +83,12 @@ fn sync_test_beacon(
     duty_pubkey: [u8; 48],
     submitted_count: Arc<AtomicUsize>,
     submitted_tx: tokio::sync::oneshot::Sender<()>,
+    head_slot: Slot,
 ) -> MockBeaconNodeClient {
     let submitted_tx = Mutex::new(Some(submitted_tx));
     MockBeaconNodeClient::new()
-        .with_get_block_root(|_block_id| {
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
-                },
-            })
+        .with_slot_aware_block_root(head_slot, &[], |_queried| {
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
         })
         .with_post_sync_committee_duties(move |_epoch, _indices| {
             Ok(ExecutionOptimisticResponse {
@@ -209,10 +207,10 @@ async fn build_integration_orchestrator(
     validator_store.add_validator(ValidatorConfig::new(pk_bytes));
     let config = create_test_config();
 
-    // Set clock to 2/3 of slot 0 so all phase waits resolve immediately.
-    // 12-second slot: attestation @ genesis+4s, 2/3 @ genesis+8s.
+    // Set clock to 2/3 of FIXTURE_SLOT so all phase waits resolve immediately.
+    // 12-second slot: slot 1 starts at genesis+12s, 2/3 at genesis+20s.
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-    clock.set_current_time(TEST_GENESIS_TIME + 8);
+    clock.set_current_time(TEST_GENESIS_TIME + FIXTURE_SLOT * 12 + 8);
 
     let circuit_breaker = Arc::new(CircuitBreakerState::new(0, 0));
 
@@ -257,7 +255,12 @@ async fn test_sync_runs_with_attesting_disabled() {
     let submitted_count = Arc::new(AtomicUsize::new(0));
     let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let beacon = Arc::new(sync_test_beacon(pk.to_bytes(), submitted_count.clone(), submitted_tx));
+    let beacon = Arc::new(sync_test_beacon(
+        pk.to_bytes(),
+        submitted_count.clone(),
+        submitted_tx,
+        FIXTURE_SLOT,
+    ));
 
     // attesting_enabled = false; sync_enabled = true (default)
     let attesting_enabled = Arc::new(AtomicBool::new(false));
@@ -270,8 +273,8 @@ async fn test_sync_runs_with_attesting_disabled() {
     let run_task = tokio::spawn(async move { orchestrator.run().await });
 
     // Wait for the sync submission notification, or bail after 5 s.
-    // With the clock past 2/3 all phase waits are zero, so this fires
-    // almost immediately after the task starts.
+    // With the clock past 2/3 of FIXTURE_SLOT all phase waits are zero,
+    // so this fires almost immediately after the task starts.
     let received = tokio::time::timeout(Duration::from_secs(5), submitted_rx).await;
 
     // Signal shutdown to interrupt the "wait for next slot" sleep.
@@ -306,7 +309,12 @@ async fn test_sync_disabled_attesting_enabled() {
     // We don't use the rx side here; the sender is dropped with the beacon.
     let (submitted_tx, _submitted_rx) = tokio::sync::oneshot::channel::<()>();
 
-    let beacon = Arc::new(sync_test_beacon(pk.to_bytes(), submitted_count.clone(), submitted_tx));
+    let beacon = Arc::new(sync_test_beacon(
+        pk.to_bytes(),
+        submitted_count.clone(),
+        submitted_tx,
+        FIXTURE_SLOT,
+    ));
 
     // attesting_enabled = true; sync_enabled will be set to false below
     let attesting_enabled = Arc::new(AtomicBool::new(true));
@@ -320,7 +328,7 @@ async fn test_sync_disabled_attesting_enabled() {
     let run_task = tokio::spawn(async move { orchestrator.run().await });
 
     // Give the orchestrator enough time to process the slot phases.
-    // All waits are zero because the clock is past 2/3 of slot 0, so
+    // All waits are zero because the clock is past 2/3 of FIXTURE_SLOT, so
     // 300 ms is more than sufficient for the synchronous mock calls.
     tokio::time::sleep(Duration::from_millis(300)).await;
 

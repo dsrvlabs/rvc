@@ -246,16 +246,11 @@ pub(super) fn sync_guard_beacon(
     duty_pubkey: [u8; 48],
     submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
 ) -> bn_manager::MockBeaconNodeClient {
-    use beacon::{BlockRootData, DataResponse, ExecutionOptimisticResponse};
+    use beacon::ExecutionOptimisticResponse;
     use eth_types::SyncCommitteeDuty;
     bn_manager::MockBeaconNodeClient::new()
-        .with_get_block_root(|_block_id| {
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                },
-            })
+        .with_slot_aware_block_root(0, &[], |_queried| {
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
         })
         .with_post_sync_committee_duties(move |_epoch, _indices| {
             Ok(ExecutionOptimisticResponse {

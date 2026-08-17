@@ -335,7 +335,7 @@ mod tests {
         },
     };
 
-    use beacon::{BlockRootData, DataResponse, ExecutionOptimisticResponse};
+    use beacon::{DataResponse, ExecutionOptimisticResponse};
     use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
@@ -384,9 +384,12 @@ mod tests {
         let count = Arc::clone(&get_block_root_call_count);
         let roots = Arc::clone(&submitted_roots);
         MockBeaconNodeClient::new()
-            .with_get_block_root(move |_block_id| {
+            .with_slot_aware_block_root(0, &[], move |queried| {
                 count.fetch_add(1, Ordering::SeqCst);
-                Ok(DataResponse { data: BlockRootData { root: r_from_bn_hex.clone() } })
+                match queried {
+                    None => r_from_bn_hex.clone(),
+                    Some(_) => r_from_bn_hex.clone(),
+                }
             })
             .with_post_sync_committee_duties(move |_epoch, _indices| {
                 Ok(ExecutionOptimisticResponse {
