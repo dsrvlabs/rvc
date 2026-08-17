@@ -32,8 +32,10 @@ pub enum Layer {
     Orchestrator,
     /// Domain crates (duty-specific logic).
     Domain,
-    /// Foundation crates (infrastructure; no domain orchestration).
-    Foundation,
+    /// Base crates (pure leaves; Base may depend only on Base).
+    Base,
+    /// Infra crates (I/O services; must not depend on Domain).
+    Infra,
     /// Dev/meta crates (tests, harnesses) — not production runtime.
     Meta,
 }
@@ -44,7 +46,8 @@ impl Layer {
             Layer::Binary => "fill:#4a9eff,color:#fff",
             Layer::Orchestrator => "fill:#ff6b6b,color:#fff",
             Layer::Domain => "fill:#ffd43b,color:#333",
-            Layer::Foundation => "fill:#51cf66,color:#fff",
+            Layer::Base => "fill:#51cf66,color:#fff",
+            Layer::Infra => "fill:#20c997,color:#fff",
             Layer::Meta => "fill:#adb5bd,color:#333",
         }
     }
@@ -55,41 +58,67 @@ impl Layer {
 /// Every workspace package from `cargo metadata` must appear here. Adding a
 /// crate without updating this table fails generation (and thus CI).
 const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
-    // Binaries
+    // Unchanged — CLI entry point.
     ("rvc-bin", Layer::Binary, "bin/rvc", "CLI entry point"),
+    // Unchanged — key generation binary.
     ("rvc-keygen", Layer::Binary, "bin/rvc-keygen", "key generation"),
+    // Unchanged — gRPC signing server binary.
     ("rvc-signer-bin", Layer::Binary, "bin/rvc-signer", "gRPC signing server"),
-    // Orchestrator
+    // Unchanged — composition root.
     ("rvc", Layer::Orchestrator, "rvc", "orchestrator"),
-    // Domain
+    // Duty logic: block proposal.
     ("rvc-block-service", Layer::Domain, "block-service", "block proposals"),
+    // Duty logic: MEV registration.
     ("rvc-builder", Layer::Domain, "builder", "MEV registration"),
+    // Duty-safety policy: duplicate detection.
     ("rvc-doppelganger", Layer::Domain, "doppelganger", "duplicate detection"),
+    // Duty cache.
     ("rvc-duty-tracker", Layer::Domain, "duty-tracker", "duty cache"),
+    // Safe-signing choke point (C9 anchor 2/5).
     ("rvc-signer", Layer::Domain, "signer", "safe signing"),
+    // Remote-signing library over the domain signing stack.
     ("rvc-signer-server", Layer::Domain, "signer-server", "remote signing lib"),
-    ("rvc-timing", Layer::Domain, "timing", "slot clock"),
-    // Domain, not Base: Config names validator_store::BlockSelectionMode (types.rs:250).
-    // G-5a (VD-P5): a Base crate may depend only on Base — rvc-config cannot.
-    ("rvc-config", Layer::Domain, "config", "names BlockSelectionMode (G-5a)"),
-    // Foundation
-    ("beacon", Layer::Foundation, "beacon", "HTTP client"),
-    ("rvc-bn-manager", Layer::Foundation, "bn-manager", "multi-BN"),
-    ("rvc-crypto", Layer::Foundation, "crypto", "BLS, signing, Web3Signer"),
-    ("rvc-eth-types", Layer::Foundation, "eth-types", "consensus types"),
-    ("rvc-grpc-signer", Layer::Foundation, "grpc-signer", "gRPC signer client"),
-    ("rvc-keymanager-api", Layer::Foundation, "keymanager-api", "key mgmt REST"),
-    ("rvc-metrics", Layer::Foundation, "metrics", "prometheus"),
-    ("rvc-observability", Layer::Foundation, "observability", "logging helpers"),
-    ("rvc-secret-provider", Layer::Foundation, "secret-provider", "cloud key mgmt"),
-    ("rvc-signer-proto", Layer::Foundation, "signer-proto", "gRPC protobuf"),
-    ("rvc-signer-registry", Layer::Foundation, "signer-registry", "sign type table"),
-    ("rvc-slashing", Layer::Foundation, "slashing", "EIP-3076"),
-    ("rvc-telemetry", Layer::Foundation, "telemetry", "OTel tracing"),
-    ("rvc-validator-store", Layer::Foundation, "validator-store", "validator config"),
-    ("rvc-web3signer-wire", Layer::Foundation, "web3signer-wire", "remote sign wire"),
-    // Meta / dev-only
+    // Domain is deliberate (A-4.2): operator config names duty/slashing/proposer
+    // concepts (Network, SlashedAction, slashing/proposer/builder sections). Sole
+    // WS edge is eth-types, so G-5a does not force Domain. Phase 4 member; draft
+    // 28-row table is pre-rvc-config.
+    ("rvc-config", Layer::Domain, "config", "operator config names domain concepts"),
+    // Reclassified Domain → Base (VD-3): pure slot arithmetic; sole WS out-edge
+    // is eth-types (Base). No I/O, no duty policy. Lock-step with DOMAIN_PACKAGES.
+    ("rvc-timing", Layer::Base, "timing", "slot clock"),
+    // Consensus types + SSZ; zero workspace out-edges, already pinned.
+    ("rvc-eth-types", Layer::Base, "eth-types", "consensus types"),
+    // Zero WS out-edges; ADR-011 pure leaf. Tension (A-6-3): axum listener in server.rs.
+    ("rvc-metrics", Layer::Base, "metrics", "prometheus"),
+    // Logging-field registry + redaction helpers; zero out-edges, already pinned.
+    ("rvc-observability", Layer::Base, "observability", "logging helpers"),
+    // Generated protobuf types only; zero out-edges, already pinned.
+    ("rvc-signer-proto", Layer::Base, "signer-proto", "gRPC protobuf"),
+    // Const sign-type table; already pinned. Review omits this member (VD-A1).
+    ("rvc-signer-registry", Layer::Base, "signer-registry", "sign type table"),
+    // OTel/subscriber construction; zero out-edges, already pinned.
+    ("rvc-telemetry", Layer::Base, "telemetry", "OTel tracing"),
+    // Pure serde wire types; sole out-edge eth-types (Base).
+    ("rvc-web3signer-wire", Layer::Base, "web3signer-wire", "remote sign wire"),
+    // Beacon-API HTTP client — network I/O.
+    ("beacon", Layer::Infra, "beacon", "HTTP client"),
+    // Multi-BN pool, failover, SSE — network I/O.
+    ("rvc-bn-manager", Layer::Infra, "bn-manager", "multi-BN"),
+    // Infra until ARCH-6f extracts remote_signer/; do not pre-flip to Base (VD-6-3).
+    ("rvc-crypto", Layer::Infra, "crypto", "BLS, signing, Web3Signer"),
+    // tonic/gRPC client — network I/O. Review omits this member (VD-A1).
+    ("rvc-grpc-signer", Layer::Infra, "grpc-signer", "gRPC signer client"),
+    // Key-management REST surface — network I/O.
+    ("rvc-keymanager-api", Layer::Infra, "keymanager-api", "key mgmt REST"),
+    // Cloud KMS clients — network I/O.
+    ("rvc-secret-provider", Layer::Infra, "secret-provider", "cloud key mgmt"),
+    // EIP-3076 SQLite store. Structurally Base-eligible; deliberately Infra (A-6-8).
+    ("rvc-slashing", Layer::Infra, "slashing", "EIP-3076"),
+    // Persists validator config to disk. Structurally Base-eligible; deliberately Infra (A-6-8).
+    ("rvc-validator-store", Layer::Infra, "validator-store", "validator config"),
+    // Unchanged — dev-only gate harness (C9 anchor 1).
     ("rvc-architecture-tests", Layer::Meta, "architecture-tests", "DAG + doc gates"),
+    // Unchanged — dev-only PKI/mTLS harness; already zero-out-edge pinned.
     ("rvc-test-support", Layer::Meta, "test-support", "PKI + mTLS harness"),
 ];
 
@@ -295,9 +324,10 @@ pub fn generate_architecture_section(graph: &WorkspaceGraph) -> String {
          \n\
          **Layer colors:**\n\
          - **Blue** — Binary entry point\n\
-         - **Red** — Core orchestrator (depends on domain + foundation crates)\n\
+         - **Red** — Core orchestrator (depends on domain + base/infra crates)\n\
          - **Yellow** — Domain crates (duty-specific logic)\n\
-         - **Green** — Foundation crates (infrastructure, no domain orchestration)\n\
+         - **Green** — Base crates (pure leaves; no I/O)\n\
+         - **Teal** — Infra crates (I/O services; no domain orchestration)\n\
          - **Gray** — Meta / dev-only crates (architecture gates, test harnesses)\n",
     );
 
@@ -382,7 +412,6 @@ pub const DOMAIN_PACKAGES: &[&str] = &[
     "rvc-duty-tracker",
     "rvc-signer",
     "rvc-signer-server",
-    "rvc-timing",
 ];
 
 /// Domain→domain edges that are intentionally allowed (grandfathered).
@@ -448,6 +477,19 @@ mod unit_tests {
             from_class, from_const,
             "DOMAIN_PACKAGES must match CLASSIFICATION Layer::Domain entries"
         );
+    }
+
+    #[test]
+    fn every_classification_row_has_a_reason() {
+        let graph = load_workspace_graph();
+        assert_eq!(
+            CLASSIFICATION.len(),
+            graph.package_count(),
+            "CLASSIFICATION.len() must equal cargo metadata member count"
+        );
+        for (name, _, _, blurb) in CLASSIFICATION {
+            assert!(!blurb.trim().is_empty(), "empty CLASSIFICATION blurb for {name}");
+        }
     }
 
     #[test]

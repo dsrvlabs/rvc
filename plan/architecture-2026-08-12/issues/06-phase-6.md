@@ -327,20 +327,20 @@ a per-row reason is in *§Assumptions* above and is this issue's starting artefa
 
 **Acceptance criteria.**
 
-- [ ] `Layer` has `Base` and `Infra` variants; `Foundation` is gone from the enum and from all uses.
-- [ ] `CLASSIFICATION` has **28** rows, each with a non-empty reason comment, matching the draft table
+- [x] `Layer` has `Base` and `Infra` variants; `Foundation` is gone from the enum and from all uses.
+- [x] `CLASSIFICATION` has **28** rows, each with a non-empty reason comment, matching the draft table
       (or departing from it with a written reason in the PR).
-- [ ] `rvc-timing` is `Layer::Base` **and** absent from `DOMAIN_PACKAGES`;
+- [x] `rvc-timing` is `Layer::Base` **and** absent from `DOMAIN_PACKAGES`;
       `domain_packages_match_classification` green; the "no Domain consumer" check is recorded in the
       PR body.
-- [ ] `rvc-crypto` is still `Infra` (it flips in ARCH-6f).
-- [ ] `make architecture-doc` produces no further diff and
+- [x] `rvc-crypto` is still `Infra` (it flips in ARCH-6f).
+- [x] `make architecture-doc` produces no further diff and
       `cargo test -p rvc-architecture-tests --test architecture_doc_matches_graph` is green — the
       exit criterion read as VD-6-7 specifies, **not** "the file is unchanged".
-- [ ] `ARCHITECTURE.md:698`'s hand-written layer chain names `Base`/`Infra`.
-- [ ] `ZERO_OUT_EDGE_IF_PRESENT` (`architecture_no_cycles.rs:72-79`) is byte-unchanged:
+- [x] `ARCHITECTURE.md:698`'s hand-written layer chain names `Base`/`Infra`.
+- [x] `ZERO_OUT_EDGE_IF_PRESENT` (`architecture_no_cycles.rs:72-79`) is byte-unchanged:
       `git diff <base> -- crates/architecture-tests/tests/architecture_no_cycles.rs` is empty.
-- [ ] `cargo nextest run --workspace` green; §2 standing commands green.
+- [x] `cargo nextest run --workspace` green; §2 standing commands green.
 
 ---
 

@@ -19,7 +19,7 @@ graph TD
     RVC_BLOCK_SERVICE["block-service<br/><i>block proposals</i>"]
     RVC_BN_MANAGER["bn-manager<br/><i>multi-BN</i>"]
     RVC_BUILDER["builder<br/><i>MEV registration</i>"]
-    RVC_CONFIG["config<br/><i>names BlockSelectionMode (G-5a)</i>"]
+    RVC_CONFIG["config<br/><i>operator config names domain concepts</i>"]
     RVC_CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
     RVC_DOPPELGANGER["doppelganger<br/><i>duplicate detection</i>"]
     RVC_DUTY_TRACKER["duty-tracker<br/><i>duty cache</i>"]
@@ -137,42 +137,43 @@ graph TD
     RVC_VALIDATOR_STORE --> RVC_OBSERVABILITY
     RVC_WEB3SIGNER_WIRE --> RVC_ETH_TYPES
 
-    style BEACON fill:#51cf66,color:#fff
+    style BEACON fill:#20c997,color:#fff
     style RVC fill:#ff6b6b,color:#fff
     style RVC_ARCHITECTURE_TESTS fill:#adb5bd,color:#333
     style RVC_BIN fill:#4a9eff,color:#fff
     style RVC_BLOCK_SERVICE fill:#ffd43b,color:#333
-    style RVC_BN_MANAGER fill:#51cf66,color:#fff
+    style RVC_BN_MANAGER fill:#20c997,color:#fff
     style RVC_BUILDER fill:#ffd43b,color:#333
     style RVC_CONFIG fill:#ffd43b,color:#333
-    style RVC_CRYPTO fill:#51cf66,color:#fff
+    style RVC_CRYPTO fill:#20c997,color:#fff
     style RVC_DOPPELGANGER fill:#ffd43b,color:#333
     style RVC_DUTY_TRACKER fill:#ffd43b,color:#333
     style RVC_ETH_TYPES fill:#51cf66,color:#fff
-    style RVC_GRPC_SIGNER fill:#51cf66,color:#fff
+    style RVC_GRPC_SIGNER fill:#20c997,color:#fff
     style RVC_KEYGEN fill:#4a9eff,color:#fff
-    style RVC_KEYMANAGER_API fill:#51cf66,color:#fff
+    style RVC_KEYMANAGER_API fill:#20c997,color:#fff
     style RVC_METRICS fill:#51cf66,color:#fff
     style RVC_OBSERVABILITY fill:#51cf66,color:#fff
-    style RVC_SECRET_PROVIDER fill:#51cf66,color:#fff
+    style RVC_SECRET_PROVIDER fill:#20c997,color:#fff
     style RVC_SIGNER fill:#ffd43b,color:#333
     style RVC_SIGNER_BIN fill:#4a9eff,color:#fff
     style RVC_SIGNER_PROTO fill:#51cf66,color:#fff
     style RVC_SIGNER_REGISTRY fill:#51cf66,color:#fff
     style RVC_SIGNER_SERVER fill:#ffd43b,color:#333
-    style RVC_SLASHING fill:#51cf66,color:#fff
+    style RVC_SLASHING fill:#20c997,color:#fff
     style RVC_TELEMETRY fill:#51cf66,color:#fff
     style RVC_TEST_SUPPORT fill:#adb5bd,color:#333
-    style RVC_TIMING fill:#ffd43b,color:#333
-    style RVC_VALIDATOR_STORE fill:#51cf66,color:#fff
+    style RVC_TIMING fill:#51cf66,color:#fff
+    style RVC_VALIDATOR_STORE fill:#20c997,color:#fff
     style RVC_WEB3SIGNER_WIRE fill:#51cf66,color:#fff
 ```
 
 **Layer colors:**
 - **Blue** — Binary entry point
-- **Red** — Core orchestrator (depends on domain + foundation crates)
+- **Red** — Core orchestrator (depends on domain + base/infra crates)
 - **Yellow** — Domain crates (duty-specific logic)
-- **Green** — Foundation crates (infrastructure, no domain orchestration)
+- **Green** — Base crates (pure leaves; no I/O)
+- **Teal** — Infra crates (I/O services; no domain orchestration)
 - **Gray** — Meta / dev-only crates (architecture gates, test harnesses)
 <!-- END GENERATED -->
 
@@ -246,7 +247,6 @@ block-beta
     block:domain:8
         SIGNER["signer"]
         DUTY["duty-tracker"]
-        TIMING["timing"]
         BLOCK["block-service"]
         BUILD["builder"]
         DOPP["doppelganger"]
@@ -254,17 +254,23 @@ block-beta
 
     space:8
 
-    block:foundation:8
+    block:infra:8
         CRYPTO["crypto"]
         SLASHING["slashing"]
         BNM["bn-manager"]
         BEACON["beacon"]
-        METRICS["metrics"]
-        ETH["eth-types"]
         KMA["keymanager-api"]
-        TEL["telemetry"]
         SP["secret-provider"]
         GRPCSIGNER["grpc-signer"]
+    end
+
+    space:8
+
+    block:base:8
+        TIMING["timing"]
+        METRICS["metrics"]
+        ETH["eth-types"]
+        TEL["telemetry"]
     end
 
     BIN --> RVC
@@ -284,7 +290,8 @@ block-beta
     style binary fill:#4a9eff,color:#fff
     style orchestrator fill:#ff6b6b,color:#fff
     style domain fill:#ffd43b,color:#333
-    style foundation fill:#51cf66,color:#fff
+    style infra fill:#20c997,color:#fff
+    style base fill:#51cf66,color:#fff
 ```
 
 ## Slot Processing — 3-Phase Architecture
@@ -679,7 +686,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
   - **Enablement defaults** — Validators stay disabled until doppelganger/enablement gates clear; key import does not enable signing immediately.
   - **Startup** — Slashing DB integrity failure, genesis-validators-root mismatch, and missing DB without `--init-slashing-db` refuse to start (no silent empty-DB create).
   - Prefer typed `Result` flows with explicit allow-lists for any intentional degradation.
-- **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
+- **Downward-only dependencies** — Binary → Orchestrator → Domain → Base/Infra. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
 - **Shutdown idiom** — **`tokio_util::sync::CancellationToken`** is the workspace standard for service lifecycle (supports `child_token` hierarchies). Older loops still use `tokio::sync::watch` (orchestrator coordinator, bn-manager SSE/sync, timing); `bin/rvc` bridges the two. New code and opportunistic rewrites adopt `CancellationToken`; do not introduce new `watch`-based shutdown channels.
 - **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
