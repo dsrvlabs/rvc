@@ -20,50 +20,14 @@ use beacon::ResponseCaps;
 use super::error::ConfigError;
 use super::network::Network;
 
-pub use rvc_config::sections::{
-    BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
-    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, LogfileArgs, LogfileConfig,
-    MonitoringArgs, MonitoringConfig, ProposerConfigArgs, ProposerConfigSource, SecretProviderArgs,
-    SecretProviderConfig, TracingArgs, TracingConfig, TracingExporter,
+pub use rvc_config::{
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig,
+    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig,
+    LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
+    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
+    TracingArgs, TracingConfig, TracingExporter,
 };
-
-/// Action taken when a managed validator is detected as slashed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SlashedAction {
-    /// Disable the validator in the store and keep running.
-    #[default]
-    DisableOnly,
-    /// Request process shutdown.
-    Shutdown,
-    /// Do not monitor / take no action.
-    None,
-}
-
-impl fmt::Display for SlashedAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DisableOnly => write!(f, "disable-only"),
-            Self::Shutdown => write!(f, "shutdown"),
-            Self::None => write!(f, "none"),
-        }
-    }
-}
-
-impl FromStr for SlashedAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "disable-only" => Ok(Self::DisableOnly),
-            "shutdown" => Ok(Self::Shutdown),
-            "none" => Ok(Self::None),
-            other => Err(format!(
-                "invalid slashed-validators-action '{other}': must be one of disable-only, shutdown, none"
-            )),
-        }
-    }
-}
 
 /// Message types that may be broadcast to all beacon nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,8 +74,11 @@ impl FromStr for BroadcastTopic {
 ///
 /// Related knobs are grouped into nested sub-structs (`logfile`, `tracing`,
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
-/// `builder_limits`). Existing operator TOML may still use the pre-nesting
-/// **flat** keys; both spellings are accepted (see `ConfigWire`).
+/// `builder_limits`). ARCH-4h invents `[beacon]` / `[server]` / `[network]` /
+/// `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s public /
+/// serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
+/// Existing operator TOML may still use the **flat** keys; both spellings are
+/// accepted (see `ConfigWire`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -316,10 +283,25 @@ impl Default for Config {
     }
 }
 
+/// `[beacon]` table plus the TOML-only `beacon_nodes_config` array (names
+/// [`BnRole`], so it cannot live on `rvc-config::BeaconConfig`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct BeaconSection {
+    #[serde(flatten)]
+    inner: BeaconConfig,
+    #[serde(default)]
+    beacon_nodes_config: Vec<BeaconNodeEntry>,
+}
+
 /// Intermediate wire format that accepts **both** nested tables and legacy flat
 /// keys. Flat keys fill fields that the corresponding nested table left at
 /// default; when both spellings set the same logical field, the **flat** key
 /// wins (operators with existing files keep working without edits).
+///
+/// ARCH-4h: shrinks to the flat→section lift for the 22 newly sectioned knobs
+/// plus the 31 4f/4g legacy keys (VD-4.1). Not deleted — serde `alias` cannot
+/// lift a top-level key into a nested table.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ConfigWire {
@@ -328,13 +310,16 @@ struct ConfigWire {
     keystore_path: PathBuf,
     password_file: Option<PathBuf>,
     slashing_db_path: PathBuf,
-    allow_fresh_db: bool,
-    allow_unsupported_fork: bool,
+    /// `Option` so a nested `[slashing] allow_fresh_db` can fill when the
+    /// flat key is absent (bool would treat absent as `false` and clobber).
+    allow_fresh_db: Option<bool>,
+    allow_unsupported_fork: Option<bool>,
     metrics_address: Option<IpAddr>,
     metrics_port: Option<u16>,
     grpc_port: Option<u16>,
     grpc_address: Option<String>,
-    network: Option<Network>,
+    // `network` as a flat string is pulled in Config's custom Deserialize
+    // (dual-shape with `[network]` — same class as `logfile`).
     genesis_time: Option<u64>,
     genesis_validators_root: Option<String>,
     graffiti: Option<String>,
@@ -342,9 +327,9 @@ struct ConfigWire {
     doppelganger_detection: Option<bool>,
     key_decrypt_threads: Option<usize>,
     secret_provider: SecretProviderConfig,
-    disable_attesting: bool,
-    slashed_validators_action: SlashedAction,
-    disable_keystore_locking: bool,
+    disable_attesting: Option<bool>,
+    slashed_validators_action: Option<SlashedAction>,
+    disable_keystore_locking: Option<bool>,
     proposer_nodes: Vec<String>,
     broadcast: Vec<BroadcastTopic>,
     bn_sync_tolerances: Option<String>,
@@ -355,7 +340,20 @@ struct ConfigWire {
     validators_config: Option<PathBuf>,
     beacon_max_body_bytes: Option<usize>,
 
-    // Nested tables (new spelling)
+    // Nested tables (4f/4g + invented 4h sections). Flat keys above win.
+    #[serde(default)]
+    beacon: BeaconSection,
+    #[serde(default)]
+    keys: KeysConfig,
+    #[serde(default)]
+    server: ServerConfig,
+    /// Table half of the `network` dual-shape (string pulled in Deserialize).
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    safety: SafetyConfig,
+    #[serde(default)]
+    slashing: SlashingConfig,
     #[serde(default)]
     logfile: LogfileConfig,
     #[serde(default)]
@@ -516,37 +514,71 @@ impl From<ConfigWire> for Config {
         }
 
         let def = Config::default();
+        // Flat-wins lift (VD-4.1): nested 4h tables fill only when the flat
+        // key is absent. The `network` string-or-table split is applied in
+        // Deserialize (same class as `logfile`).
         Config {
-            beacon_url: if w.beacon_url.is_empty() { def.beacon_url } else { w.beacon_url },
-            beacon_nodes: w.beacon_nodes,
-            keystore_path: if w.keystore_path.as_os_str().is_empty() {
-                def.keystore_path
+            beacon_url: if !w.beacon_url.is_empty() {
+                w.beacon_url
             } else {
+                w.beacon.inner.url.unwrap_or(def.beacon_url)
+            },
+            beacon_nodes: if !w.beacon_nodes.is_empty() {
+                w.beacon_nodes
+            } else {
+                w.beacon.inner.nodes
+            },
+            keystore_path: if !w.keystore_path.as_os_str().is_empty() {
                 w.keystore_path
-            },
-            password_file: w.password_file,
-            slashing_db_path: if w.slashing_db_path.as_os_str().is_empty() {
-                def.slashing_db_path
             } else {
-                w.slashing_db_path
+                w.keys.keystore_path.unwrap_or(def.keystore_path)
             },
-            allow_fresh_db: w.allow_fresh_db,
-            allow_unsupported_fork: w.allow_unsupported_fork,
-            metrics_address: w.metrics_address.unwrap_or(def.metrics_address),
-            metrics_port: w.metrics_port.unwrap_or(def.metrics_port),
-            grpc_port: w.grpc_port.unwrap_or(def.grpc_port),
-            grpc_address: w.grpc_address.unwrap_or(def.grpc_address),
-            network: w.network.unwrap_or(def.network),
-            genesis_time: w.genesis_time,
-            genesis_validators_root: w.genesis_validators_root,
-            graffiti: w.graffiti,
+            password_file: w.password_file.or(w.keys.password_file),
+            slashing_db_path: if !w.slashing_db_path.as_os_str().is_empty() {
+                w.slashing_db_path
+            } else {
+                w.slashing.slashing_db_path.unwrap_or(def.slashing_db_path)
+            },
+            allow_fresh_db: w
+                .allow_fresh_db
+                .or(w.slashing.allow_fresh_db)
+                .unwrap_or(def.allow_fresh_db),
+            allow_unsupported_fork: w
+                .allow_unsupported_fork
+                .or(w.safety.allow_unsupported_fork)
+                .unwrap_or(def.allow_unsupported_fork),
+            metrics_address: w
+                .metrics_address
+                .or(w.server.metrics_address)
+                .unwrap_or(def.metrics_address),
+            metrics_port: w.metrics_port.or(w.server.metrics_port).unwrap_or(def.metrics_port),
+            grpc_port: w.grpc_port.or(w.server.grpc_port).unwrap_or(def.grpc_port),
+            grpc_address: w.grpc_address.or(w.server.grpc_address).unwrap_or(def.grpc_address),
+            network: w.network.network.unwrap_or(def.network),
+            genesis_time: w.genesis_time.or(w.network.genesis_time),
+            genesis_validators_root: w
+                .genesis_validators_root
+                .or(w.network.genesis_validators_root),
+            graffiti: w.graffiti.or(w.network.graffiti),
             log_level: w.log_level.unwrap_or(def.log_level),
-            doppelganger_detection: w.doppelganger_detection.unwrap_or(def.doppelganger_detection),
-            key_decrypt_threads: w.key_decrypt_threads,
+            doppelganger_detection: w
+                .doppelganger_detection
+                .or(w.safety.doppelganger_detection)
+                .unwrap_or(def.doppelganger_detection),
+            key_decrypt_threads: w.key_decrypt_threads.or(w.keys.key_decrypt_threads),
             secret_provider: w.secret_provider,
-            disable_attesting: w.disable_attesting,
-            slashed_validators_action: w.slashed_validators_action,
-            disable_keystore_locking: w.disable_keystore_locking,
+            disable_attesting: w
+                .disable_attesting
+                .or(w.safety.disable_attesting)
+                .unwrap_or(def.disable_attesting),
+            slashed_validators_action: w
+                .slashed_validators_action
+                .or(w.safety.slashed_validators_action)
+                .unwrap_or(def.slashed_validators_action),
+            disable_keystore_locking: w
+                .disable_keystore_locking
+                .or(w.keys.disable_keystore_locking)
+                .unwrap_or(def.disable_keystore_locking),
             logfile,
             tracing,
             keymanager,
@@ -556,8 +588,12 @@ impl From<ConfigWire> for Config {
             builder_limits,
             proposer_nodes: w.proposer_nodes,
             broadcast: w.broadcast,
-            bn_sync_tolerances: w.bn_sync_tolerances,
-            beacon_nodes_config: w.beacon_nodes_config,
+            bn_sync_tolerances: w.bn_sync_tolerances.or(w.beacon.inner.bn_sync_tolerances),
+            beacon_nodes_config: if !w.beacon_nodes_config.is_empty() {
+                w.beacon_nodes_config
+            } else {
+                w.beacon.beacon_nodes_config
+            },
             block_selection_mode: w.block_selection_mode,
             validator_registration_batch_size: w
                 .validator_registration_batch_size
@@ -565,8 +601,11 @@ impl From<ConfigWire> for Config {
             validator_registration_batch_delay: w
                 .validator_registration_batch_delay
                 .unwrap_or(def.validator_registration_batch_delay),
-            validators_config: w.validators_config,
-            beacon_max_body_bytes: w.beacon_max_body_bytes.unwrap_or(def.beacon_max_body_bytes),
+            validators_config: w.validators_config.or(w.keys.validators_config),
+            beacon_max_body_bytes: w
+                .beacon_max_body_bytes
+                .or(w.beacon.inner.max_body_bytes)
+                .unwrap_or(def.beacon_max_body_bytes),
         }
     }
 }
@@ -605,11 +644,31 @@ impl<'de> Deserialize<'de> for Config {
             None => None,
         };
 
+        // `network` is either a preset string or a `[network]` table (ARCH-4h).
+        let flat_network = match map.remove("network") {
+            Some(toml::Value::String(s)) => Some(
+                Network::deserialize(toml::Value::String(s)).map_err(serde::de::Error::custom)?,
+            ),
+            Some(toml::Value::Table(t)) => {
+                map.insert("network".into(), toml::Value::Table(t));
+                None
+            }
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "network must be a string preset or a table, got {other:?}"
+                )));
+            }
+            None => None,
+        };
+
         let wire: ConfigWire =
             ConfigWire::deserialize(toml::Value::Table(map)).map_err(serde::de::Error::custom)?;
         let mut cfg = Config::from(wire);
         if let Some(path) = flat_logfile_path {
             cfg.logfile.path = Some(path);
+        }
+        if let Some(net) = flat_network {
+            cfg.network = net;
         }
         Ok(cfg)
     }

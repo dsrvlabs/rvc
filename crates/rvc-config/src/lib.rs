@@ -3,20 +3,25 @@
 //! ARCH-4f: tracing / keymanager / grpc_signer / monitoring.
 //! ARCH-4g: logfile / proposer_config / builder_limits / secret_provider
 //! (plus the `KeysArgs` clap group that flattens `SecretProviderArgs`).
+//! ARCH-4h: beacon / server / network / safety / slashing, and `[keys]`.
 //! [`Config::load`] is still a scaffold (ARCH-4i). No figment; env is not a
 //! config layer.
 
 mod error;
+mod network;
 pub mod sections;
 
 use std::path::Path;
 
 pub use error::{ConfigError, ConfigSource};
+pub use network::Network;
 pub use sections::{
-    BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
-    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, LogfileArgs, LogfileConfig,
-    MonitoringArgs, MonitoringConfig, ProposerConfigArgs, ProposerConfigSource, SecretProviderArgs,
-    SecretProviderConfig, TracingArgs, TracingConfig, TracingExporter,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig,
+    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig,
+    LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
+    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
+    TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// CLI overlay accepted by [`Config::load`].

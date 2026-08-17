@@ -82,6 +82,11 @@ const MIGRATED_GROUP_SRCS: &[&str] = &[
     "crates/rvc-config/src/sections/builder_limits.rs",
     "crates/rvc-config/src/sections/secret_provider.rs",
     "crates/rvc-config/src/sections/keys.rs",
+    "crates/rvc-config/src/sections/beacon.rs",
+    "crates/rvc-config/src/sections/server.rs",
+    "crates/rvc-config/src/sections/network.rs",
+    "crates/rvc-config/src/sections/safety.rs",
+    "crates/rvc-config/src/sections/slashing.rs",
 ];
 
 // ---------------------------------------------------------------------------
@@ -975,8 +980,8 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
     let body = from_impl_body(&cli);
     let from_scan = scan_text(&body);
     assert!(
-        has_field_access(&from_scan, "beacon", "beacon_url"),
-        "From-impl body extraction broke (missing beacon.beacon_url)"
+        has_field_access(&from_scan, "beacon", "url"),
+        "From-impl body extraction broke (missing beacon.url)"
     );
 
     // Nested flatten (ARCH-4g) is expanded for field accounting; StartArgs stays at 13.
@@ -1340,7 +1345,7 @@ fn from_impl_body_extracts_live_cli_rs() {
     let body = from_impl_body(&cli);
     assert!(!body.is_empty());
     assert!(body.contains("beacon"));
-    assert!(has_field_access(&scan_text(&body), "beacon", "beacon_url"));
+    assert!(has_field_access(&scan_text(&body), "beacon", "url"));
 }
 
 // ---------------------------------------------------------------------------

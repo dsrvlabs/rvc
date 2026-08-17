@@ -4252,6 +4252,7 @@ name = "rvc-config"
 version = "0.7.0"
 dependencies = [
  "clap",
+ "rvc-eth-types",
  "serde",
  "thiserror 2.0.18",
  "toml",

@@ -816,15 +816,15 @@ creates the `[keys]` struct**; this issue **creates five new sections** (`[beaco
 
 **Acceptance criteria.**
 
-- [ ] **Five** new section structs (`[beacon]`, `[server]`, `[network]`, `[safety]`, `[slashing]`)
+- [x] **Five** new section structs (`[beacon]`, `[server]`, `[network]`, `[safety]`, `[slashing]`)
       plus five knobs added to `ARCH-4g`'s `[keys]`; all 22 bare knobs relocated.
-- [ ] **Flat top-level spelling still parses for every relocated key**, proven by
+- [x] **Flat top-level spelling still parses for every relocated key**, proven by
       `top_level_flat_keys_still_parse_after_sectioning` against `ARCH-4d`'s snapshot.
-- [ ] The fate of `ConfigWire` is decided explicitly in the PR (shrunk vs removed) with the reason.
-- [ ] `bn_sync_tolerances` and `beacon_nodes_config` covered.
-- [ ] `every_one_of_the_65_knobs_has_exactly_one_declaration` green.
-- [ ] No test name ends in `_root`; `kat_policy.rs` green with no new exemption.
-- [ ] `ARCH-4d` snapshots byte-identical; G-2, G-3 green.
+- [x] The fate of `ConfigWire` is decided explicitly in the PR (shrunk vs removed) with the reason.
+- [x] `bn_sync_tolerances` and `beacon_nodes_config` covered.
+- [x] `every_one_of_the_65_knobs_has_exactly_one_declaration` green.
+- [x] No test name ends in `_root`; `kat_policy.rs` green with no new exemption.
+- [x] `ARCH-4d` snapshots byte-identical; G-2, G-3 green.
 
 ---
 

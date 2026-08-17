@@ -3,27 +3,38 @@
 //! ARCH-4f: tracing, keymanager, grpc_signer, monitoring.
 //! ARCH-4g: logfile, proposer_config, builder_limits, secret_provider (+ keys
 //! clap group that flattens `SecretProviderArgs`).
+//! ARCH-4h: beacon, server, network, safety, slashing; `[keys]` finished.
 
+mod beacon;
 mod builder_limits;
 mod grpc_signer;
 mod keymanager;
 mod keys;
 mod logfile;
 mod monitoring;
+mod network;
 mod proposer_config;
+mod safety;
 mod secret_provider;
+mod server;
+mod slashing;
 mod tracing;
 
+pub use beacon::{BeaconArgs, BeaconConfig};
 pub use builder_limits::{BuilderLimits, BuilderLimitsArgs};
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};
 pub use keymanager::{KeymanagerArgs, KeymanagerConfig};
-pub use keys::KeysArgs;
+pub use keys::{KeysArgs, KeysConfig};
 pub use logfile::{LogfileArgs, LogfileConfig};
 pub use monitoring::{MonitoringArgs, MonitoringConfig};
+pub use network::{NetworkArgs, NetworkConfig};
 pub use proposer_config::{ProposerConfigArgs, ProposerConfigSource};
+pub use safety::{SafetyArgs, SafetyConfig, SlashedAction};
 pub use secret_provider::{
     GcpSecretArgs, GcpSecretConfig, SecretProviderArgs, SecretProviderConfig,
 };
+pub use server::{ServerArgs, ServerConfig};
+pub use slashing::{SlashingArgs, SlashingConfig};
 pub use tracing::{TracingArgs, TracingConfig, TracingExporter};
 
 #[cfg(test)]
@@ -54,6 +65,34 @@ mod tests {
         "--tracing-max-export-batch-size",
         "--tracing-max-queue-size",
         "--tracing-sample-rate",
+    ];
+
+    /// Pre-move longs for the ARCH-4h clap groups (22 knobs + 4 BN timeouts +
+    /// 2 slashing BYPASS flags). Timeouts / strict_* stay CLI-only.
+    const PRE_MOVE_LONG_FLAGS_4H: &[&str] = &[
+        "--aggregate-timeout",
+        "--allow-unsupported-fork",
+        "--attestation-timeout",
+        "--beacon-max-body-bytes",
+        "--beacon-nodes",
+        "--beacon-url",
+        "--block-production-timeout",
+        "--disable-attesting",
+        "--duty-fetch-timeout",
+        "--genesis-time",
+        "--genesis-validators-root",
+        "--graffiti",
+        "--grpc-address",
+        "--grpc-port",
+        "--init-slashing-db",
+        "--metrics-address",
+        "--metrics-port",
+        "--network",
+        "--no-doppelganger-detection",
+        "--slashed-validators-action",
+        "--slashing-db-path",
+        "--strict-permissions",
+        "--strict-slashing-semantics",
     ];
 
     /// Pre-move longs for the 17 dotted knobs of the four partial sections.
@@ -98,6 +137,16 @@ mod tests {
         builder_limits: BuilderLimitsArgs,
         #[command(flatten)]
         keys: KeysArgs,
+        #[command(flatten)]
+        beacon: BeaconArgs,
+        #[command(flatten)]
+        server: ServerArgs,
+        #[command(flatten)]
+        network: NetworkArgs,
+        #[command(flatten)]
+        safety: SafetyArgs,
+        #[command(flatten)]
+        slashing: SlashingArgs,
     }
 
     fn probe_long_flags() -> Vec<String> {
@@ -157,6 +206,7 @@ mod tests {
                 "--disable-keystore-locking",
                 "--validators-config",
             ]);
+            v.extend_from_slice(PRE_MOVE_LONG_FLAGS_4H);
             v.sort();
             v
         };
@@ -166,6 +216,9 @@ mod tests {
         }
         for flag in PRE_MOVE_LONG_FLAGS_4G {
             assert!(actual.contains(flag), "ARCH-4g section missing pre-move flag {flag}");
+        }
+        for flag in PRE_MOVE_LONG_FLAGS_4H {
+            assert!(actual.contains(flag), "ARCH-4h section missing pre-move flag {flag}");
         }
         assert_eq!(PRE_MOVE_LONG_FLAGS_4F.len(), 20, "ARCH-4f migrates 20 knobs");
         assert_eq!(PRE_MOVE_LONG_FLAGS_4G.len(), 17, "ARCH-4g migrates 17 dotted knobs");
@@ -205,13 +258,32 @@ mod tests {
             include_str!("builder_limits.rs"),
             include_str!("secret_provider.rs"),
             include_str!("keys.rs"),
+            include_str!("beacon.rs"),
+            include_str!("server.rs"),
+            include_str!("network.rs"),
         );
         for line in src.lines() {
             let t = line.trim();
             assert!(
                 !t.contains("default_value =") && !t.contains("default_value_t"),
-                "ARCH-4f/4g section clap field must not set default_value: {t}"
+                "ARCH-4f/4g/4h section clap field must not set default_value: {t}"
             );
+        }
+        // Present-only bools that already had default_value_t = false (verbatim).
+        // They go through flag() / Option lift and do not clobber TOML (ADR-009).
+        for (path, src) in
+            [("safety.rs", include_str!("safety.rs")), ("slashing.rs", include_str!("slashing.rs"))]
+        {
+            for line in src.lines() {
+                let t = line.trim();
+                if t.contains("allow-unsupported-fork") || t.contains("init-slashing-db") {
+                    continue;
+                }
+                assert!(
+                    !t.contains("default_value =") && !t.contains("default_value_t"),
+                    "{path} clap field must not set default_value: {t}"
+                );
+            }
         }
     }
 

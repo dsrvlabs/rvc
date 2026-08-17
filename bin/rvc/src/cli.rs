@@ -1,13 +1,12 @@
 //! CLI types and command dispatch for the `rvc` binary.
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use rvc::config::{
-    BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, CliOverrides, GrpcSignerArgs,
-    KeymanagerArgs, KeysArgs, LogfileArgs, MonitoringArgs, Network, ProposerConfigArgs,
-    SlashedAction, TracingArgs,
+    BeaconArgs, BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, CliOverrides,
+    GrpcSignerArgs, KeymanagerArgs, KeysArgs, LogfileArgs, MonitoringArgs, NetworkArgs,
+    ProposerConfigArgs, SafetyArgs, ServerArgs, SlashingArgs, TracingArgs,
 };
 use tracing::{error, info, warn};
 
@@ -187,84 +186,6 @@ pub struct StartArgs {
     pub slashing: SlashingArgs,
 }
 
-/// Beacon-node connection and BN HTTP operation timeouts.
-#[derive(Args, Debug)]
-pub struct BeaconArgs {
-    /// Beacon node URL (e.g., http://localhost:5052)
-    #[arg(long)]
-    pub beacon_url: Option<String>,
-
-    /// Comma-separated list of beacon node URLs for multi-BN support
-    #[arg(long, value_delimiter = ',')]
-    pub beacon_nodes: Option<Vec<String>>,
-
-    /// Maximum JSON response body size in bytes from the beacon node.
-    ///
-    /// Requests whose body (or Content-Length) exceeds this value are rejected
-    /// before the full body is allocated.  Raise this only if your beacon node
-    /// legitimately returns larger responses.
-    ///
-    /// Default when unset: 33554432 (32 MiB), from `Config::default()`.
-    #[arg(long)]
-    pub beacon_max_body_bytes: Option<usize>,
-
-    /// Block production timeout in seconds (default: 3)
-    #[arg(long)]
-    pub block_production_timeout: Option<u64>,
-
-    /// Attestation fetch timeout in seconds (default: 4)
-    #[arg(long)]
-    pub attestation_timeout: Option<u64>,
-
-    /// Aggregate fetch timeout in seconds (default: 2)
-    #[arg(long)]
-    pub aggregate_timeout: Option<u64>,
-
-    /// Duty fetch timeout in seconds (default: 10)
-    #[arg(long)]
-    pub duty_fetch_timeout: Option<u64>,
-}
-
-/// Metrics HTTP and local gRPC bind settings.
-#[derive(Args, Debug)]
-pub struct ServerArgs {
-    /// Bind address for the metrics HTTP server (default: 127.0.0.1)
-    #[arg(long)]
-    pub metrics_address: Option<IpAddr>,
-
-    /// Port for the metrics HTTP server (default: 8080)
-    #[arg(long)]
-    pub metrics_port: Option<u16>,
-
-    /// Port for the gRPC server (default: 50051)
-    #[arg(long)]
-    pub grpc_port: Option<u16>,
-
-    /// Bind address for the gRPC server (default: 127.0.0.1)
-    #[arg(long)]
-    pub grpc_address: Option<String>,
-}
-
-/// Network preset and genesis overrides.
-#[derive(Args, Debug)]
-pub struct NetworkArgs {
-    /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
-    #[arg(long)]
-    pub network: Option<Network>,
-
-    /// Genesis time override (Unix timestamp)
-    #[arg(long)]
-    pub genesis_time: Option<u64>,
-
-    /// Genesis validators root override (hex string with 0x prefix)
-    #[arg(long)]
-    pub genesis_validators_root: Option<String>,
-
-    /// Graffiti string for blocks
-    #[arg(long)]
-    pub graffiti: Option<String>,
-}
-
 /// Console logging plus flattened `[logfile]` knobs (ARCH-4g / A-4.4).
 ///
 /// `[logfile]` keeps its TOML name/shape. `log_level` stays bare (ARCH-4h).
@@ -297,38 +218,10 @@ pub struct LoggingArgs {
     pub logfile: LogfileArgs,
 }
 
-/// Startup safety toggles (doppelganger, attesting, slashed action).
-#[derive(Args, Debug)]
-pub struct SafetyArgs {
-    /// Disable doppelganger / forward-window protection (enabled by default).
-    ///
-    /// When enabled (default), newly loaded and imported keys are withheld from
-    /// signing for ~2 epochs (~12.8 min on mainnet) while network liveness is
-    /// observed, mitigating double-signing if another live instance holds the
-    /// same keys. Opting out removes that safety cost but exposes the process
-    /// to the Staked 2021 / SSV-Ankr class of mass-slashing incidents.
-    #[arg(long)]
-    pub no_doppelganger_detection: bool,
-
-    /// Disable attestation duties at startup (emergency use only)
-    #[arg(long)]
-    pub disable_attesting: bool,
-
-    /// Action when a slashed validator is detected: disable-only (default), shutdown, none
-    #[arg(long)]
-    pub slashed_validators_action: Option<SlashedAction>,
-
-    /// Allow startup when the beacon node's current fork version is not in
-    /// the client's schedule (SEC-9 / M-15). For testnets / experimental
-    /// forks only; default is fatal on unknown fork.
-    #[arg(long, default_value_t = false)]
-    pub allow_unsupported_fork: bool,
-}
-
 /// Builder circuit-breaker plus bare registration knobs (ARCH-4g / A-4.4).
 ///
 /// `[builder_limits]` keeps its TOML name/shape. The three bare knobs keep
-/// top-level TOML spelling (ARCH-4h will section them).
+/// top-level TOML spelling (out of ARCH-4h's 22-knob table).
 #[derive(Args, Debug)]
 pub struct BuilderArgs {
     #[command(flatten)]
@@ -365,30 +258,6 @@ pub struct ProposerArgs {
     pub proposer_config: ProposerConfigArgs,
 }
 
-/// Slashing-protection database and operator safety flags.
-#[derive(Args, Debug)]
-pub struct SlashingArgs {
-    /// Path to the slashing protection database
-    #[arg(long)]
-    pub slashing_db_path: Option<PathBuf>,
-
-    /// Allow creating a fresh empty slashing-protection DB when the path is
-    /// missing (SEC-3). DANGEROUS on a previously-active validator: the new
-    /// DB has zero signing history and can enable double-signing / slashing.
-    /// Use only for genuine first-time deployments. A 0-byte or corrupt DB
-    /// is always a hard error regardless of this flag.
-    #[arg(long, default_value_t = false)]
-    pub init_slashing_db: bool,
-
-    /// Exit on unsafe slashing DB file permissions (world-readable/writable)
-    #[arg(long)]
-    pub strict_permissions: bool,
-
-    /// Reject null-root re-signs as potential double votes (strict EIP-3076 semantics)
-    #[arg(long)]
-    pub strict_slashing_semantics: bool,
-}
-
 /// Convert a present-only CLI boolean into the three-state `Option<bool>`
 /// used by [`CliOverrides`]: `true` → `Some(true)`, `false` (absent) → `None`.
 fn flag(b: bool) -> Option<bool> {
@@ -419,8 +288,8 @@ impl From<StartArgs> for CliOverrides {
         } = args;
 
         Self {
-            beacon_url: beacon.beacon_url,
-            beacon_nodes: beacon.beacon_nodes,
+            beacon_url: beacon.url,
+            beacon_nodes: beacon.nodes,
             keystore_path: keys.keystore_path,
             password_file: keys.password_file,
             slashing_db_path: slashing.slashing_db_path,
@@ -475,7 +344,7 @@ impl From<StartArgs> for CliOverrides {
                 .builder_limits
                 .circuit_breaker_consecutive_limit,
             builder_circuit_breaker_epoch_limit: builder.builder_limits.circuit_breaker_epoch_limit,
-            disable_keystore_locking: flag(keys.disable_keystore_locking),
+            disable_keystore_locking: keys.disable_keystore_locking.filter(|b| *b),
             proposer_nodes: proposer.proposer_nodes,
             broadcast: proposer.broadcast,
             proposer_config_url: proposer.proposer_config.url.clone(),
@@ -495,7 +364,7 @@ impl From<StartArgs> for CliOverrides {
             validator_registration_batch_size: builder.validator_registration_batch_size,
             validator_registration_batch_delay: builder.validator_registration_batch_delay,
             validators_config: keys.validators_config,
-            beacon_max_body_bytes: beacon.beacon_max_body_bytes,
+            beacon_max_body_bytes: beacon.max_body_bytes,
         }
     }
 }
@@ -734,9 +603,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
     use clap::CommandFactory;
-    use rvc::config::TracingExporter;
+    use rvc::config::{Network, SlashedAction, TracingExporter};
 
     /// Complete long-flag surface for `rvc start` (RF5-14 help snapshot).
     const START_FLAGS: &[&str] = &[
@@ -1293,7 +1164,7 @@ grpc_port = 60051
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
-        assert!(args.beacon.beacon_url.is_some());
+        assert!(args.beacon.url.is_some());
         assert!(args.logging.logfile.path.is_some());
         assert!(args.tracing.endpoint.is_some());
         assert_eq!(args.keymanager.enabled, Some(true));
