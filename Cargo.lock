@@ -4109,6 +4109,7 @@ dependencies = [
  "rvc-block-service",
  "rvc-bn-manager",
  "rvc-builder",
+ "rvc-config",
  "rvc-crypto",
  "rvc-doppelganger",
  "rvc-duty-tracker",
@@ -4254,6 +4255,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
+ "tracing",
 ]
 
 [[package]]

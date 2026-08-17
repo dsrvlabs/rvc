@@ -665,14 +665,14 @@ That is **20 of the 65 knobs**.
 
 **Acceptance criteria.**
 
-- [ ] The four group structs live in `rvc-config`; `bin/rvc` `#[command(flatten)]`s them.
-- [ ] All 20 fields are `Option<T>` with **no** `default_value`; defaults live in one place.
-- [ ] Flat legacy TOML keys for these sections parse via `#[serde(alias)]`.
-- [ ] Every `--flag` string is unchanged; `--help` differs only in where defaults are documented.
-- [ ] `ARCH-4d`'s snapshots byte-identical.
-- [ ] **G-3 green** through the change (the OTEL reads moved crates — the gate must still classify
+- [x] The four group structs live in `rvc-config`; `bin/rvc` `#[command(flatten)]`s them.
+- [x] All 20 fields are `Option<T>` with **no** `default_value`; defaults live in one place.
+- [x] Flat legacy TOML keys for these sections parse via `#[serde(alias)]`.
+- [x] Every `--flag` string is unchanged; `--help` differs only in where defaults are documented.
+- [x] `ARCH-4d`'s snapshots byte-identical.
+- [x] **G-3 green** through the change (the OTEL reads moved crates — the gate must still classify
       them, which is a real re-check, not a formality).
-- [ ] `merge_with_cli` still compiles (it is deleted in `ARCH-4i`, not here) — this issue is
+- [x] `merge_with_cli` still compiles (it is deleted in `ARCH-4i`, not here) — this issue is
       independently revertible.
 
 ---

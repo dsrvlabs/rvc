@@ -1,7 +1,8 @@
 //! Operator configuration crate (ADR-008).
 //!
-//! Scaffold (ARCH-4e): provenance types and the [`Config::load`] signature.
-//! Section structs land in ARCH-4f+. No figment; env is not a config layer.
+//! ARCH-4f: tracing / keymanager / grpc_signer / monitoring section structs
+//! live here. [`Config::load`] is still a scaffold (ARCH-4i). No figment;
+//! env is not a config layer.
 
 mod error;
 pub mod sections;
@@ -9,18 +10,23 @@ pub mod sections;
 use std::path::Path;
 
 pub use error::{ConfigError, ConfigSource};
+pub use sections::{
+    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, MonitoringArgs,
+    MonitoringConfig, TracingArgs, TracingConfig, TracingExporter,
+};
 
 /// CLI overlay accepted by [`Config::load`].
 ///
-/// Placeholder for `bin/rvc`'s `StartArgs`. Real clap groups move here in ARCH-4f+.
+/// Placeholder for `bin/rvc`'s `StartArgs`. Migrated clap groups live in
+/// [`sections`]; this type stays empty until ARCH-4i wires `load`.
 /// Declared here so `rvc-config` does not depend on `rvc` / `rvc-bin`.
 #[derive(Debug, Default, Clone, clap::Args, serde::Deserialize, serde::Serialize)]
 pub struct StartArgs {}
 
 /// Folded operator configuration.
 ///
-/// Scaffold: empty. Operator-visible values still live in `rvc::config` until
-/// ARCH-4f+ migrates sections and ARCH-4i implements [`Config::load`].
+/// Scaffold: empty. Operator-visible values still live in `rvc::config`.
+/// Section structs are in [`sections`]; ARCH-4i implements [`Config::load`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {}
 

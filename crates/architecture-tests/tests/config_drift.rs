@@ -71,6 +71,14 @@ use std::path::{Path, PathBuf};
 const CLI_RS: &str = "bin/rvc/src/cli.rs";
 const TYPES_RS: &str = "crates/rvc/src/config/types.rs";
 
+/// ARCH-4f: migrated clap groups live in `rvc-config` and are re-imported by `StartArgs`.
+const MIGRATED_GROUP_SRCS: &[&str] = &[
+    "crates/rvc-config/src/sections/tracing.rs",
+    "crates/rvc-config/src/sections/keymanager.rs",
+    "crates/rvc-config/src/sections/grpc_signer.rs",
+    "crates/rvc-config/src/sections/monitoring.rs",
+];
+
 // ---------------------------------------------------------------------------
 // Shrinking-only tables (reason string required per entry)
 // ---------------------------------------------------------------------------
@@ -216,6 +224,19 @@ const UNVALIDATED: &[(&str, &str)] = &[
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+}
+
+/// `cli.rs` plus ARCH-4f section files so seam-α can see moved group structs.
+fn group_args_source(root: &Path) -> String {
+    let mut src =
+        std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
+    for rel in MIGRATED_GROUP_SRCS {
+        let extra = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel} must exist after ARCH-4f: {e}"));
+        src.push('\n');
+        src.push_str(&extra);
+    }
+    src
 }
 
 /// Normalize whitespace for field-access matching:
@@ -880,6 +901,7 @@ fn unvalidated_violations(
 fn every_group_arg_field_is_read_by_the_from_impl() {
     let root = workspace_root();
     let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs must exist");
+    let groups = group_args_source(&root);
 
     let bindings = flatten_bindings(&cli);
     assert_eq!(
@@ -897,7 +919,7 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
 
     let mut fields_by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for ty in bindings.values() {
-        fields_by_type.entry(ty.clone()).or_insert_with(|| struct_fields(&cli, ty));
+        fields_by_type.entry(ty.clone()).or_insert_with(|| struct_fields(&groups, ty));
     }
     // Reverse map: struct type → binding name (for BYPASS second-leg needles).
     let ty_to_binding: BTreeMap<&str, &str> =
@@ -1224,9 +1246,10 @@ fn from_impl_body_extracts_live_cli_rs() {
 fn clap_default_clobbers_list_matches_the_source() {
     let root = workspace_root();
     let cli = std::fs::read_to_string(root.join(CLI_RS)).expect("bin/rvc/src/cli.rs");
+    let groups = group_args_source(&root);
     let bindings = flatten_bindings(&cli);
     let body = from_impl_body(&cli);
-    let found = detect_clap_default_clobbers(&body, &cli, &bindings);
+    let found = detect_clap_default_clobbers(&body, &groups, &bindings);
 
     let allowed: Vec<&str> = CLAP_DEFAULT_CLOBBERS.iter().map(|&(f, _)| f).collect();
     let allowed_set: HashSet<&str> = allowed.iter().copied().collect();

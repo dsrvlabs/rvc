@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use rvc::config::{
-    BlockSelectionMode, BroadcastTopic, CliOverrides, Network, SlashedAction, TracingExporter,
+    BlockSelectionMode, BroadcastTopic, CliOverrides, GrpcSignerArgs, KeymanagerArgs,
+    MonitoringArgs, Network, SlashedAction, TracingArgs,
 };
 use tracing::{error, info, warn};
 
@@ -361,90 +362,6 @@ pub struct LoggingArgs {
     pub logfile_level: Option<String>,
 }
 
-/// Distributed tracing / OpenTelemetry settings.
-#[derive(Args, Debug)]
-pub struct TracingArgs {
-    /// OTLP exporter endpoint (e.g., http://localhost:4318). Enables tracing when set.
-    #[arg(long)]
-    pub tracing_endpoint: Option<String>,
-
-    /// Exporter backend: "otlp" (default) or "gcp"
-    #[arg(long)]
-    pub tracing_exporter: Option<TracingExporter>,
-
-    /// Head-based sampling ratio 0.0–1.0 (default: 0.01 when unset; see OTEL_TRACES_SAMPLER_ARG)
-    #[arg(long)]
-    pub tracing_sample_rate: Option<f64>,
-
-    /// Maximum number of spans queued for export (OTel SDK default: 2048)
-    #[arg(long)]
-    pub tracing_max_queue_size: Option<usize>,
-
-    /// Maximum number of spans per export batch (OTel SDK default: 512)
-    #[arg(long)]
-    pub tracing_max_export_batch_size: Option<usize>,
-}
-
-/// Keymanager API and remote-signer settings.
-#[derive(Args, Debug)]
-pub struct KeymanagerArgs {
-    /// Enable the Keymanager API server
-    #[arg(long)]
-    pub keymanager_enabled: bool,
-
-    /// Disable the Keymanager API server (overrides config file)
-    #[arg(long, conflicts_with = "keymanager_enabled")]
-    pub no_keymanager: bool,
-
-    /// Bind address for the Keymanager API server (default: 127.0.0.1:5062)
-    #[arg(long)]
-    pub keymanager_address: Option<String>,
-
-    /// Path to the Keymanager API bearer token file
-    #[arg(long)]
-    pub keymanager_token_file: Option<PathBuf>,
-
-    /// Remote signer (Web3Signer) URL
-    #[arg(long)]
-    pub remote_signer_url: Option<String>,
-
-    /// Comma-separated list of allowed remote signer hostnames
-    #[arg(long)]
-    pub remote_signer_allowed_hosts: Option<String>,
-
-    /// Allow HTTP (non-TLS) URLs for remote signer imports
-    #[arg(long)]
-    pub allow_insecure_remote_signer: bool,
-
-    /// Comma-separated list of allowed CORS origins for the Keymanager API
-    #[arg(long, value_delimiter = ',')]
-    pub keymanager_cors_origins: Option<Vec<String>>,
-
-    /// Maximum request body size in bytes for the Keymanager API (default: 10 MB)
-    #[arg(long)]
-    pub keymanager_body_limit: Option<usize>,
-}
-
-/// gRPC remote signer connection settings.
-#[derive(Args, Debug)]
-pub struct GrpcSignerArgs {
-    /// gRPC remote signer URL (e.g., https://signer.example.com:50051)
-    #[arg(long)]
-    pub grpc_signer_url: Option<String>,
-
-    /// Path to the client TLS certificate for gRPC signer mTLS
-    #[arg(long)]
-    pub grpc_signer_tls_cert: Option<PathBuf>,
-
-    /// Path to the client TLS private key for gRPC signer mTLS
-    #[arg(long)]
-    pub grpc_signer_tls_key: Option<PathBuf>,
-
-    /// Path to the CA certificate for gRPC signer mTLS
-    #[arg(long)]
-    pub grpc_signer_tls_ca_cert: Option<PathBuf>,
-}
-
 /// Startup safety toggles (doppelganger, attesting, slashed action).
 #[derive(Args, Debug)]
 pub struct SafetyArgs {
@@ -529,22 +446,6 @@ pub struct ProposerArgs {
     pub proposer_config_url_insecure: bool,
 }
 
-/// Monitoring push-endpoint settings.
-#[derive(Args, Debug)]
-pub struct MonitoringArgs {
-    /// Remote monitoring endpoint URL (e.g., https://beaconcha.in/api/v1/client/metrics?apikey=...)
-    #[arg(long)]
-    pub monitoring_endpoint: Option<String>,
-
-    /// Monitoring push interval in seconds (default: 384, i.e., one epoch)
-    #[arg(long)]
-    pub monitoring_interval: Option<u64>,
-
-    /// Allow HTTP (non-HTTPS) monitoring endpoint
-    #[arg(long)]
-    pub monitoring_endpoint_insecure: bool,
-}
-
 /// Slashing-protection database and operator safety flags.
 #[derive(Args, Debug)]
 pub struct SlashingArgs {
@@ -622,33 +523,33 @@ impl From<StartArgs> for CliOverrides {
             },
             keymanager_enabled: if keymanager.no_keymanager {
                 Some(false)
-            } else if keymanager.keymanager_enabled {
+            } else if keymanager.enabled == Some(true) {
                 Some(true)
             } else {
                 None
             },
-            keymanager_address: keymanager.keymanager_address,
-            keymanager_token_file: keymanager.keymanager_token_file,
+            keymanager_address: keymanager.address,
+            keymanager_token_file: keymanager.token_file,
             remote_signer_url: keymanager.remote_signer_url,
             remote_signer_allowed_hosts: keymanager.remote_signer_allowed_hosts,
             key_decrypt_threads: keys.key_decrypt_threads,
-            tracing_endpoint: tracing.tracing_endpoint,
-            tracing_exporter: tracing.tracing_exporter,
-            tracing_sample_rate: tracing.tracing_sample_rate,
-            tracing_max_queue_size: tracing.tracing_max_queue_size,
-            tracing_max_export_batch_size: tracing.tracing_max_export_batch_size,
+            tracing_endpoint: tracing.endpoint,
+            tracing_exporter: tracing.exporter,
+            tracing_sample_rate: tracing.sample_rate,
+            tracing_max_queue_size: tracing.max_queue_size,
+            tracing_max_export_batch_size: tracing.max_export_batch_size,
             secret_provider: keys.secret_provider,
             gcp_project_id: keys.gcp_project_id,
             gcp_secret_prefix: keys.gcp_secret_prefix,
             secret_refresh_interval: keys.secret_refresh_interval,
             secret_provider_strict: flag(keys.secret_provider_strict),
-            allow_insecure_remote_signer: flag(keymanager.allow_insecure_remote_signer),
-            keymanager_cors_origins: keymanager.keymanager_cors_origins,
-            keymanager_body_limit: keymanager.keymanager_body_limit,
-            grpc_signer_url: grpc_signer.grpc_signer_url,
-            grpc_signer_tls_cert: grpc_signer.grpc_signer_tls_cert,
-            grpc_signer_tls_key: grpc_signer.grpc_signer_tls_key,
-            grpc_signer_tls_ca_cert: grpc_signer.grpc_signer_tls_ca_cert,
+            allow_insecure_remote_signer: keymanager.allow_insecure_remote_signer.filter(|b| *b),
+            keymanager_cors_origins: keymanager.cors_origins,
+            keymanager_body_limit: keymanager.body_limit,
+            grpc_signer_url: grpc_signer.url,
+            grpc_signer_tls_cert: grpc_signer.tls_cert,
+            grpc_signer_tls_key: grpc_signer.tls_key,
+            grpc_signer_tls_ca_cert: grpc_signer.tls_ca_cert,
             disable_attesting: flag(safety.disable_attesting),
             slashed_validators_action: safety.slashed_validators_action,
             builder_circuit_breaker_consecutive_limit: builder
@@ -662,9 +563,9 @@ impl From<StartArgs> for CliOverrides {
             proposer_config_refresh_interval: proposer.proposer_config_refresh_interval,
             proposer_config_url_token: proposer.proposer_config_url_token,
             proposer_config_url_insecure: flag(proposer.proposer_config_url_insecure),
-            monitoring_endpoint: monitoring.monitoring_endpoint,
-            monitoring_interval: monitoring.monitoring_interval,
-            monitoring_endpoint_insecure: flag(monitoring.monitoring_endpoint_insecure),
+            monitoring_endpoint: monitoring.endpoint,
+            monitoring_interval: monitoring.interval,
+            monitoring_endpoint_insecure: monitoring.endpoint_insecure.filter(|b| *b),
             logfile: logging.logfile,
             logfile_max_size: logging.logfile_max_size,
             logfile_max_number: logging.logfile_max_number,
@@ -719,10 +620,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Start(args) => {
             let args = *args;
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
-            if args.grpc_signer.grpc_signer_url.is_some()
-                && (args.grpc_signer.grpc_signer_tls_cert.is_none()
-                    || args.grpc_signer.grpc_signer_tls_key.is_none()
-                    || args.grpc_signer.grpc_signer_tls_ca_cert.is_none())
+            if args.grpc_signer.url.is_some()
+                && (args.grpc_signer.tls_cert.is_none()
+                    || args.grpc_signer.tls_key.is_none()
+                    || args.grpc_signer.tls_ca_cert.is_none())
             {
                 anyhow::bail!(
                     "--grpc-signer-url requires --grpc-signer-tls-cert, \
@@ -915,6 +816,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use rvc::config::TracingExporter;
 
     /// Complete long-flag surface for `rvc start` (RF5-14 help snapshot).
     const START_FLAGS: &[&str] = &[
@@ -1407,11 +1309,11 @@ grpc_port = 60051
         };
         assert!(args.beacon.beacon_url.is_some());
         assert!(args.logging.logfile.is_some());
-        assert!(args.tracing.tracing_endpoint.is_some());
-        assert!(args.keymanager.keymanager_enabled);
-        assert!(args.grpc_signer.grpc_signer_url.is_some());
+        assert!(args.tracing.endpoint.is_some());
+        assert_eq!(args.keymanager.enabled, Some(true));
+        assert!(args.grpc_signer.url.is_some());
         assert!(args.proposer.proposer_config_file.is_some());
-        assert!(args.monitoring.monitoring_endpoint.is_some());
+        assert!(args.monitoring.endpoint.is_some());
         assert!(args.builder.builder_circuit_breaker_consecutive_limit.is_some());
         assert!(args.slashing.slashing_db_path.is_some());
     }

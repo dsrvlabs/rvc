@@ -20,6 +20,11 @@ use beacon::ResponseCaps;
 use super::error::ConfigError;
 use super::network::Network;
 
+pub use rvc_config::sections::{
+    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, MonitoringArgs,
+    MonitoringConfig, TracingArgs, TracingConfig, TracingExporter,
+};
+
 /// Action taken when a managed validator is detected as slashed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -95,38 +100,6 @@ impl FromStr for BroadcastTopic {
             other => Err(format!(
                 "invalid broadcast topic '{other}': must be one of attestations, blocks, sync-committee, subscriptions, none"
             )),
-        }
-    }
-}
-
-/// OpenTelemetry exporter backend selected in config / CLI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TracingExporter {
-    /// OTLP over HTTP (default).
-    #[default]
-    Otlp,
-    /// Google Cloud Trace (requires the `gcp-trace` feature on the binary).
-    Gcp,
-}
-
-impl fmt::Display for TracingExporter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Otlp => write!(f, "otlp"),
-            Self::Gcp => write!(f, "gcp"),
-        }
-    }
-}
-
-impl FromStr for TracingExporter {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "otlp" => Ok(Self::Otlp),
-            "gcp" => Ok(Self::Gcp),
-            other => Err(format!("invalid tracing_exporter '{other}': must be one of otlp, gcp")),
         }
     }
 }
@@ -276,10 +249,6 @@ fn default_beacon_max_body_bytes() -> usize {
     ResponseCaps::DEFAULT_MAX_BODY_BYTES
 }
 
-fn default_monitoring_interval() -> u64 {
-    384
-}
-
 fn default_proposer_config_refresh_interval() -> u64 {
     384
 }
@@ -353,20 +322,12 @@ fn default_gcp_secret_prefix() -> String {
     "validator-key-".to_string()
 }
 
-fn default_keymanager_body_limit() -> usize {
-    10 * 1024 * 1024 // 10 MB
-}
-
 fn default_circuit_breaker_consecutive_limit() -> u32 {
     3
 }
 
 fn default_circuit_breaker_epoch_limit() -> u32 {
     5
-}
-
-fn default_tracing_sample_rate() -> f64 {
-    0.01
 }
 
 // ---------------------------------------------------------------------------
@@ -406,111 +367,6 @@ impl Default for LogfileConfig {
     }
 }
 
-/// Distributed tracing / OpenTelemetry settings.
-///
-/// `sample_rate` is `Option` end-to-end so an explicit `0.01` is distinguishable
-/// from "unset" (RF5-15 / F20). Resolve with [`TracingConfig::resolve_sample_rate`]
-/// / [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
-/// built-in default.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct TracingConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub exporter: TracingExporter,
-    /// Head-based sampling ratio when set. `None` means "not configured" so
-    /// `OTEL_TRACES_SAMPLER_ARG` and the 0.01 built-in default can apply at
-    /// resolution time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_queue_size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_export_batch_size: Option<usize>,
-}
-
-impl TracingConfig {
-    /// Resolve the OTLP endpoint: explicit config/CLI > `OTEL_EXPORTER_OTLP_ENDPOINT`.
-    ///
-    /// Returns `None` when neither source provides a value (tracing stays disabled).
-    pub fn resolve_endpoint(&self) -> Option<String> {
-        self.endpoint.clone().or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
-    }
-
-    /// Resolve the sample rate: explicit config/CLI > `OTEL_TRACES_SAMPLER_ARG` > 0.01.
-    ///
-    /// Values outside `0.0..=1.0` are clamped with a warning.
-    pub fn resolve_sample_rate(&self) -> f64 {
-        let mut rate = match self.sample_rate {
-            Some(rate) => rate,
-            None => match std::env::var("OTEL_TRACES_SAMPLER_ARG") {
-                Ok(env_rate) => {
-                    env_rate.parse::<f64>().unwrap_or_else(|_| default_tracing_sample_rate())
-                }
-                Err(_) => default_tracing_sample_rate(),
-            },
-        };
-
-        if !(0.0..=1.0).contains(&rate) {
-            warn!(sample_rate = rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
-            rate = rate.clamp(0.0, 1.0);
-        }
-        rate
-    }
-}
-
-/// Keymanager API and remote-signer settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct KeymanagerConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_file: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_signer_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_signer_allowed_hosts: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_insecure_remote_signer: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cors_origins: Vec<String>,
-    #[serde(default = "default_keymanager_body_limit")]
-    pub body_limit: usize,
-}
-
-impl Default for KeymanagerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: None,
-            token_file: None,
-            remote_signer_url: None,
-            remote_signer_allowed_hosts: None,
-            allow_insecure_remote_signer: false,
-            cors_origins: Vec::new(),
-            body_limit: default_keymanager_body_limit(),
-        }
-    }
-}
-
-/// gRPC remote signer connection settings.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GrpcSignerConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_cert: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_key: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_ca_cert: Option<PathBuf>,
-}
-
 /// Proposer-config URL / file source settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -536,24 +392,6 @@ impl Default for ProposerConfigSource {
             url_token: None,
             url_insecure: false,
         }
-    }
-}
-
-/// Monitoring push-endpoint settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MonitoringConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default = "default_monitoring_interval")]
-    pub interval: u64,
-    #[serde(default)]
-    pub endpoint_insecure: bool,
-}
-
-impl Default for MonitoringConfig {
-    fn default() -> Self {
-        Self { endpoint: None, interval: default_monitoring_interval(), endpoint_insecure: false }
     }
 }
 

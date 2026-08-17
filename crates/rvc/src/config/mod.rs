@@ -11,7 +11,8 @@ pub use error::ConfigError;
 pub use network::Network;
 pub use types::{
     redact_url, BeaconNodeEntry, BroadcastTopic, BuilderLimits, CliOverrides, Config,
-    GcpSecretConfig, GrpcSignerConfig, KeymanagerConfig, LogfileConfig, MonitoringConfig,
-    ProposerConfigSource, SecretProviderConfig, SlashedAction, TracingConfig, TracingExporter,
+    GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig,
+    LogfileConfig, MonitoringArgs, MonitoringConfig, ProposerConfigSource, SecretProviderConfig,
+    SlashedAction, TracingArgs, TracingConfig, TracingExporter,
 };
 pub use validator_store::BlockSelectionMode;

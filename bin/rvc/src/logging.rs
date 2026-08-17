@@ -571,21 +571,12 @@ mod tests {
         match cli.command {
             crate::cli::Commands::Start(args) => {
                 assert_eq!(
-                    args.grpc_signer.grpc_signer_url.as_deref(),
+                    args.grpc_signer.url.as_deref(),
                     Some("https://signer.example.com:50051")
                 );
-                assert_eq!(
-                    args.grpc_signer.grpc_signer_tls_cert,
-                    Some(PathBuf::from("/tmp/cert.pem"))
-                );
-                assert_eq!(
-                    args.grpc_signer.grpc_signer_tls_key,
-                    Some(PathBuf::from("/tmp/key.pem"))
-                );
-                assert_eq!(
-                    args.grpc_signer.grpc_signer_tls_ca_cert,
-                    Some(PathBuf::from("/tmp/ca.pem"))
-                );
+                assert_eq!(args.grpc_signer.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
+                assert_eq!(args.grpc_signer.tls_key, Some(PathBuf::from("/tmp/key.pem")));
+                assert_eq!(args.grpc_signer.tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
             }
             _ => panic!("expected Start command"),
         }
@@ -597,10 +588,10 @@ mod tests {
 
         match cli.command {
             crate::cli::Commands::Start(args) => {
-                assert!(args.grpc_signer.grpc_signer_url.is_none());
-                assert!(args.grpc_signer.grpc_signer_tls_cert.is_none());
-                assert!(args.grpc_signer.grpc_signer_tls_key.is_none());
-                assert!(args.grpc_signer.grpc_signer_tls_ca_cert.is_none());
+                assert!(args.grpc_signer.url.is_none());
+                assert!(args.grpc_signer.tls_cert.is_none());
+                assert!(args.grpc_signer.tls_key.is_none());
+                assert!(args.grpc_signer.tls_ca_cert.is_none());
             }
             _ => panic!("expected Start command"),
         }
