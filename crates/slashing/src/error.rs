@@ -102,6 +102,15 @@ pub enum SlashingError {
     /// Classification of this variant is ARCH-5i; the inject is ARCH-5e/5g.
     #[error("slashing-protection reserve commit failed (no row written): {0}")]
     ReserveCommitFailed(String),
+
+    /// Compensating delete inside [`crate::SlashingDb::reconcile_unsigned`]
+    /// failed. The reserved history row is **retained** (C1 fail-safe).
+    ///
+    /// Never returned as `Err` from `reconcile_unsigned` — that method returns
+    /// [`crate::ReconcileOutcome::Failed`] so a caller cannot `?` a compensation
+    /// failure off a signing path.
+    #[error("slashing-protection compensating delete failed (row retained): {0}")]
+    ReconcileFailed(String),
 }
 
 impl SlashingError {

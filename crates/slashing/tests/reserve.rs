@@ -1,8 +1,8 @@
-//! ARCH-5e: `reserve_block` / `reserve_attestation` + `CommittedReservation`.
+//! ARCH-5e / ARCH-5f: `reserve_*` + `reconcile_unsigned`.
 //!
-//! Additive sibling of `stage_*`. Compensating delete is **ARCH-5f** — this
-//! file must not grow a `reconcile_unsigned` caller. Shipping reserve without
-//! 5f must not become a production sign path (M-1).
+//! Additive sibling of `stage_*`. `reconcile_unsigned` is the compensating
+//! delete that makes reserve-before-sign admissible (M-1). C1: a failed
+//! delete retains. No production caller switch (ARCH-5l).
 //!
 //! M-1 (`crates/signer/tests/phantom_row_m1.rs:1-10`):
 //! Before the fix, `SignerService::sign_attestation` and `sign_block` called
@@ -18,8 +18,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use metrics::definitions::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
-    BlockSlashingViolation, CommittedReservation, ReservationKind, SlashingDb, SlashingError,
+    BlockSlashingViolation, CommittedReservation, InterchangeAttestation, InterchangeBlock,
+    InterchangeFormat, InterchangeMetadata, ReconcileOutcome, ReservationKind, SlashingDb,
+    SlashingError, ValidatorRecord,
 };
 
 const PUBKEY: &str = "0xdeadbeef01";
@@ -27,6 +30,11 @@ const PUBKEY2: &str = "0xdeadbeef02";
 const GVR: &[u8; 32] = &[0u8; 32];
 const R1: &[u8; 32] = &[0x01u8; 32];
 const R2: &[u8; 32] = &[0x02u8; 32];
+const CHAIN_GVR_HEX: &str = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+const CHAIN_GVR: [u8; 32] = [
+    0x04, 0x70, 0x00, 0x07, 0xfa, 0xbc, 0x82, 0x82, 0x64, 0x4a, 0xed, 0x6d, 0x1c, 0x7c, 0x9e, 0x21,
+    0xd3, 0x8a, 0x03, 0xa0, 0xc4, 0xba, 0x19, 0x3f, 0x3a, 0xfe, 0x42, 0x88, 0x24, 0xb3, 0xa6, 0x73,
+];
 
 fn assert_send<T: Send>() {}
 
@@ -230,4 +238,217 @@ fn test_reserve_attestation_commit_failure_leaves_no_row() {
         db.reserve_attestation(PUBKEY, 2, 8, Some("0xatt_inj".into()), GVR).expect_err("inject");
     assert!(err.is_reserve_commit_failure());
     assert!(db.get_attestations(PUBKEY).expect("get").is_empty());
+}
+
+// ── ARCH-5f: reconcile_unsigned ───────────────────────────────────────────────
+
+/// RED for 5f: two reserved slots, reconcile one, the other must survive.
+/// A naive `DELETE … WHERE pubkey = ?` fails this.
+#[test]
+fn test_reconcile_deletes_exactly_the_reserved_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let keep = db.reserve_block(PUBKEY, 10, Some("0xkeep".into()), GVR).expect("reserve keep");
+    let drop = db.reserve_block(PUBKEY, 20, Some("0xdrop".into()), GVR).expect("reserve drop");
+    assert!(keep.inserted && drop.inserted);
+    assert_eq!(db.get_blocks(PUBKEY).expect("get").len(), 2);
+
+    let outcome = db.reconcile_unsigned(&drop);
+    assert!(matches!(outcome, ReconcileOutcome::Deleted));
+
+    let remaining = db.get_blocks(PUBKEY).expect("get");
+    assert_eq!(remaining.len(), 1, "exactly the reserved row must be deleted");
+    assert_eq!(remaining[0].slot, 10);
+    assert_eq!(remaining[0].signing_root.as_deref(), Some("0xkeep"));
+}
+
+#[test]
+fn test_reconcile_deletes_exactly_the_reserved_attestation() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let keep = db.reserve_attestation(PUBKEY, 1, 5, Some("0xatt_keep".into()), GVR).expect("keep");
+    let drop = db.reserve_attestation(PUBKEY, 5, 9, Some("0xatt_drop".into()), GVR).expect("drop");
+    assert!(keep.inserted && drop.inserted);
+
+    let outcome = db.reconcile_unsigned(&drop);
+    assert!(matches!(outcome, ReconcileOutcome::Deleted));
+
+    let remaining = db.get_attestations(PUBKEY).expect("get");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].target_epoch, 5);
+    assert_eq!(remaining[0].signing_root.as_deref(), Some("0xatt_keep"));
+}
+
+#[test]
+fn test_reconcile_is_a_noop_for_a_resign_reservation() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let first = db.reserve_block(PUBKEY, 42, Some("0xsame".into()), GVR).expect("first");
+    assert!(first.inserted);
+    let resign = db.reserve_block(PUBKEY, 42, Some("0xsame".into()), GVR).expect("resign");
+    assert!(!resign.inserted);
+
+    let outcome = db.reconcile_unsigned(&resign);
+    assert!(matches!(outcome, ReconcileOutcome::NotApplicable));
+    assert_eq!(db.get_blocks(PUBKEY).expect("get").len(), 1);
+
+    // The original inserted reservation is still reconcilable.
+    let deleted = db.reconcile_unsigned(&first);
+    assert!(matches!(deleted, ReconcileOutcome::Deleted));
+    assert!(db.get_blocks(PUBKEY).expect("get").is_empty());
+}
+
+/// Targeting includes signing_root: a fabricated reservation for the same
+/// slot/kind with a different root must not remove the real row.
+#[test]
+fn test_reconcile_does_not_delete_a_mismatched_signing_root_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let reserved = db.reserve_block(PUBKEY, 7, Some("0xreal".into()), GVR).expect("reserve");
+    assert!(reserved.inserted);
+
+    let forged = CommittedReservation {
+        pubkey_hex: reserved.pubkey_hex.clone(),
+        kind: reserved.kind,
+        signing_root_hex: Some("0xother".into()),
+        inserted: true,
+    };
+    let outcome = db.reconcile_unsigned(&forged);
+    assert!(
+        matches!(outcome, ReconcileOutcome::NotApplicable),
+        "0-row targeted DELETE must not report Deleted, got: {outcome:?}"
+    );
+    let remaining = db.get_blocks(PUBKEY).expect("get");
+    assert_eq!(remaining.len(), 1, "mismatched signing_root must not delete the row");
+    assert_eq!(remaining[0].signing_root.as_deref(), Some("0xreal"));
+}
+
+#[test]
+fn test_reconcile_never_changes_watermarks() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_block_watermark(PUBKEY, 50).expect("block wm");
+    db.set_attestation_watermark(PUBKEY, 3, 4).expect("att wm");
+    db.set_block_watermark(PUBKEY2, 999).expect("other wm");
+
+    let before_block = db.get_block_watermark(PUBKEY).expect("get");
+    let before_att = db.get_attestation_watermark(PUBKEY).expect("get");
+    let before_other = db.get_block_watermark(PUBKEY2).expect("get");
+
+    let reservation =
+        db.reserve_block(PUBKEY, 80, Some("0xabove".into()), GVR).expect("reserve above floor");
+    assert!(reservation.inserted);
+    let outcome = db.reconcile_unsigned(&reservation);
+    assert!(matches!(outcome, ReconcileOutcome::Deleted));
+
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("get"), before_block);
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("get"), before_att);
+    assert_eq!(db.get_block_watermark(PUBKEY2).expect("get"), before_other);
+}
+
+/// Minified interchange: watermark floor + dummy history at the floor.
+/// Reconciling a later reservation must not re-open a slot at or below that floor.
+#[test]
+fn test_reconcile_after_a_minified_import_cannot_reopen_a_closed_slot() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_genesis_validators_root(&CHAIN_GVR).expect("pin");
+
+    let interchange = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".into(),
+            genesis_validators_root: CHAIN_GVR_HEX.into(),
+        },
+        data: vec![ValidatorRecord {
+            pubkey: PUBKEY.into(),
+            signed_blocks: vec![InterchangeBlock { slot: "100".into(), signing_root: None }],
+            signed_attestations: vec![InterchangeAttestation {
+                source_epoch: "10".into(),
+                target_epoch: "20".into(),
+                signing_root: None,
+            }],
+        }],
+    };
+    db.import(&interchange, &CHAIN_GVR).expect("minified import");
+    assert_eq!(db.get_block_watermark(PUBKEY).expect("wm"), Some(100));
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("wm"), Some((10, 20)));
+
+    let reservation = db
+        .reserve_block(PUBKEY, 200, Some("0xabove_floor".into()), &CHAIN_GVR)
+        .expect("reserve above imported floor");
+    assert!(reservation.inserted);
+    let outcome = db.reconcile_unsigned(&reservation);
+    assert!(matches!(outcome, ReconcileOutcome::Deleted));
+
+    assert_eq!(
+        db.get_block_watermark(PUBKEY).expect("wm"),
+        Some(100),
+        "reconcile must not lower the imported floor"
+    );
+    assert_eq!(db.get_attestation_watermark(PUBKEY).expect("wm"), Some((10, 20)));
+
+    let below = db.reserve_block(PUBKEY, 50, Some("0xreopen".into()), &CHAIN_GVR);
+    assert!(
+        matches!(below, Err(SlashingError::BelowBlockWatermark { .. })),
+        "slot at or below the minified floor must stay refused, got: {below:?}"
+    );
+
+    let at_floor = db.reserve_block(PUBKEY, 100, Some("0xat_floor".into()), &CHAIN_GVR);
+    assert!(at_floor.is_err(), "the imported floor slot must stay closed, got: {at_floor:?}");
+
+    // Watermark-only isolation: no history at the floor, only the raised watermark.
+    db.set_block_watermark(PUBKEY2, 75).expect("watermark-only floor");
+    let above = db
+        .reserve_block(PUBKEY2, 200, Some("0xpk2".into()), &CHAIN_GVR)
+        .expect("reserve above watermark-only floor");
+    assert!(matches!(db.reconcile_unsigned(&above), ReconcileOutcome::Deleted));
+    let reopen = db.reserve_block(PUBKEY2, 75, Some("0xreopen_wm".into()), &CHAIN_GVR);
+    assert!(
+        matches!(reopen, Err(SlashingError::BelowBlockWatermark { .. })),
+        "watermark-only floor must survive reconcile, got: {reopen:?}"
+    );
+}
+
+/// 48-byte compressed BLS key so `TruncatedPubkey` actually truncates.
+/// A raw-pubkey log regression would fail `!logs_contain(FULL_PUBKEY)`.
+const FULL_PUBKEY: &str = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
+const FULL_PUBKEY_TRUNCATED: &str = "0x93247f2209...611df74a";
+
+#[tracing_test::traced_test]
+#[test]
+fn test_reconcile_failure_reports_failed_and_retains_the_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    let reservation =
+        db.reserve_block(FULL_PUBKEY, 3, Some("0xphantom".into()), GVR).expect("reserve");
+    assert!(reservation.inserted);
+
+    let failed_before = RVC_SLASHING_RECONCILE_TOTAL
+        .with_label_values(&[tx_hold_kind::BLOCK, reconcile_outcome::FAILED])
+        .get();
+
+    // Consumed by reconcile, not reserve — armed after the INSERT committed.
+    db.fail_next_commits(1);
+    let outcome = db.reconcile_unsigned(&reservation);
+    match outcome {
+        ReconcileOutcome::Failed(SlashingError::ReconcileFailed(msg)) => {
+            assert!(msg.contains("injected reconcile failure"), "got: {msg}");
+        }
+        other => panic!("expected Failed(ReconcileFailed), got: {other:?}"),
+    }
+
+    let remaining = db.get_blocks(FULL_PUBKEY).expect("get");
+    assert_eq!(remaining.len(), 1, "failed delete must retain the row (C1)");
+    assert_eq!(remaining[0].signing_root.as_deref(), Some("0xphantom"));
+
+    let failed_after = RVC_SLASHING_RECONCILE_TOTAL
+        .with_label_values(&[tx_hold_kind::BLOCK, reconcile_outcome::FAILED])
+        .get();
+    assert!(
+        failed_after > failed_before,
+        "rvc_slashing_reconcile_total{{outcome=failed}} must increment: before={failed_before} after={failed_after}"
+    );
+    assert!(logs_contain("reconcile_unsigned failed"));
+    assert!(logs_contain("retaining reserved slashing row"));
+    assert!(
+        logs_contain(FULL_PUBKEY_TRUNCATED),
+        "Failed path must log TruncatedPubkey, expected {FULL_PUBKEY_TRUNCATED}"
+    );
+    assert!(
+        !logs_contain(FULL_PUBKEY),
+        "raw 48-byte pubkey must not appear in the reconcile error log"
+    );
 }

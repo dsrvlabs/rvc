@@ -78,20 +78,25 @@ pub struct SlashingDb {
     /// observes "no GVR pinned in metadata" so operators can detect a degraded
     /// chain-swap-protection state.
     gvr_skip_warned: OnceLock<()>,
-    /// Per-instance countdown of forced commit failures (`test-utils` only arms it).
+    /// Per-instance countdown of forced persist failures (`test-utils` only arms it).
     ///
     /// Scoped to this `SlashingDb` so parallel tests with separate in-memory DBs
     /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`;
-    /// consumed inside `reserve_*` immediately before INSERT.
+    /// consumed inside `reserve_*` immediately before INSERT, and inside
+    /// `reconcile_unsigned` immediately before the compensating DELETE.
     pub(crate) fail_next_commits: AtomicU32,
 }
 
 impl SlashingDb {
-    /// Force the next `n` persist operations on **this** DB to fail before
-    /// INSERT/`COMMIT`: `Staged*::commit` (snapshotted at `stage_*`) and
-    /// `reserve_*` (consumed immediately before INSERT). Drop of a staged
-    /// guard still rolls back. Per-instance — safe under parallel tests with
-    /// separate `open_in_memory()` DBs.
+    /// Force the next `n` persist operations on **this** DB to fail:
+    /// `Staged*::commit` (snapshotted at `stage_*`), `reserve_*` (consumed
+    /// immediately before INSERT), and `reconcile_unsigned` (consumed
+    /// immediately before DELETE). Drop of a staged guard still rolls back.
+    /// Per-instance — safe under parallel tests with separate
+    /// `open_in_memory()` DBs.
+    ///
+    /// Arm this **after** a successful `reserve_*` to fail the compensating
+    /// delete; otherwise `reserve_*` consumes the inject first.
     ///
     /// # Test-only
     ///

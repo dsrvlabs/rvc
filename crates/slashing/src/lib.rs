@@ -19,7 +19,9 @@ pub use db::SlashingDb;
 pub use error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 pub use reader::{SlashingDbReader, TargetEpoch};
 pub use scoped::{PendingAudit, PubkeyScopedDb};
-pub use stage::{CommittedReservation, ReservationKind, StagedAttestation, StagedBlock};
+pub use stage::{
+    CommittedReservation, ReconcileOutcome, ReservationKind, StagedAttestation, StagedBlock,
+};
 pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,

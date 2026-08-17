@@ -478,6 +478,48 @@ lazy_static! {
         counter
     };
 
+    // ── ADR-005 (Phase 5) ──
+    // Both series land here so ARCH-5l only wires the reserve-only histogram
+    // and edits no definition (merge-conflict strategy, §6.1).
+
+    /// Compensating-delete outcomes for a reserved slashing history row.
+    ///
+    /// Labels: `kind` — `"block"` | `"attestation"`;
+    /// `outcome` ∈ {`deleted`, `not_applicable`, `failed`}.
+    /// `failed` is the M-1 liveness mode: the phantom row is retained (C1).
+    pub static ref RVC_SLASHING_RECONCILE_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_slashing_reconcile_total",
+            "Total slashing reserve compensating-delete outcomes"
+        );
+        let counter = IntCounterVec::new(opts, &["kind", "outcome"])
+            .expect("Failed to create rvc_slashing_reconcile_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_slashing_reconcile_total metric");
+        counter
+    };
+
+    /// Reserve-transaction-only hold duration in milliseconds (ARCH-5b / X6).
+    ///
+    /// Window: mutex acquire → COMMIT inside `reserve_*`. This is the quantity
+    /// ADR-005 shrinks. The existing `rvc_signer_slashing_tx_hold_duration_ms`
+    /// keeps its stage-start → sign-return window for comparability.
+    /// Wired by ARCH-5l; defined here so 5l edits no metric definition.
+    ///
+    /// Labels: `kind` — `"attestation"` or `"block"`.
+    /// Buckets: same 1 ms … 5 s set as the existing tx-hold series.
+    pub static ref RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_slashing_reserve_tx_hold_duration_ms",
+            "Duration (ms) of the slashing-DB reserve write transaction (mutex acquire → COMMIT)"
+        ).buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]);
+        let histogram = HistogramVec::new(opts, &["kind"])
+            .expect("Failed to create rvc_slashing_reserve_tx_hold_duration_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_slashing_reserve_tx_hold_duration_ms metric");
+        histogram
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -516,6 +558,8 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
     lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL);
     lazy_static::initialize(&RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS);
+    lazy_static::initialize(&RVC_SLASHING_RECONCILE_TOTAL);
+    lazy_static::initialize(&RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS);
 }
 
 /// Attestation status label values.
@@ -592,6 +636,13 @@ pub mod attestation_trigger_source {
     pub const HEAD_EVENT: &str = "head_event";
 }
 
+/// `outcome` label values for `rvc_slashing_reconcile_total`.
+pub mod reconcile_outcome {
+    pub const DELETED: &str = "deleted";
+    pub const NOT_APPLICABLE: &str = "not_applicable";
+    pub const FAILED: &str = "failed";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +714,12 @@ mod tests {
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
         RVC_SSE_EVENTS_DROPPED_TOTAL.inc();
         RVC_ATTESTATION_TRIGGER_TOTAL.with_label_values(&[attestation_trigger_source::TIMER]).inc();
+        RVC_SLASHING_RECONCILE_TOTAL
+            .with_label_values(&[tx_hold_kind::BLOCK, reconcile_outcome::DELETED])
+            .inc();
+        RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS
+            .with_label_values(&[tx_hold_kind::BLOCK])
+            .observe(1.0);
 
         let metrics = REGISTRY.gather();
         let metric_names: Vec<&str> = metrics.iter().map(|m| m.name()).collect();
@@ -691,6 +748,25 @@ mod tests {
             metric_names.contains(&"rvc_attestation_trigger_total"),
             "rvc_attestation_trigger_total should be registered"
         );
+        assert!(
+            metric_names.contains(&"rvc_slashing_reconcile_total"),
+            "rvc_slashing_reconcile_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_slashing_reserve_tx_hold_duration_ms"),
+            "rvc_slashing_reserve_tx_hold_duration_ms should be registered"
+        );
+    }
+
+    #[test]
+    fn test_slashing_reconcile_total_increments() {
+        RVC_SLASHING_RECONCILE_TOTAL
+            .with_label_values(&[tx_hold_kind::BLOCK, reconcile_outcome::FAILED])
+            .inc();
+        let value = RVC_SLASHING_RECONCILE_TOTAL
+            .with_label_values(&[tx_hold_kind::BLOCK, reconcile_outcome::FAILED])
+            .get();
+        assert!(value >= 1, "failed reconcile counter should be at least 1 after increment");
     }
 
     #[test]

@@ -762,17 +762,17 @@ pub fn reconcile_unsigned(&self, reservation: &CommittedReservation) -> Reconcil
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] `reconcile_unsigned` returns `ReconcileOutcome`, never `Result`; no caller can `?` it.
-- [ ] `NotApplicable` on `!inserted`, asserted.
-- [ ] The delete is targeted on `(pubkey, kind, signing_root)` and affects at most one row.
-- [ ] Watermarks are provably unchanged across reserve + reconcile.
-- [ ] A minified-import floor cannot be re-opened by a reconcile.
-- [ ] A failed delete yields `Failed(_)`, **retains** the row, increments
+- [x] `reconcile_unsigned` returns `ReconcileOutcome`, never `Result`; no caller can `?` it.
+- [x] `NotApplicable` on `!inserted`, asserted.
+- [x] The delete is targeted on `(pubkey, kind, signing_root)` and affects at most one row.
+- [x] Watermarks are provably unchanged across reserve + reconcile.
+- [x] A minified-import floor cannot be re-opened by a reconcile.
+- [x] A failed delete yields `Failed(_)`, **retains** the row, increments
       `rvc_slashing_reconcile_total{outcome="failed"}`, and logs at `error!`.
-- [ ] The liveness trade (A-5.5) is written into the module docs: *under `DiscardStagedRow` a
+- [x] The liveness trade (A-5.5) is written into the module docs: *under `DiscardStagedRow` a
       failed compensating delete leaves a phantom row — M-1's liveness mode, accepted because the
       alternative direction permits a double-sign.*
-- [ ] G-7 (`audit_log_scope.rs`) green — no emission inside a scope holding the DB mutex.
+- [x] G-7 (`audit_log_scope.rs`) green — no emission inside a scope holding the DB mutex.
 
 ---
 
