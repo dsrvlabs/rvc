@@ -334,6 +334,14 @@ impl LivenessApi for DutyStallBeacon {
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         self.inner.post_validator_liveness(epoch, validator_indices).await
     }
+
+    async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.inner.post_validator_liveness_merged(epoch, validator_indices).await
+    }
 }
 
 impl BeaconNodeClient for DutyStallBeacon {}

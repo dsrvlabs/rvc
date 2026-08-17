@@ -1,7 +1,7 @@
 //! SEC-2c: per-slot forward-window liveness observation loop.
 //!
 //! Drives [`ForwardWindowMachine`] with real network liveness via the bn-manager
-//! (`BeaconNodeClient::post_validator_liveness`, multi-BN `query_first` failover).
+//! (`BeaconNodeClient::post_validator_liveness_merged`, multi-BN OR-merge).
 //!
 //! Each cycle (once per slot):
 //! 1. Periodically re-resolve numeric indices from the live [`PubkeyMap`] (import /
@@ -14,14 +14,15 @@
 //! A clean fully-observed window opens the gate. This loop is the sole production
 //! doppelganger mechanism (the backward one-shot `DoppelgangerService` is not wired).
 //!
-//! # Multi-BN residual (review Finding 2 — accepted)
+//! # Multi-BN OR-merge (ARCH-P1-13)
 //!
-//! Liveness uses bn-manager `query_first`: the first healthy BN that returns HTTP
-//! success wins; there is **no cross-BN OR-merge of `is_live`**. A lagging or
-//! wrong primary that answers all-not-live suppresses secondaries that might
-//! report live activity. Fixing that needs a dedicated multi-query merge in
-//! bn-manager (not a simple existing `query_best` comparator). Residual risk is
-//! documented; loop still fail-closes on errors/incomplete samples.
+//! Liveness fans out to every configured BN via
+//! [`BeaconNodeClient::post_validator_liveness_merged`]. Per validator index,
+//! `is_live` is OR-merged — any BN reporting live wins (fail-safe: a lagging
+//! primary that answers all-not-live cannot suppress a secondary that saw
+//! activity). Errors and non-responses contribute nothing (they are not treated
+//! as "not live"). If every BN fails the call returns `Err` and this loop still
+//! fail-closes on errors/incomplete samples.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -266,7 +267,7 @@ impl LivenessObservationLoop {
         let numeric_indices: Vec<String> = index_to_bare.keys().cloned().collect();
         let response = self
             .beacon
-            .post_validator_liveness(epoch, &numeric_indices)
+            .post_validator_liveness_merged(epoch, &numeric_indices)
             .await
             .map_err(|e| e.to_string())?;
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -9,8 +9,9 @@ use beacon::{
     BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
     ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -874,6 +875,44 @@ fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
     val_a > val_b
 }
 
+/// OR-merge `is_live` per validator index across broadcast outcomes.
+///
+/// Fail-safe: any BN reporting live wins. Errors contribute nothing. All-fail
+/// returns `Err` so the observation loop stays fail-closed.
+fn merge_liveness_broadcast(
+    broadcast: BroadcastResult<ValidatorLivenessResponse>,
+) -> Result<ValidatorLivenessResponse, BeaconError> {
+    if !broadcast.any_success() {
+        return broadcast.into_result();
+    }
+
+    let mut live_by_index: HashMap<String, bool> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for outcome in broadcast.outcomes {
+        let Ok(resp) = outcome.result else {
+            continue;
+        };
+        for entry in resp.data {
+            match live_by_index.get_mut(&entry.index) {
+                Some(live) => *live |= entry.is_live,
+                None => {
+                    live_by_index.insert(entry.index.clone(), entry.is_live);
+                    order.push(entry.index);
+                }
+            }
+        }
+    }
+
+    Ok(ValidatorLivenessResponse {
+        data: order
+            .into_iter()
+            .filter_map(|index| {
+                live_by_index.remove(&index).map(|is_live| ValidatorLiveness { index, is_live })
+            })
+            .collect(),
+    })
+}
+
 #[async_trait]
 impl NodeStatusApi for BnManager {
     // -- State / Config: query(First), any role, accept SmallLag --
@@ -1291,6 +1330,22 @@ impl LivenessApi for BnManager {
         })
         .await
     }
+
+    // -- ARCH-3n: fan-out + per-index OR-merge (fail-safe live-wins) --
+
+    async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        let broadcast = self
+            .broadcast_inner("post_validator_liveness_merged", &|c| {
+                Box::pin(c.post_validator_liveness(epoch, validator_indices))
+            })
+            .await;
+        Self::log_partial_failure("post_validator_liveness_merged", &broadcast);
+        merge_liveness_broadcast(broadcast)
+    }
 }
 
 impl BeaconNodeClient for BnManager {}
@@ -1446,6 +1501,11 @@ impl_beacon_client_passthrough! {
             epoch: u64,
             validator_indices: &[String],
         ) -> Result<ValidatorLivenessResponse, BeaconError>;
+        async fn post_validator_liveness_merged(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError>;
     }
 }
 
@@ -1467,10 +1527,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 26 methods across the six role traits (see impl_beacon_client_passthrough!).
+        // 27 methods across the six role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            26,
+            27,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -1492,6 +1552,7 @@ mod tests {
             "submit_attestation",
             "submit_sync_committee_messages",
             "post_validator_liveness",
+            "post_validator_liveness_merged",
         ] {
             assert!(
                 BEACON_CLIENT_PASSTHROUGH_METHODS.contains(&required),

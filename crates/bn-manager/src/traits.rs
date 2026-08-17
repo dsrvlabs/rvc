@@ -147,6 +147,21 @@ pub trait LivenessApi: Send + Sync {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError>;
+
+    /// Query liveness on every configured BN and OR-merge `is_live` per index.
+    ///
+    /// Any BN reporting live wins (fail-safe). Errors and non-responses
+    /// contribute nothing — they are not treated as "not live". Returns `Err`
+    /// only when every BN fails, so callers can stay fail-closed.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure. Single-BN clients (`BeaconClient`) self-delegate
+    /// to [`Self::post_validator_liveness`].
+    async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError>;
 }
 
 /// Chain state, config, block roots, and node health/version.

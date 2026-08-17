@@ -800,6 +800,15 @@ impl BeaconClient {
         self.post(&path, &validator_indices).await
     }
 
+    /// Single-BN merge is a self-delegation: this node is the only source.
+    pub async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.post_validator_liveness(epoch, validator_indices).await
+    }
+
     /// Submits a signed voluntary exit to the beacon node pool.
     ///
     /// Once submitted, the exit is irreversible. The beacon node will propagate

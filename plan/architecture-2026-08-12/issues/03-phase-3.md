@@ -1113,14 +1113,14 @@ ADR-015 and gate G-6.
 4. `test_single_bn_client_merged_liveness_delegates_to_itself` — the `BeaconClient` impl.
 
 **Acceptance criteria.**
-- [ ] One BN reporting "live" and another "not live" yields a **live-detected** merged verdict, with
+- [x] One BN reporting "live" and another "not live" yields a **live-detected** merged verdict, with
       the fail-safe direction explicit in the test name.
-- [ ] Errors contribute nothing; all-fail still returns `Err` and the loop still fail-closes.
-- [ ] The merged call is reachable through `Arc<dyn BeaconNodeClient>` (role-trait method, passthrough
+- [x] Errors contribute nothing; all-fail still returns `Err` and the loop still fail-closes.
+- [x] The merged call is reachable through `Arc<dyn BeaconNodeClient>` (role-trait method, passthrough
       list updated).
-- [ ] The documented residual at `liveness_loop.rs:17-24` is rewritten to describe the new behaviour.
-- [ ] No change to `stop_monitoring` / `cancel_monitoring` semantics (C5 remains Phase 7's).
-- [ ] Existing doppelganger tests green; no new unbounded channel or raw spawn.
+- [x] The documented residual at `liveness_loop.rs:17-24` is rewritten to describe the new behaviour.
+- [x] No change to `stop_monitoring` / `cancel_monitoring` semantics (C5 remains Phase 7's).
+- [x] Existing doppelganger tests green; no new unbounded channel or raw spawn.
 
 ---
 

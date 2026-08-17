@@ -4,9 +4,10 @@
 //! (RF6-08 / H1). Unit tests that touch private helpers (`primary_endpoint`,
 //! `is_better_block`) remain in `src/manager.rs`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use beacon::BeaconClient;
+use beacon::{BeaconClient, BeaconClientConfig};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -429,6 +430,136 @@ async fn test_post_validator_liveness_failover() {
     assert_eq!(data.len(), 2);
     assert!(!data[0].is_live);
     assert!(data[1].is_live);
+}
+
+/// ARCH-P1-13 / ARCH-3n: fail-safe OR-merge — any BN reporting live wins.
+///
+/// A lagging primary that answers `is_live = false` must not suppress a
+/// secondary that saw activity. `query_first` would take A's answer and stop.
+#[tokio::test]
+async fn test_merged_liveness_reports_live_when_any_bn_says_live_fail_safe() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":false}]}"#),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":true}]}"#),
+        )
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let indices = vec!["1".to_string()];
+    let result = manager.post_validator_liveness_merged(42, &indices).await;
+    assert!(result.is_ok(), "merge must succeed: {result:?}");
+    let entry = result
+        .unwrap()
+        .data
+        .into_iter()
+        .find(|v| v.index == "1")
+        .expect("merged response must include index 1");
+    assert!(entry.is_live, "fail-safe: any BN reporting live must win over a not-live peer");
+}
+
+/// An erroring BN contributes nothing (not live, not not-live).
+#[tokio::test]
+async fn test_merged_liveness_ignores_a_failing_bn() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":false}]}"#),
+        )
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let indices = vec!["1".to_string()];
+    let result = manager.post_validator_liveness_merged(42, &indices).await;
+    assert!(result.is_ok(), "partial failure must not fail the merge: {result:?}");
+    let entry = result
+        .unwrap()
+        .data
+        .into_iter()
+        .find(|v| v.index == "1")
+        .expect("merged response must include index 1");
+    assert!(!entry.is_live, "a failing BN must not be read as live; sole success is not-live");
+}
+
+/// Every BN failing returns Err so the observation loop stays fail-closed.
+#[tokio::test]
+async fn test_merged_liveness_errors_when_every_bn_fails() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("secondary down"))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let indices = vec!["1".to_string()];
+    let result = manager.post_validator_liveness_merged(42, &indices).await;
+    assert!(result.is_err(), "all-fail must return Err so the loop fail-closes");
+}
+
+/// Single-BN `BeaconClient` implements the merge as a self-delegation.
+#[tokio::test]
+async fn test_single_bn_client_merged_liveness_delegates_to_itself() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/7"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":true}]}"#),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(client);
+    let indices = vec!["1".to_string()];
+    let result = beacon.post_validator_liveness_merged(7, &indices).await;
+    assert!(result.is_ok(), "single-BN merge must delegate: {result:?}");
+    let data = result.unwrap().data;
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].index, "1");
+    assert!(data[0].is_live);
 }
 
 #[tokio::test]

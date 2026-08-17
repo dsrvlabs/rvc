@@ -648,6 +648,16 @@ impl LivenessApi for MockBeaconNodeClient {
         self.post_validator_liveness
             .invoke("post_validator_liveness", (epoch, validator_indices.to_vec()))
     }
+
+    async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        // Single-source mock: merge is a self-delegation so existing
+        // `with_post_validator_liveness` fixtures keep working.
+        self.post_validator_liveness(epoch, validator_indices).await
+    }
 }
 
 impl BeaconNodeClient for MockBeaconNodeClient {}
