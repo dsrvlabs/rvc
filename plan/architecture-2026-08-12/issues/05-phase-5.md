@@ -1056,14 +1056,14 @@ narrower "scoped to `RetainStagedRow`" sentence.
   no benefit; name them for the *outcome class*, not the artefact. `EXEMPTIONS` gains nothing.
 
 **Acceptance criteria**
-- [ ] All 14 cells asserted, one `#[test]` per cell, each named for its (class, policy) pair.
-- [ ] Every cell asserts error variant **and** DB state **and** reconcile-metric label.
-- [ ] A parallel "today" run over `stage_then_sign` shows agreement everywhere §5.3 says
+- [x] All 14 cells asserted, one `#[test]` per cell, each named for its (class, policy) pair.
+- [x] Every cell asserts error variant **and** DB state **and** reconcile-metric label.
+- [x] A parallel "today" run over `stage_then_sign` shows agreement everywhere §5.3 says
       "identical" and difference only where it says "stricter".
-- [ ] The unambiguous class under `Retain` is demonstrably **stricter**: with reconcile forced to
+- [x] The unambiguous class under `Retain` is demonstrably **stricter**: with reconcile forced to
       fail, the row **remains**.
-- [ ] No test name matches `.*_root$`; `kat_policy.rs` green with an unchanged `EXEMPTIONS`.
-- [ ] Runs in the normal `nextest` workspace run.
+- [x] No test name matches `.*_root$`; `kat_policy.rs` green with an unchanged `EXEMPTIONS`.
+- [x] Runs in the normal `nextest` workspace run.
 
 ---
 

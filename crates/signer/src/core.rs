@@ -376,6 +376,37 @@ pub struct SlashableSignSession {
 }
 
 impl SlashableSignSession {
+    /// Build a session from `tests/` (separate crate; fields stay private).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_tests(
+        handle: tokio::runtime::Handle,
+        signer: Arc<dyn Signer>,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        sign_timeout: Duration,
+        policy: TimeoutPolicy,
+        policy_recheck: Option<Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>>,
+        slashing_db: Arc<SlashingDb>,
+        hooks: Arc<dyn SignHooks>,
+        op_name: &'static str,
+    ) -> Self {
+        let pubkey_bytes = pubkey.to_bytes();
+        Self {
+            handle,
+            signer,
+            pubkey_bytes,
+            pubkey_hex: hex::encode(pubkey_bytes),
+            signing_root,
+            sign_timeout,
+            policy,
+            policy_recheck,
+            hooks,
+            op_name,
+            slashing_db,
+        }
+    }
+
     /// Run `stage`, then sign with timeout, then commit/discard per [`TimeoutPolicy`].
     ///
     /// `stage` is invoked on this blocking thread and must return a staged guard
