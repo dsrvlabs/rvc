@@ -482,14 +482,14 @@ then extends to the slashable path.
   (non-slashable writes **no** slashing rows) — the last is the strongest regression pin here.
 
 **Acceptance criteria**
-- [ ] Exactly **one** `DEFAULT_SIGN_TIMEOUT` declaration in `crates/signer/src`, asserted by a test.
-- [ ] Exactly **one** non-slashable flow implementation; both entry points delegate.
-- [ ] A test asserts identical behaviour through both entry points across four outcome classes.
-- [ ] `lib.rs:3132-3135`'s "non-slashable must not write block/attestation rows" assertions stay
+- [x] Exactly **one** `DEFAULT_SIGN_TIMEOUT` declaration in `crates/signer/src`, asserted by a test.
+- [x] Exactly **one** non-slashable flow implementation; both entry points delegate.
+- [x] A test asserts identical behaviour through both entry points across four outcome classes.
+- [x] `lib.rs:3132-3135`'s "non-slashable must not write block/attestation rows" assertions stay
       green **verbatim**.
-- [ ] The no-lock invariant doc block survives on the folded helper (it is the guard rail that
+- [x] The no-lock invariant doc block survives on the folded helper (it is the guard rail that
       stops a future contributor adding DB writes to a lock-free path).
-- [ ] `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings` green (CI Gate 1,
+- [x] `cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings` green (CI Gate 1,
       `ci.yml:47`).
 
 ---

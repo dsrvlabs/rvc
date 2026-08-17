@@ -33,8 +33,7 @@
 //!
 //! 1. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
-//! 2. Call the BLS backend `sign(signing_root, pubkey)` wrapped in the gate's
-//!    `tokio::time::timeout` (same duration as slashable, for consistency).
+//! 2. Delegate to [`crate::sign_nonslashable_core`] (same duration as slashable).
 //!    No slashing-DB staging or committing occurs — these operations are not
 //!    slashable by the Ethereum consensus spec.
 //!
@@ -85,7 +84,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::{CompositeSigner, PublicKey, Signer, SigningError};
+use crypto::{CompositeSigner, PublicKey, Signer};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
 use observability::logging::TruncatedPubkey;
@@ -93,8 +92,8 @@ use slashing::{PubkeyScopedDb, SlashingDb};
 use tracing::{error, warn};
 
 use crate::core::{
-    sign_slashable, SignSlashableRequest, StandardSlashableHooks, TimeoutPolicy,
-    TimeoutPolicySource,
+    sign_nonslashable_core, sign_slashable, NonSlashableFailure, SignSlashableRequest,
+    StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
@@ -107,12 +106,6 @@ use crate::locks::ValidatorLockMap;
 /// call site that does not have an mTLS context (e.g. crate-internal callers and
 /// integration tests).
 pub const AUDIT_CN_DEFAULT: &str = "signing-gate";
-
-/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
-///
-/// Bounding the signer call is mandatory because the staging guard holds the
-/// SQLite single-writer connection mutex.  See module doc for BUG-003 analysis.
-const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Central signing gate with slashing protection and doppelganger detection.
 ///
@@ -395,50 +388,25 @@ impl SigningGate {
 
     // ── Non-slashable signing methods ─────────────────────────────────────────
     //
-    // All 7 non-slashable methods share the same 2-step flow:
-    //   1. `gate_decision(pubkey)` — fail-closed on false (unknown → denied).
-    //   2. `timeout(sign_timeout, signer.sign(...)).await` — no slashing DB,
-    //      no spawn_blocking (no !Send guard), no commit/discard.
+    // All 7 non-slashable methods: `gate_decision` (bool, fail-closed) then
+    // [`sign_nonslashable_core`]. No slashing DB, no spawn_blocking.
     //
     // Error mapping is uniform: timeout/generic → SigningFailed,
-    // KeyNotFound → KeyNotFound.
+    // KeyNotFound → KeyNotFound (explicit, not folded into Display).
 
-    /// Execute the non-slashable signing flow: gate check → BLS sign with timeout.
+    /// Facade wrapper: `gate_decision` then [`sign_nonslashable_core`].
     ///
-    /// Shared by all 7 non-slashable methods so the error-mapping logic lives
-    /// in one place.
-    ///
-    /// # No-lock invariant
-    ///
-    /// This helper deliberately does **NOT** acquire the per-pubkey
-    /// `ValidatorLockMap` lock and does **NOT** call any of
-    /// `PubkeyScopedDb`, `stage_block`, `stage_attestation`, or `commit`.
-    /// Non-slashable operations have no slashing-DB transaction to serialize,
-    /// so the lock is unnecessary overhead.
-    ///
-    /// **If a future variant of this helper needs to write to the slashing DB,
-    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
-    /// used by `sign_block` / `sign_attestation`.**
-    ///
-    /// # TOCTOU note
-    ///
-    /// There is a micro-window between `gate_decision` returning `true` and
-    /// `signer.sign().await` completing during which the doppelganger state
-    /// could theoretically change.  This window is intentionally accepted:
-    /// these operations are **not slashable**, so the worst case is a
-    /// signature produced for a pubkey that was concurrently disabled — a
-    /// tolerable transient condition.  No additional synchronization is needed
-    /// to shrink this window.
+    /// Maps the core's neutral [`NonSlashableFailure`] onto [`SigningGateError`].
+    /// The no-lock invariant lives on the core helper.
     async fn sign_nonslashable(
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
         op_name: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        // Step 1: doppelganger gate (same gate_decision point as slashable paths).
+        // Same gate_decision point as slashable paths (bool, fail-closed).
         if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -448,23 +416,34 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
-        let sign_result =
-            tokio::time::timeout(self.sign_timeout, self.signer.sign(&signing_root, &pubkey_bytes))
-                .await;
-
-        match sign_result {
-            Err(_elapsed) => {
+        match sign_nonslashable_core(
+            self.enablement.as_ref(),
+            self.signer.as_ref(),
+            pubkey,
+            signing_root,
+            self.sign_timeout,
+        )
+        .await
+        {
+            Ok(sig) => Ok(sig.to_bytes().to_vec()),
+            Err(NonSlashableFailure::Blocked) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    "SigningGate: non-slashable sign blocked by doppelganger gate"
+                );
+                Err(SigningGateError::BlockedByDoppelganger)
+            }
+            Err(NonSlashableFailure::TimedOut { after }) => {
                 error!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,
-                    timeout_secs = self.sign_timeout.as_secs_f64(),
+                    timeout_secs = after.as_secs_f64(),
                     "SigningGate: non-slashable signer timed out"
                 );
                 Err(SigningGateError::SigningFailed("signer timed out".to_string()))
             }
-            Ok(Ok(sig)) => Ok(sig.to_bytes().to_vec()),
-            Ok(Err(SigningError::KeyNotFound(_))) => {
+            Err(NonSlashableFailure::KeyNotFound) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,
@@ -472,7 +451,7 @@ impl SigningGate {
                 );
                 Err(SigningGateError::KeyNotFound)
             }
-            Ok(Err(e)) => {
+            Err(NonSlashableFailure::Backend(e)) => {
                 error!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,

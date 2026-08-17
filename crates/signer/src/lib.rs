@@ -24,8 +24,9 @@ pub use crypto::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 pub use core::{
-    sign_slashable, NoopSignHooks, SignHooks, SignSlashableRequest, SlashableSignSession,
-    StagedRow, StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource,
+    sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
+    SignSlashableRequest, SlashableSignSession, StagedRow, StandardSlashableHooks, TimeoutPolicy,
+    TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 pub use doppelganger::SigningEnablement;
 pub use error::{classify, GateErrClass, SigningGateError};
@@ -161,13 +162,6 @@ impl From<SigningError> for SignerError {
     }
 }
 
-/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
-///
-/// Bounds BLS sign calls (slashable and non-slashable) so a wedged remote
-/// backend cannot hang the VC duty loop indefinitely (F37). Matches
-/// [`crate::gate`]'s default.
-const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
-
 /// Audit CN recorded by [`PubkeyScopedDb`] on the VC slashable path.
 const AUDIT_CN_VC: &str = "local-vc";
 
@@ -206,9 +200,10 @@ pub enum BackendKind {
 /// per per-pubkey [`TimeoutPolicy`] (fail-closed retain for remote/unknown).
 /// Metrics use [`StandardSlashableHooks`] (same families as the gate).
 ///
-/// Non-slashable paths share the private `sign_nonslashable` helper: enablement →
-/// `tokio::time::timeout(sign_timeout, backend.sign(...))` with uniform error
-/// mapping. They take no per-validator lock and write no slashing-DB row.
+/// Non-slashable paths: `ensure_signing_enabled` then
+/// [`sign_nonslashable_core`] (timeout + uniform classification). They take
+/// no per-validator lock and write no slashing-DB row. VC-specific `debug!`
+/// timing stays in the wrapper.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     /// BLS backend used by slashable and non-slashable sign paths.
@@ -429,46 +424,24 @@ impl SignerService {
     //
     // Pattern (mirrors SigningGate):
     //   1. Root derivation in the public wrapper
-    //   2. `sign_nonslashable`: enablement → timeout(sign) → uniform mapping
-    // No per-validator lock, no slashing-DB staging.
+    //   2. `ensure_signing_enabled` (Result) then `sign_nonslashable_core`
+    // No per-validator lock, no slashing-DB staging. VC `debug!`/timing stay here.
 
-    /// Execute the non-slashable signing flow: enablement gate → BLS sign with timeout.
+    /// Facade wrapper: `ensure_signing_enabled` then [`sign_nonslashable_core`].
     ///
-    /// Shared by all non-slashable methods so enablement, timeout, and error
-    /// mapping live in one place.
-    ///
-    /// # No-lock invariant
-    ///
-    /// This helper deliberately does **NOT** acquire the per-pubkey
-    /// `ValidatorLockMap` lock and does **NOT** call any of
-    /// `stage_block`, `stage_attestation`, or `commit`.
-    /// Non-slashable operations have no slashing-DB transaction to serialize,
-    /// so the lock is unnecessary overhead.
-    ///
-    /// **If a future variant of this helper needs to write to the slashing DB,
-    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
-    /// used by `sign_block` / `sign_attestation`.**
-    ///
-    /// # TOCTOU note
-    ///
-    /// There is a micro-window between `ensure_signing_enabled` returning `Ok`
-    /// and `signer.sign().await` completing during which the doppelganger state
-    /// could theoretically change.  This window is intentionally accepted:
-    /// these operations are **not slashable**, so the worst case is a
-    /// signature produced for a pubkey that was concurrently disabled — a
-    /// tolerable transient condition.  No additional synchronization is needed
-    /// to shrink this window.
+    /// VC-specific `debug!` / elapsed timing stay here (operator output, not
+    /// core behaviour). `KeyNotFound` and other backend errors fold through
+    /// [`SignerError`]'s `From<SigningError>`.
     async fn sign_nonslashable(
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
         op_name: &str,
     ) -> Result<Signature, SignerError> {
-        // Step 1: doppelganger gate (same gate point as slashable early check).
+        // Same gate point as slashable early check (Result, not a bool).
         self.ensure_signing_enabled(pubkey)?;
 
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
 
         debug!(
@@ -477,24 +450,16 @@ impl SignerService {
             "Signing non-slashable duty"
         );
 
-        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
-        let sign_result = tokio::time::timeout(
+        match sign_nonslashable_core(
+            self.enablement.as_ref(),
+            self.sign_backend.as_ref(),
+            pubkey,
+            signing_root,
             self.sign_timeout,
-            self.sign_backend.sign(&signing_root, &pubkey_bytes),
         )
-        .await;
-
-        match sign_result {
-            Err(_elapsed) => {
-                error!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    op = op_name,
-                    timeout_secs = self.sign_timeout.as_secs_f64(),
-                    "SignerService: non-slashable signer timed out"
-                );
-                Err(SignerError::SigningFailed("signer timed out".to_string()))
-            }
-            Ok(Ok(sig)) => {
+        .await
+        {
+            Ok(sig) => {
                 debug!(
                     duration_ms = start.elapsed().as_millis() as u64,
                     signing_type = op_name,
@@ -502,7 +467,25 @@ impl SignerService {
                 );
                 Ok(sig)
             }
-            Ok(Err(e)) => {
+            Err(NonSlashableFailure::Blocked) => Err(SignerError::BlockedByDoppelganger),
+            Err(NonSlashableFailure::TimedOut { after }) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    timeout_secs = after.as_secs_f64(),
+                    "SignerService: non-slashable signer timed out"
+                );
+                Err(SignerError::SigningFailed("signer timed out".to_string()))
+            }
+            Err(NonSlashableFailure::KeyNotFound) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    signing_type = op_name,
+                    "Signing failed"
+                );
+                Err(SigningError::KeyNotFound(pubkey_hex).into())
+            }
+            Err(NonSlashableFailure::Backend(e)) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     error = %e,
@@ -3140,6 +3123,191 @@ mod tests {
             attestations.is_empty(),
             "non-slashable must not write attestation rows; found: {attestations:?}"
         );
+    }
+
+    /// ARCH-5c / ARCH-P1-6: both facades classify the same four non-slashable
+    /// outcomes the same way. Return types stay distinct (`SigningGateError` vs
+    /// `SignerError`); only the class must match.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NonSlashableClass {
+        Success,
+        TimedOut,
+        KeyNotFound,
+        Backend,
+    }
+
+    fn classify_gate_nonslashable(result: Result<Vec<u8>, SigningGateError>) -> NonSlashableClass {
+        match result {
+            Ok(_) => NonSlashableClass::Success,
+            Err(SigningGateError::SigningFailed(ref msg)) if msg.contains("timed out") => {
+                NonSlashableClass::TimedOut
+            }
+            Err(SigningGateError::KeyNotFound) => NonSlashableClass::KeyNotFound,
+            Err(SigningGateError::SigningFailed(_)) => NonSlashableClass::Backend,
+            other => panic!("unexpected gate non-slashable outcome: {other:?}"),
+        }
+    }
+
+    fn classify_service_nonslashable(result: Result<Signature, SignerError>) -> NonSlashableClass {
+        match result {
+            Ok(_) => NonSlashableClass::Success,
+            Err(SignerError::SigningFailed(ref msg)) if msg.contains("timed out") => {
+                NonSlashableClass::TimedOut
+            }
+            Err(SignerError::KeyNotFound(_)) => NonSlashableClass::KeyNotFound,
+            Err(SignerError::SigningFailed(_)) => NonSlashableClass::Backend,
+            other => panic!("unexpected service non-slashable outcome: {other:?}"),
+        }
+    }
+
+    struct RemoteFailSigner;
+
+    #[async_trait]
+    impl Signer for RemoteFailSigner {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; 48],
+        ) -> Result<Signature, crypto::SigningError> {
+            Err(crypto::SigningError::RemoteSignerError("connection reset mid-response".into()))
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            vec![]
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_nonslashable_path_behaves_identically_through_both_entry_points() {
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        let beacon_block_root = [0x11; 32];
+        let slot = 100;
+
+        // success
+        {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let mut km = KeyManager::new();
+            km.insert(secret_key);
+            let backend: Arc<dyn Signer> = Arc::new(LocalSigner::new(km));
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&backend),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(backend);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::Success);
+            assert_eq!(svc_class, gate_class, "success class must match through both entry points");
+        }
+
+        // timeout
+        {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let mut km = KeyManager::new();
+            km.insert(secret_key);
+            let slow: Arc<dyn Signer> = Arc::new(SlowSigner {
+                inner: LocalSigner::new(km),
+                sleep: Duration::from_millis(400),
+            });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&slow),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_millis(50),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_timeout(Duration::from_millis(50))
+                .with_sign_backend(slow);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::TimedOut);
+            assert_eq!(svc_class, gate_class, "timeout class must match through both entry points");
+        }
+
+        // KeyNotFound
+        {
+            let pubkey = SecretKey::generate().public_key();
+            let empty: Arc<dyn Signer> = Arc::new(LocalSigner::new(KeyManager::new()));
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&empty),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(empty);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::KeyNotFound);
+            assert_eq!(
+                svc_class, gate_class,
+                "KeyNotFound class must match through both entry points"
+            );
+        }
+
+        // generic backend error
+        {
+            let pubkey = SecretKey::generate().public_key();
+            let failing: Arc<dyn Signer> = Arc::new(RemoteFailSigner);
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&failing),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(failing);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::Backend);
+            assert_eq!(svc_class, gate_class, "backend class must match through both entry points");
+        }
     }
 
     /// All non-slashable methods share the helper's error mapping

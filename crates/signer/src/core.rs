@@ -1,8 +1,9 @@
-//! Shared slashable-signing core (`sign_slashable`) with explicit [`TimeoutPolicy`].
+//! Shared signing core: slashable (`sign_slashable`) and non-slashable
+//! (`sign_nonslashable_core`).
 //!
-//! Both `SigningGate` (remote-signer path) and, in RF4-06, `SignerService` (VC path)
-//! delegate the stage → sign → commit/discard triple here so timeout, per-validator
-//! lock, enablement re-check under lock, and metrics hooks stay in one place.
+//! Both `SigningGate` (remote-signer path) and `SignerService` (VC path)
+//! delegate here so timeout, enablement, and (on the slashable path) the
+//! stage → sign → commit/discard triple stay in one place.
 //!
 //! # Timeout policy (fail-closed for remote backends)
 //!
@@ -43,7 +44,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crypto::{PublicKey, Signer, SigningError};
+use crypto::{PublicKey, Signature, Signer, SigningError};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
 use metrics::definitions::{
@@ -57,6 +58,84 @@ use tracing::{error, warn};
 
 use crate::error::SigningGateError;
 use crate::locks::ValidatorLockMap;
+
+/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
+///
+/// Bounding the signer call is mandatory because slashable staging holds the
+/// SQLite single-writer connection mutex, and a wedged remote backend must not
+/// hang the VC duty loop indefinitely (F37). Shared by `SigningGate` and
+/// `SignerService` (ARCH-P1-6).
+pub const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
+
+// ── Non-slashable core ────────────────────────────────────────────────────────
+
+/// Neutral failure of [`sign_nonslashable_core`].
+///
+/// Wrappers map this onto [`SigningGateError`] or [`crate::SignerError`] so the
+/// two crate boundaries keep their own error types (ARCH-5c / ARCH-P1-6).
+#[derive(Debug)]
+pub enum NonSlashableFailure {
+    /// Client-side `tokio::time::timeout` elapsed before the backend returned.
+    TimedOut {
+        /// Configured timeout that elapsed.
+        after: Duration,
+    },
+    /// Backend reported [`SigningError::KeyNotFound`].
+    KeyNotFound,
+    /// Any other backend [`SigningError`].
+    Backend(SigningError),
+    /// [`SigningEnablement::is_signing_enabled`] returned `false`.
+    Blocked,
+}
+
+/// Shared non-slashable signing flow: enablement → BLS sign with timeout.
+///
+/// `SigningGate` and `SignerService` supply policy inputs (enablement impl,
+/// backend, timeout) and map [`NonSlashableFailure`] onto their own error type.
+///
+/// # No-lock invariant
+///
+/// This helper deliberately does **NOT** acquire the per-pubkey
+/// `ValidatorLockMap` lock and does **NOT** call any of
+/// `PubkeyScopedDb`, `stage_block`, `stage_attestation`, or `commit`.
+/// Non-slashable operations have no slashing-DB transaction to serialize,
+/// so the lock is unnecessary overhead.
+///
+/// **If a future variant of this helper needs to write to the slashing DB,
+/// it MUST add the per-pubkey lock and the staging/commit/discard pattern
+/// used by `sign_block` / `sign_attestation`.**
+///
+/// # TOCTOU note
+///
+/// There is a micro-window between `SigningEnablement::is_signing_enabled`
+/// returning `true` and `signer.sign().await` completing during which the
+/// doppelganger state could theoretically change.  This window is
+/// intentionally accepted: these operations are **not slashable**, so the
+/// worst case is a signature produced for a pubkey that was concurrently
+/// disabled — a tolerable transient condition.  No additional
+/// synchronization is needed to shrink this window.
+pub async fn sign_nonslashable_core(
+    enablement: &dyn SigningEnablement,
+    signer: &dyn Signer,
+    pubkey: &PublicKey,
+    signing_root: Root,
+    sign_timeout: Duration,
+) -> Result<Signature, NonSlashableFailure> {
+    if !enablement.is_signing_enabled(pubkey) {
+        return Err(NonSlashableFailure::Blocked);
+    }
+
+    let pubkey_bytes = pubkey.to_bytes();
+    let sign_result =
+        tokio::time::timeout(sign_timeout, signer.sign(&signing_root, &pubkey_bytes)).await;
+
+    match sign_result {
+        Err(_elapsed) => Err(NonSlashableFailure::TimedOut { after: sign_timeout }),
+        Ok(Ok(sig)) => Ok(sig),
+        Ok(Err(SigningError::KeyNotFound(_))) => Err(NonSlashableFailure::KeyNotFound),
+        Ok(Err(e)) => Err(NonSlashableFailure::Backend(e)),
+    }
+}
 
 // ── TimeoutPolicy ─────────────────────────────────────────────────────────────
 
