@@ -656,13 +656,13 @@ with a comment.
 4. `test_scanner_is_non_vacuous`: the walk finds at least the known number of call sites.
 
 **Acceptance criteria.**
-- [ ] `mock_fidelity.rs` exists, runs under the Phase-0 `arch-gates` CI job, and is green on
+- [x] `mock_fidelity.rs` exists, runs under the Phase-0 `arch-gates` CI job, and is green on
       `develop` after 3f.
-- [ ] Both clauses implemented; the error-for-everything case is covered (**VD-36**).
-- [ ] RED demonstrated locally against the pre-3f tree, output in the PR.
-- [ ] Each failure names file + line and the concrete remedy.
-- [ ] Non-vacuity assertion present; the `mock.rs` definition is excluded by exact path with a reason.
-- [ ] No existing gate file modified.
+- [x] Both clauses implemented; the error-for-everything case is covered (**VD-36**).
+- [x] RED demonstrated locally against the pre-3f tree, output in the PR.
+- [x] Each failure names file + line and the concrete remedy.
+- [x] Non-vacuity assertion present; the `mock.rs` definition is excluded by exact path with a reason.
+- [x] No existing gate file modified.
 
 ---
 

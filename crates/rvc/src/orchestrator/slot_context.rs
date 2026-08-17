@@ -628,7 +628,7 @@ mod tests {
             if block_id == (slot - 1).to_string() {
                 return Ok(DataResponse { data: BlockRootData { root: "not-a-root".to_string() } });
             }
-            Ok(DataResponse { data: BlockRootData { root: hex_for_slot(slot - 2) } })
+            Err(beacon::BeaconError::HttpError(format!("unexpected block_id {block_id}")))
         });
 
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
