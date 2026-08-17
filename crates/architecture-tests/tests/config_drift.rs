@@ -49,8 +49,8 @@
 //! ## Non-vacuity
 //!
 //! `assert_eq!(bindings.len(), 13)` and `assert_eq!(checked, 74)` so a rename of `StartArgs` or a
-//! group cannot turn the gate green forever. Field arithmetic: `74 − 8 − 1 = 65` (group fields
-//! minus BYPASS minus the sole 2:1 alias collapse) equals `CliOverrides` field count.
+//! group cannot turn the gate green forever. Field arithmetic: `74 − 4 − 1 = 69` (group fields
+//! minus BYPASS minus the sole 2:1 alias collapse) equals the operator knob count.
 //!
 //! ## Matcher limits (clause ii is a presence scan)
 //!
@@ -93,34 +93,14 @@ const MIGRATED_GROUP_SRCS: &[&str] = &[
 // Shrinking-only tables (reason string required per entry)
 // ---------------------------------------------------------------------------
 
-/// Group-struct fields that deliberately never reach `CliOverrides` / `Config`: they are read
-/// straight off `StartArgs` at `cli.rs` into `bn_manager::OperationTimeouts` or run/logging options.
+/// Group-struct fields that deliberately never reach `Config`: they are read
+/// straight off `StartArgs` at `cli.rs` into run/logging options.
 ///
-/// **Shrinking-only.** Entries may be **removed** (by giving the knob a `Config` field — ADR-008
-/// Phase 4 shrinks the four BN timeouts), never **added**. Adding one hides a real drift.
+/// **Shrinking-only.** ARCH-4j removed the four BN timeouts (8 → 4). Entries
+/// may be **removed**, never **added**. Adding one hides a real drift.
 ///
 /// Tuple: `(struct_name, field_name, reason)`.
 const BYPASS: &[(&str, &str, &str)] = &[
-    (
-        "BeaconArgs",
-        "aggregate_timeout",
-        "routed to bn_manager::OperationTimeouts.aggregate_fetch/submit (cli.rs), not CliOverrides",
-    ),
-    (
-        "BeaconArgs",
-        "attestation_timeout",
-        "routed to bn_manager::OperationTimeouts.attestation_fetch (cli.rs), not CliOverrides",
-    ),
-    (
-        "BeaconArgs",
-        "block_production_timeout",
-        "routed to bn_manager::OperationTimeouts.block_production (cli.rs), not CliOverrides",
-    ),
-    (
-        "BeaconArgs",
-        "duty_fetch_timeout",
-        "routed to bn_manager::OperationTimeouts.duty_fetch (cli.rs), not CliOverrides",
-    ),
     ("LoggingArgs", "enable_log_reload", "run/logging init only (cli.rs); no Config field"),
     ("LoggingArgs", "log_format", "telemetry::LogFormat::resolve only (cli.rs); no Config field"),
     ("SlashingArgs", "strict_permissions", "run options only (cli.rs); no Config field"),
@@ -132,7 +112,7 @@ const BYPASS: &[(&str, &str, &str)] = &[
 /// Two opposite shapes (F13):
 /// - 1:1 negated rename: `no_doppelganger_detection` → `doppelganger_detection`
 /// - 2:1 collapse: `no_keymanager` + `keymanager_enabled` → `keymanager_enabled` (the sole −1 in
-///   `74 − 8 − 1 = 65`)
+///   `74 − 4 − 1 = 69`)
 ///
 /// Tuple: `(struct_name, field_name, override_field, reason)`.
 const ALIASES: &[(&str, &str, &str, &str)] = &[
@@ -140,7 +120,7 @@ const ALIASES: &[(&str, &str, &str, &str)] = &[
         "KeymanagerArgs",
         "no_keymanager",
         "keymanager_enabled",
-        "2:1 collapse with keymanager_enabled (cli.rs From impl); sole −1 in 74−8−1=65",
+        "2:1 collapse with keymanager_enabled (cli.rs From impl); sole −1 in 74−4−1=69",
     ),
     (
         "SafetyArgs",
@@ -238,8 +218,8 @@ fn workspace_root() -> PathBuf {
 
 /// `cli.rs` plus ARCH-4f section files so seam-α can see moved group structs.
 fn group_args_source(root: &Path) -> String {
-    let mut src =
-        std::fs::read_to_string(root.join(START_RS)).expect("crates/rvc/src/config/start.rs must exist");
+    let mut src = std::fs::read_to_string(root.join(START_RS))
+        .expect("crates/rvc/src/config/start.rs must exist");
     for rel in MIGRATED_GROUP_SRCS {
         let extra = std::fs::read_to_string(root.join(rel))
             .unwrap_or_else(|e| panic!("{rel} must exist after ARCH-4f: {e}"));
@@ -1001,7 +981,7 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
     let aliases = aliases_set();
     assert_eq!(bypass.len(), BYPASS.len(), "duplicate BYPASS entries");
     assert_eq!(aliases.len(), ALIASES.len(), "duplicate ALIASES entries");
-    assert_eq!(BYPASS.len(), 8, "BYPASS must have exactly 8 entries");
+    assert_eq!(BYPASS.len(), 4, "BYPASS must have exactly 4 entries");
     assert_eq!(ALIASES.len(), 2, "ALIASES must have exactly 2 entries");
 
     // Table hygiene: every BYPASS/ALIASES source must exist on its group struct.
@@ -1020,9 +1000,9 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
         );
     }
 
-    // Second-leg: BYPASS fields must still be consumed outside From (timeouts / run options).
+    // Second-leg: BYPASS fields must still be consumed outside From (run options).
     // Scan the whole cli.rs (comment-stripped); From does not read these fields, so hits are
-    // the Commands::Start routing path (e.g. args.beacon.block_production_timeout).
+    // the Commands::Start routing path (e.g. args.logging.log_format).
     let cli_scan = scan_text(&cli);
     for (ty, field, _reason) in BYPASS {
         let binding = ty_to_binding
@@ -1031,7 +1011,7 @@ fn every_group_arg_field_is_read_by_the_from_impl() {
         assert!(
             has_field_access(&cli_scan, binding, field),
             "BYPASS {ty}::{field} has no second-leg read as `{binding}.{field}` outside/alongside \
-             From (timeouts/run options routing missing?)"
+             From (run options routing missing?)"
         );
     }
 
@@ -1081,7 +1061,7 @@ fn bypass_and_aliases_are_sorted_and_unique() {
 
 #[test]
 fn every_bypass_and_alias_entry_carries_a_reason() {
-    assert_eq!(BYPASS.len(), 8);
+    assert_eq!(BYPASS.len(), 4);
     assert_eq!(ALIASES.len(), 2);
     for &(ty, field, reason) in BYPASS {
         assert!(
@@ -1099,9 +1079,9 @@ fn every_bypass_and_alias_entry_carries_a_reason() {
 
 #[test]
 fn field_arithmetic_holds() {
-    // 74 group fields − 8 BYPASS − 1 (2:1 no_keymanager collapse) = 65 CliOverrides fields.
-    assert_eq!(74 - 8 - 1, 65);
-    assert_eq!(BYPASS.len(), 8);
+    // 74 group fields − 4 BYPASS − 1 (2:1 no_keymanager collapse) = 69 knobs (ARCH-4j).
+    assert_eq!(74 - 4 - 1, 69);
+    assert_eq!(BYPASS.len(), 4);
     // Exactly one ALIASES entry is the 2:1 collapse (the −1); the other is 1:1.
     let collapse = ALIASES
         .iter()
@@ -1114,7 +1094,7 @@ fn field_arithmetic_holds() {
     let override_fields = operator_knob_names(&knobs);
     assert_eq!(
         override_fields.len(),
-        65,
+        69,
         "OPERATOR_KNOB_NAMES count drifted; update arithmetic / seam α tables"
     );
 }
@@ -1500,7 +1480,7 @@ fn every_cli_override_field_is_validated_or_listed() {
     let override_fields = operator_knob_names(&knobs);
     assert_eq!(
         override_fields.len(),
-        65,
+        69,
         "OPERATOR_KNOB_NAMES count drifted; update UNVALIDATED / clause iii"
     );
 

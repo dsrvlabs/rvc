@@ -214,6 +214,17 @@ pub struct Config {
     /// the full body is allocated.  Default: 32 MiB.
     #[serde(default = "default_beacon_max_body_bytes")]
     pub beacon_max_body_bytes: usize,
+
+    // --- BN operation timeouts (ARCH-4j) ---
+    // Seconds; `None` folds to `OperationTimeouts::default()` (A-4.12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_production_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty_fetch_timeout: Option<u64>,
 }
 
 fn default_beacon_max_body_bytes() -> usize {
@@ -281,6 +292,10 @@ impl Default for Config {
             validator_registration_batch_delay: default_validator_registration_batch_delay(),
             validators_config: None,
             beacon_max_body_bytes: default_beacon_max_body_bytes(),
+            block_production_timeout: None,
+            attestation_timeout: None,
+            aggregate_timeout: None,
+            duty_fetch_timeout: None,
         }
     }
 }
@@ -341,6 +356,10 @@ struct ConfigWire {
     validator_registration_batch_delay: Option<u64>,
     validators_config: Option<PathBuf>,
     beacon_max_body_bytes: Option<usize>,
+    block_production_timeout: Option<u64>,
+    attestation_timeout: Option<u64>,
+    aggregate_timeout: Option<u64>,
+    duty_fetch_timeout: Option<u64>,
 
     // Nested tables (4f/4g + invented 4h sections). Flat keys above win.
     #[serde(default)]
@@ -608,6 +627,12 @@ impl From<ConfigWire> for Config {
                 .beacon_max_body_bytes
                 .or(w.beacon.inner.max_body_bytes)
                 .unwrap_or(def.beacon_max_body_bytes),
+            block_production_timeout: w
+                .block_production_timeout
+                .or(w.beacon.inner.block_production_timeout),
+            attestation_timeout: w.attestation_timeout.or(w.beacon.inner.attestation_timeout),
+            aggregate_timeout: w.aggregate_timeout.or(w.beacon.inner.aggregate_timeout),
+            duty_fetch_timeout: w.duty_fetch_timeout.or(w.beacon.inner.duty_fetch_timeout),
         }
     }
 }
@@ -793,6 +818,27 @@ impl Config {
             ));
         }
 
+        if self.block_production_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--block-production-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.attestation_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--attestation-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.aggregate_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--aggregate-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.duty_fetch_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--duty-fetch-timeout must be greater than 0".to_string(),
+            ));
+        }
+
         // Validate proposer node URLs
         for node_url in &self.proposer_nodes {
             if node_url.is_empty() {
@@ -902,6 +948,28 @@ impl Config {
         }
     }
 
+    /// Fold the four `[beacon]` timeout knobs into [`bn_manager::OperationTimeouts`].
+    ///
+    /// Unset knobs keep [`bn_manager::OperationTimeouts::default`] (A-4.12).
+    /// `aggregate_timeout` sets both `aggregate_fetch` and `aggregate_submit`.
+    pub fn operation_timeouts(&self) -> bn_manager::OperationTimeouts {
+        let mut timeouts = bn_manager::OperationTimeouts::default();
+        if let Some(secs) = self.block_production_timeout {
+            timeouts.block_production = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.attestation_timeout {
+            timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.aggregate_timeout {
+            timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
+            timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.duty_fetch_timeout {
+            timeouts.duty_fetch = std::time::Duration::from_secs(secs);
+        }
+        timeouts
+    }
+
     /// Load with explicit precedence: defaults < file < CLI.
     ///
     /// `*Config` stays the live home for defaults (`Config::default` /
@@ -948,6 +1016,18 @@ impl Config {
         }
         if let Some(v) = beacon.max_body_bytes {
             self.beacon_max_body_bytes = v;
+        }
+        if let Some(v) = beacon.block_production_timeout {
+            self.block_production_timeout = Some(v);
+        }
+        if let Some(v) = beacon.attestation_timeout {
+            self.attestation_timeout = Some(v);
+        }
+        if let Some(v) = beacon.aggregate_timeout {
+            self.aggregate_timeout = Some(v);
+        }
+        if let Some(v) = beacon.duty_fetch_timeout {
+            self.duty_fetch_timeout = Some(v);
         }
 
         if let Some(v) = &keys.keystore_path {

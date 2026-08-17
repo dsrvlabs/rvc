@@ -1,8 +1,8 @@
 //! ARCH-4d: freeze the current TOML wire surface before any section collapse.
 //!
 //! Parsed [`Config`] snapshots in `tests/fixtures/config/snapshots/` are the
-//! binding contract for later Stream-A issues (ARCH-4f…4i). This harness is the
-//! prerequisite those issues re-run unchanged.
+//! binding contract for later Stream-A issues. ARCH-4j extends the corpus with
+//! the four BN timeout knobs (65 → 69); earlier snapshots stay byte-identical.
 //!
 //! KAT-first: no test name here ends in `_root` / `tree_hash` / `signing_root`
 //! (the knob `genesis_validators_root` is in the corpus).
@@ -127,14 +127,15 @@ const REQUIRED_CORPUS: &[&str] = &[
     "logfile_flat_string.toml",
     "logfile_table.toml",
     "top_level_28.toml",
+    "beacon_timeouts.toml",
 ];
 
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 65, "operator knob count must stay at 65 until ARCH-4j");
+    assert_eq!(names.len(), 69, "operator knob count is 69 after ARCH-4j");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 65, "operator knob names must be unique");
+    assert_eq!(unique.len(), 69, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);
@@ -321,6 +322,22 @@ fn top_level_bare_knobs_still_parse() {
     assert_eq!(config.validators_config.as_deref(), Some(Path::new("/tmp/top/validators.toml")));
     assert_eq!(config.beacon_max_body_bytes, 1_048_576);
     assert_config_snapshot("top_level_28", &config);
+}
+
+#[test]
+fn promoted_beacon_timeouts_appear_in_corpus_snapshot() {
+    let config = load_fixture("beacon_timeouts.toml");
+    assert_eq!(config.block_production_timeout, Some(11));
+    assert_eq!(config.attestation_timeout, Some(12));
+    assert_eq!(config.aggregate_timeout, Some(13));
+    assert_eq!(config.duty_fetch_timeout, Some(14));
+    let timeouts = config.operation_timeouts();
+    assert_eq!(timeouts.block_production, std::time::Duration::from_secs(11));
+    assert_eq!(timeouts.attestation_fetch, std::time::Duration::from_secs(12));
+    assert_eq!(timeouts.aggregate_fetch, std::time::Duration::from_secs(13));
+    assert_eq!(timeouts.aggregate_submit, std::time::Duration::from_secs(13));
+    assert_eq!(timeouts.duty_fetch, std::time::Duration::from_secs(14));
+    assert_config_snapshot("beacon_timeouts", &config);
 }
 
 #[test]

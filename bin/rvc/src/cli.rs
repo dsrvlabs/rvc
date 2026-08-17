@@ -184,33 +184,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 );
             }
 
-            let mut timeouts = bn_manager::OperationTimeouts::default();
-            if let Some(secs) = args.beacon.block_production_timeout {
-                if secs == 0 {
-                    anyhow::bail!("--block-production-timeout must be greater than 0");
-                }
-                timeouts.block_production = std::time::Duration::from_secs(secs);
-            }
-            if let Some(secs) = args.beacon.attestation_timeout {
-                if secs == 0 {
-                    anyhow::bail!("--attestation-timeout must be greater than 0");
-                }
-                timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
-            }
-            if let Some(secs) = args.beacon.aggregate_timeout {
-                if secs == 0 {
-                    anyhow::bail!("--aggregate-timeout must be greater than 0");
-                }
-                timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
-                timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
-            }
-            if let Some(secs) = args.beacon.duty_fetch_timeout {
-                if secs == 0 {
-                    anyhow::bail!("--duty-fetch-timeout must be greater than 0");
-                }
-                timeouts.duty_fetch = std::time::Duration::from_secs(secs);
-            }
-
             if let Some(n) = args.keys.key_decrypt_threads {
                 if n == 0 {
                     anyhow::bail!("--key-decrypt-threads must be greater than 0");
@@ -252,6 +225,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 error!("Configuration validation failed: {}", e);
                 return Err(e.into());
             }
+            let timeouts = cfg.operation_timeouts();
 
             if cfg.keymanager.allow_insecure_remote_signer {
                 warn!("INSECURE MODE: HTTP remote signer URLs are allowed. Use only for development/testing.");

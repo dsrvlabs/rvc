@@ -69,7 +69,8 @@ mod tests {
     ];
 
     /// Pre-move longs for the ARCH-4h clap groups (22 knobs + 4 BN timeouts +
-    /// 2 slashing BYPASS flags). Timeouts / strict_* stay CLI-only.
+    /// 2 slashing BYPASS flags). Timeouts are Config knobs as of ARCH-4j;
+    /// `strict_*` stay CLI-only.
     const PRE_MOVE_LONG_FLAGS_4H: &[&str] = &[
         "--aggregate-timeout",
         "--allow-unsupported-fork",

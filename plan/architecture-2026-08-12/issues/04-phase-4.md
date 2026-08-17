@@ -936,15 +936,15 @@ zero; the other four are `log_format`, `enable_log_reload`, `strict_permissions`
 
 **Acceptance criteria.**
 
-- [ ] Four knobs settable from TOML **and** CLI, CLI winning; knob count **69**.
-- [ ] Defaults derived from `OperationTimeouts::default()`; no new literal constants.
-- [ ] `secs == 0` rejected from both sources with the existing message text.
-- [ ] `--aggregate-timeout`'s dual assignment preserved.
-- [ ] `ARCH-4d` corpus extended with the four new knobs; snapshots updated **in this PR only**, with
+- [x] Four knobs settable from TOML **and** CLI, CLI winning; knob count **69**.
+- [x] Defaults derived from `OperationTimeouts::default()`; no new literal constants.
+- [x] `secs == 0` rejected from both sources with the existing message text.
+- [x] `--aggregate-timeout`'s dual assignment preserved.
+- [x] `ARCH-4d` corpus extended with the four new knobs; snapshots updated **in this PR only**, with
       the four additions visible in the diff and nothing else changed.
 - [ ] **`ARCH-4l`'s draft example TOMLs are landed as corpus fixtures here** (Stream A owns
       `crates/rvc/tests/fixtures/config/`), so the release note's examples are proven to parse before
-      the note ships and cannot rot afterwards.
+      the note ships and cannot rot afterwards. *(No 4l drafts existed; 4l will land examples.)*
 
 ---
 

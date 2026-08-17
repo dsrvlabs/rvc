@@ -4,8 +4,9 @@
 //! (VD-4.2). Nested tables accept section-relative names only (4f SEC). Flat
 //! `beacon_url` / `beacon_nodes` / `beacon_max_body_bytes` stay on `ConfigWire`.
 //!
-//! Four BN timeout flags stay on this clap group (G-2 `BYPASS`); they are not
-//! Config knobs until ARCH-4j. `bn_sync_tolerances` is TOML-only (no clap flag).
+//! ARCH-4j: the four BN timeout knobs live here as `Option<u64>` seconds.
+//! Defaults come from `bn_manager::OperationTimeouts::default()` at fold time
+//! (A-4.12), not from literals in this crate. `bn_sync_tolerances` is TOML-only.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,24 +38,33 @@ pub struct BeaconArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_body_bytes: Option<usize>,
 
-    /// Block production timeout in seconds (default: 3)
+    /// Block production timeout in seconds.
+    ///
+    /// Default when unset: `OperationTimeouts::default().block_production`.
     #[arg(long = "block-production-timeout")]
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub block_production_timeout: Option<u64>,
 
-    /// Attestation fetch timeout in seconds (default: 4)
+    /// Attestation fetch timeout in seconds.
+    ///
+    /// Default when unset: `OperationTimeouts::default().attestation_fetch`.
     #[arg(long = "attestation-timeout")]
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attestation_timeout: Option<u64>,
 
-    /// Aggregate fetch timeout in seconds (default: 2)
+    /// Aggregate fetch and submit timeout in seconds.
+    ///
+    /// Sets both `aggregate_fetch` and `aggregate_submit`. Default when unset:
+    /// `OperationTimeouts::default()` for those two fields.
     #[arg(long = "aggregate-timeout")]
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate_timeout: Option<u64>,
 
-    /// Duty fetch timeout in seconds (default: 10)
+    /// Duty fetch timeout in seconds.
+    ///
+    /// Default when unset: `OperationTimeouts::default().duty_fetch`.
     #[arg(long = "duty-fetch-timeout")]
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub duty_fetch_timeout: Option<u64>,
 }
 
@@ -68,6 +78,10 @@ impl BeaconArgs {
             nodes: self.nodes.clone().unwrap_or_default(),
             max_body_bytes: self.max_body_bytes,
             bn_sync_tolerances: None,
+            block_production_timeout: self.block_production_timeout,
+            attestation_timeout: self.attestation_timeout,
+            aggregate_timeout: self.aggregate_timeout,
+            duty_fetch_timeout: self.duty_fetch_timeout,
         }
     }
 }
@@ -88,4 +102,12 @@ pub struct BeaconConfig {
     /// TOML-only sync-tolerance string (no CLI flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bn_sync_tolerances: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_production_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duty_fetch_timeout: Option<u64>,
 }
