@@ -13,7 +13,7 @@ use eth_types::{Epoch, Root, Slot};
 
 use crate::audit::audit_log;
 use crate::error::SlashingError;
-use crate::stage::{StagedAttestation, StagedBlock};
+use crate::stage::{CommittedReservation, ReconcileOutcome, StagedAttestation, StagedBlock};
 use crate::SlashingDb;
 
 /// Captured audit outcome whose emission is deferred until the staged guard is gone.
@@ -160,6 +160,98 @@ impl PubkeyScopedDb {
                 Err(e)
             }
         }
+    }
+
+    /// Rule check + INSERT + COMMIT, then emit the slashing audit record.
+    ///
+    /// Delegates to [`SlashingDb::reserve_block`]. The connection mutex is
+    /// released before this method returns, so audit emission is **outside**
+    /// the lock by construction (C2 / ADR-006).
+    ///
+    /// # Audit ordering (ADR-006)
+    ///
+    /// `"staged"` is emitted after the reserve transaction commits. It
+    /// correlates with **"a row exists"** — not with "a row will exist if the
+    /// sign succeeds" (that was the `stage_*` / [`PendingAudit`] meaning).
+    /// `"rejected"` is emitted on `Err` (rule violation, GVR mismatch, or
+    /// reserve-time commit failure). No [`PendingAudit`] is returned: there
+    /// is no guard for the caller to release.
+    ///
+    /// `fail_next_commits` is consumed by the inner `reserve_*` immediately
+    /// before INSERT: the inject fails **this** call, not a later commit or
+    /// reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Same surface as [`SlashingDb::reserve_block`].
+    pub fn reserve_block(
+        &self,
+        pubkey_hex: &str,
+        slot: Slot,
+        signing_root_hex: Option<String>,
+    ) -> Result<CommittedReservation, SlashingError> {
+        match self.db.reserve_block(pubkey_hex, slot, signing_root_hex, &self.gvr) {
+            Ok(reservation) => {
+                audit_log(&self.client_cn, pubkey_hex, "staged");
+                Ok(reservation)
+            }
+            Err(e) => {
+                audit_log(&self.client_cn, pubkey_hex, "rejected");
+                Err(e)
+            }
+        }
+    }
+
+    /// Attestation counterpart of [`Self::reserve_block`].
+    ///
+    /// Same audit contract: `"staged"` means a row exists; `"rejected"` is
+    /// emitted on `Err`. Emission is after the inner reserve returns, so it
+    /// is outside the connection mutex (C2 / ADR-006).
+    ///
+    /// # Errors
+    ///
+    /// Same surface as [`SlashingDb::reserve_attestation`].
+    pub fn reserve_attestation(
+        &self,
+        pubkey_hex: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root_hex: Option<String>,
+    ) -> Result<CommittedReservation, SlashingError> {
+        match self.db.reserve_attestation(
+            pubkey_hex,
+            source_epoch,
+            target_epoch,
+            signing_root_hex,
+            &self.gvr,
+        ) {
+            Ok(reservation) => {
+                audit_log(&self.client_cn, pubkey_hex, "staged");
+                Ok(reservation)
+            }
+            Err(e) => {
+                audit_log(&self.client_cn, pubkey_hex, "rejected");
+                Err(e)
+            }
+        }
+    }
+
+    /// Compensating delete of a reserved row, then emit an audit record.
+    ///
+    /// Delegates to [`SlashingDb::reconcile_unsigned`]. That method releases
+    /// the mutex before returning, so emission is outside the lock (C2 / G-7).
+    ///
+    /// `outcome` is `"reconciled"` on [`ReconcileOutcome::Deleted`] /
+    /// [`ReconcileOutcome::NotApplicable`], and `"reconcile_failed"` on
+    /// [`ReconcileOutcome::Failed`].
+    pub fn reconcile_unsigned(&self, reservation: &CommittedReservation) -> ReconcileOutcome {
+        let outcome = self.db.reconcile_unsigned(reservation);
+        let audit_outcome = match &outcome {
+            ReconcileOutcome::Failed(_) => "reconcile_failed",
+            ReconcileOutcome::Deleted | ReconcileOutcome::NotApplicable => "reconciled",
+        };
+        audit_log(&self.client_cn, &reservation.pubkey_hex, audit_outcome);
+        outcome
     }
 }
 

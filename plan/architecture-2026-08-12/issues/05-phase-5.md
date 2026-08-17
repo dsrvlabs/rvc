@@ -828,14 +828,14 @@ snapshot point and the consumption point become the same call. Downstream consum
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] `PubkeyScopedDb::{reserve_block, reserve_attestation, reconcile_unsigned}` exist and delegate.
-- [ ] **G-7 green** over the new wrappers; a DB-reading subscriber completes a full reserve → sign
+- [x] `PubkeyScopedDb::{reserve_block, reserve_attestation, reconcile_unsigned}` exist and delegate.
+- [x] **G-7 green** over the new wrappers; a DB-reading subscriber completes a full reserve → sign
       cycle within the test timeout.
-- [ ] The `scoped.rs:70-74` ordering note is **replaced** for the reserve path with an accurate
+- [x] The `scoped.rs:70-74` ordering note is **replaced** for the reserve path with an accurate
       one, not amended.
-- [ ] `fail_next_commits` fails the reserve; `commit_failed_path.rs` and `lib.rs:1562`/`:1619`
+- [x] `fail_next_commits` fails the reserve; `commit_failed_path.rs` and `lib.rs:1562`/`:1619`
       still express a real path (they may be re-pointed in `ARCH-5l`, not here).
-- [ ] Existing `scoped.rs` tests (`:249`, `:272`) pass **unchanged**.
+- [x] Existing `scoped.rs` tests (`:249`, `:272`) pass **unchanged**.
 
 ---
 

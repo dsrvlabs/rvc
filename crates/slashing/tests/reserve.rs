@@ -1,8 +1,9 @@
-//! ARCH-5e / ARCH-5f: `reserve_*` + `reconcile_unsigned`.
+//! ARCH-5e / ARCH-5f / ARCH-5g: `reserve_*` + `reconcile_unsigned` + scoped wrappers.
 //!
 //! Additive sibling of `stage_*`. `reconcile_unsigned` is the compensating
 //! delete that makes reserve-before-sign admissible (M-1). C1: a failed
-//! delete retains. No production caller switch (ARCH-5l).
+//! delete retains. `PubkeyScopedDb::reserve_*` emits audit after the mutex
+//! is gone (C2 / ADR-006). No production caller switch (ARCH-5l).
 //!
 //! M-1 (`crates/signer/tests/phantom_row_m1.rs:1-10`):
 //! Before the fix, `SignerService::sign_attestation` and `sign_block` called
@@ -21,9 +22,12 @@ use std::time::{Duration, Instant};
 use metrics::definitions::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
 use rvc_slashing::{
     BlockSlashingViolation, CommittedReservation, InterchangeAttestation, InterchangeBlock,
-    InterchangeFormat, InterchangeMetadata, ReconcileOutcome, ReservationKind, SlashingDb,
-    SlashingError, ValidatorRecord,
+    InterchangeFormat, InterchangeMetadata, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
+    SlashingDb, SlashingError, ValidatorRecord,
 };
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
 
 const PUBKEY: &str = "0xdeadbeef01";
 const PUBKEY2: &str = "0xdeadbeef02";
@@ -451,4 +455,210 @@ fn test_reconcile_failure_reports_failed_and_retains_the_row() {
         !logs_contain(FULL_PUBKEY),
         "raw 48-byte pubkey must not appear in the reconcile error log"
     );
+}
+
+// ── ARCH-5g: PubkeyScopedDb::reserve_* + reconcile_unsigned ───────────────────
+
+const R1_HEX: &str = "0x0101010101010101010101010101010101010101010101010101010101010101";
+const SCOPED_CN: &str = "peer-dvt-5g";
+
+/// Subscriber that acquires the slashing DB mutex on every tracing event.
+///
+/// Reproduces C2: if `"staged"` / `"reconciled"` fire while `reserve_*` still
+/// holds `conn`, `get_blocks` deadlocks. Timeout is thread-based
+/// (`recv_timeout`), never `tokio::time::timeout`: a `parking_lot` lock is
+/// not an await point, so an async timeout cannot cancel it and would hang
+/// nextest instead of failing.
+struct DbReadingLayer {
+    db: Arc<SlashingDb>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for DbReadingLayer {
+    fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let _ = self.db.get_blocks("0xdead");
+    }
+}
+
+/// RED for 5g: a DB-reading subscriber must complete a scoped reserve →
+/// (simulated sign) → reconcile cycle. Failure mode is deadlock, not an
+/// assertion. Timeout, not a bare join.
+#[test]
+fn test_scoped_reserve_emits_audit_outside_the_connection_mutex() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let db_worker = Arc::clone(&db);
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let subscriber =
+            tracing_subscriber::registry().with(DbReadingLayer { db: Arc::clone(&db_worker) });
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let scoped = PubkeyScopedDb::new(db_worker, SCOPED_CN.to_string(), *GVR);
+        let result = (|| {
+            let reservation = scoped.reserve_block(PUBKEY, 1, Some("0xscoped".into()))?;
+            // Simulated sign while the reservation token is still held.
+            // The mutex must already be free — the subscriber re-entered on
+            // the `"staged"` event above.
+            assert!(reservation.inserted, "fresh reserve must insert");
+            let outcome = scoped.reconcile_unsigned(&reservation);
+            Ok::<_, SlashingError>(outcome)
+        })();
+        let _ = tx.send(result);
+    });
+
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect(
+            "scoped reserve→reconcile must complete; deadlock means audit still holds the mutex \
+             (C2 / ADR-006)",
+        )
+        .expect("reserve must succeed");
+    assert!(
+        matches!(outcome, ReconcileOutcome::Deleted),
+        "reconcile after a successful reserve must delete, got: {outcome:?}"
+    );
+    assert!(db.get_blocks(PUBKEY).expect("get").is_empty());
+}
+
+/// Inject must fail `reserve_*` itself (INSERT+COMMIT is inside the call).
+/// A leftover snapshot consumed by a later commit/reconcile would be a 5g miss.
+#[test]
+fn test_fail_next_commits_fails_the_reserve_not_a_later_call() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), SCOPED_CN.to_string(), *GVR);
+
+    db.fail_next_commits(1);
+    let err = scoped
+        .reserve_block(PUBKEY, 9, Some("0xinject".into()))
+        .expect_err("inject must fail the reserve");
+    assert!(err.is_reserve_commit_failure(), "got: {err:?}");
+    match &err {
+        SlashingError::ReserveCommitFailed(msg) => {
+            assert!(msg.contains("injected commit failure"), "got: {msg}");
+        }
+        other => panic!("expected ReserveCommitFailed, got: {other:?}"),
+    }
+    assert!(db.get_blocks(PUBKEY).expect("get").is_empty(), "failed reserve must leave no row");
+
+    // Inject exhausted by reserve — a later call must succeed without re-arming.
+    let reservation = scoped
+        .reserve_block(PUBKEY, 9, Some("0xinject".into()))
+        .expect("second reserve after inject exhausted must succeed");
+    assert!(reservation.inserted);
+    assert_eq!(db.get_blocks(PUBKEY).expect("get").len(), 1);
+
+    let att_err = {
+        db.fail_next_commits(1);
+        scoped
+            .reserve_attestation(PUBKEY, 1, 4, Some("0xatt_inj".into()))
+            .expect_err("inject must fail reserve_attestation")
+    };
+    assert!(att_err.is_reserve_commit_failure(), "got: {att_err:?}");
+    assert!(db.get_attestations(PUBKEY).expect("get").is_empty());
+}
+
+/// Captures `(client_cn, outcome)` from `slashing.audit` events.
+struct AuditCapture {
+    events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+struct AuditVisitor {
+    client_cn: Option<String>,
+    outcome: Option<String>,
+}
+
+impl Visit for AuditVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "client_cn" => self.client_cn = Some(value.to_string()),
+            "outcome" => self.outcome = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "client_cn" if self.client_cn.is_none() => {
+                self.client_cn = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+            "outcome" if self.outcome.is_none() => {
+                self.outcome = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for AuditCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "slashing.audit" {
+            return;
+        }
+        let mut visitor = AuditVisitor { client_cn: None, outcome: None };
+        event.record(&mut visitor);
+        if let (Some(cn), Some(outcome)) = (visitor.client_cn, visitor.outcome) {
+            self.events.lock().expect("capture").push((cn, outcome));
+        }
+    }
+}
+
+#[test]
+fn test_scoped_reserve_pins_client_cn_and_gvr() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("scoped_reserve.db");
+    let db = Arc::new(SlashingDb::open(&path).expect("open file db"));
+    db.set_genesis_validators_root(R1).expect("pin R1");
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber =
+        tracing_subscriber::registry().with(AuditCapture { events: Arc::clone(&events) });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let scoped = PubkeyScopedDb::new(Arc::clone(&db), SCOPED_CN.to_string(), *R1);
+    let reservation =
+        scoped.reserve_block(PUBKEY, 11, Some("0xcn".into())).expect("matching GVR must reserve");
+    assert!(reservation.inserted);
+
+    let wrong = PubkeyScopedDb::new(Arc::clone(&db), SCOPED_CN.to_string(), *R2);
+    let err = wrong
+        .reserve_block(PUBKEY2, 12, Some("0xwrong_gvr".into()))
+        .expect_err("wrong GVR must be rejected");
+    match err {
+        SlashingError::GenesisRootMismatch { expected, got } => {
+            assert_eq!(expected, *R1);
+            assert_eq!(got, *R2);
+        }
+        other => panic!("expected GenesisRootMismatch, got: {other:?}"),
+    }
+
+    let captured = events.lock().expect("capture");
+    assert!(
+        captured.iter().any(|(cn, outcome)| cn == SCOPED_CN && outcome == "staged"),
+        "successful reserve must audit with the scoped CN, got: {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|(cn, outcome)| cn == SCOPED_CN && outcome == "rejected"),
+        "GVR mismatch must audit rejected with the scoped CN, got: {captured:?}"
+    );
+    drop(captured);
+
+    drop(scoped);
+    drop(wrong);
+    drop(db);
+
+    let conn = rusqlite::Connection::open(&path).expect("direct open");
+    let (cn, gvr_hex): (String, String) = conn
+        .query_row(
+            "SELECT client_cn, genesis_validators_root FROM blocks WHERE pubkey = ?1 AND slot = 11",
+            [PUBKEY],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("reserved row must exist");
+    assert_eq!(cn, "local-vc", "history row CN is AUDIT_ORIGIN; per-CN audit is the event");
+    assert_eq!(gvr_hex, R1_HEX, "row must carry the scoped GVR");
+
+    let leftover: i64 = conn
+        .query_row("SELECT COUNT(*) FROM blocks WHERE pubkey = ?1", [PUBKEY2], |row| row.get(0))
+        .expect("count");
+    assert_eq!(leftover, 0, "GVR-rejected reserve must write no row");
 }
