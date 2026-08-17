@@ -73,6 +73,52 @@ fn test_single_production_stage_then_sign_call_site() {
         core_prod.contains("fail_closed_max"),
         "SEC-1: TimeoutPolicySource::fail_closed_max must stay on the slashable path"
     );
+
+    // ARCH-5i: `rg 'reserve_then_sign' crates/signer/src` — declaration only,
+    // no production `.reserve_then_sign(` in any src file (not just core.rs).
+    let mut saw_decl = false;
+    let mut reserve_calls = Vec::new();
+    let mut staged_row_impls = Vec::new();
+    for path in rust_files(&src) {
+        let text = std::fs::read_to_string(&path).expect("read signer src");
+        let prod = production_text(&text);
+        let rel = path.strip_prefix(&src).unwrap_or(&path);
+        if prod.contains("fn reserve_then_sign") {
+            saw_decl = true;
+        }
+        for (idx, line) in prod.lines().enumerate() {
+            if line.contains(".reserve_then_sign(") {
+                reserve_calls.push(format!("{}:{}: {}", rel.display(), idx + 1, line.trim()));
+            }
+            if line.contains("impl StagedRow for CommittedReservation") {
+                staged_row_impls.push(format!("{}:{}", rel.display(), idx + 1));
+            }
+        }
+    }
+    assert!(saw_decl, "ARCH-5i: fn reserve_then_sign must exist in crates/signer/src");
+    assert!(
+        reserve_calls.is_empty(),
+        "ARCH-5i: no production caller of reserve_then_sign yet; found:\n{}",
+        reserve_calls.join("\n")
+    );
+    assert!(
+        staged_row_impls.is_empty(),
+        "VD-5.4: reserve_then_sign must not be a StagedRow impl; found:\n{}",
+        staged_row_impls.join("\n")
+    );
+}
+
+fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read signer src dir") {
+        let path = entry.expect("dirent").path();
+        if path.is_dir() {
+            out.extend(rust_files(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn make_fork_schedule() -> ForkSchedule {

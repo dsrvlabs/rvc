@@ -983,17 +983,17 @@ sibling method with its own control flow, not a new `StagedRow` impl.
 - **KAT note (A-5.10):** none named `*_root`.
 
 **Acceptance criteria**
-- [ ] `reserve_then_sign` exists and is exercised **only** by tests; `rg 'reserve_then_sign'
+- [x] `reserve_then_sign` exists and is exercised **only** by tests; `rg 'reserve_then_sign'
       crates/signer/src` shows the declaration and no production caller.
-- [ ] It is **not** implemented as a `StagedRow` impl (VD-5.4); the compensation outcome is
+- [x] It is **not** implemented as a `StagedRow` impl (VD-5.4); the compensation outcome is
       observable.
-- [ ] `is_unambiguous_no_signature` is called on `crypto::SigningError` (VD-5.3), and the code
+- [x] `is_unambiguous_no_signature` is called on `crypto::SigningError` (VD-5.3), and the code
       comment says so.
-- [ ] SEC-1's double resolution is preserved around the **reserve** point, with the
+- [x] SEC-1's double resolution is preserved around the **reserve** point, with the
       already-committed-row argument written in a comment.
-- [ ] `stage_then_sign` and all four `finish_*` helpers are unchanged;
+- [x] `stage_then_sign` and all four `finish_*` helpers are unchanged;
       `phantom_row_m1.rs`/`commit_failed_path.rs`/`tx_hold_metric.rs` green with zero edits.
-- [ ] `spawn_blocking` still wraps the sequence (X9).
+- [x] `spawn_blocking` still wraps the sequence (X9).
 
 ---
 

@@ -46,13 +46,15 @@ pub enum SigningGateError {
     #[error("signing blocked by slashing protection")]
     SlashingBlocked(#[source] SlashingError),
 
-    /// The slashing-protection database accepted the sign request (stage
-    /// succeeded, signing succeeded) but the *commit* step failed with an I/O
-    /// error.
+    /// Slashing-protection persist failed; no new history row was written.
+    ///
+    /// Production `stage_then_sign` emits this when `commit()` fails after a
+    /// successful BLS sign. The additive `reserve_then_sign` path also maps
+    /// reserve-time `ReserveCommitFailed` here (no sign is attempted).
     ///
     /// See module-level **CommitFailed** retry contract: same-root retry is safe;
-    /// `signing_root` is the only root a caller may retry with.  The BLS
-    /// signature bytes are lost; the caller must obtain a new signature.
+    /// `signing_root` is the only root a caller may retry with.  Any BLS
+    /// signature bytes from a post-sign commit failure are lost.
     ///
     /// Display intentionally omits raw SQLite internals.  The underlying error
     /// is available via `source()`.
@@ -71,14 +73,18 @@ pub enum SigningGateError {
     /// Whether a staged slashing-DB row was discarded depends on **how** this
     /// variant was produced by [`crate::sign_slashable`]:
     ///
-    /// | Cause | Typical row fate |
-    /// |---|---|
-    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | Discarded (ROLLBACK) |
-    /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded |
-    /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (fail-closed history; slot/epoch consumed) |
-    /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded |
-    /// | Ambiguous backend error + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (remote may have signed) |
-    /// | Panic of the blocking task after stage | Unspecified — treat history as possibly written |
+    /// | Cause | `stage_then_sign` (today) | `reserve_then_sign` (ADR-005) |
+    /// |---|---|---|
+    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | Discarded (ROLLBACK) | `reconcile_unsigned` (failed delete **retains**) |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded | `reconcile_unsigned` |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (fail-closed history; slot/epoch consumed) | row already committed (no action) |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded | `reconcile_unsigned` |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (remote may have signed) | row already committed (no action) |
+    /// | Panic of the blocking task after stage/reserve | Unspecified — treat history as possibly written | row already committed; sign never released |
+    ///
+    /// This table is the ARCH-5i truth for row fate. On `reserve_then_sign`, a
+    /// failed compensating delete **retains** the row (C1) for every class that
+    /// calls `reconcile_unsigned`, not only unambiguous-no-signature.
     ///
     /// Callers **must not** treat `SigningFailed` as “slot free / different-root
     /// retry safe.” After a retain path, a conflicting different-root retry is
@@ -93,8 +99,10 @@ pub enum SigningGateError {
 
     /// The signing backend has no key for the requested pubkey.
     ///
-    /// On the slashable core path the staged row is discarded (no signature was
-    /// produced for this key). Not used for retain-on-timeout.
+    /// No signature was produced. Production `stage_then_sign` discards the
+    /// staged row. On `reserve_then_sign` the reserved row is reconciled; a
+    /// failed delete retains it (see the table on [`Self::SigningFailed`]).
+    /// Not used for retain-on-timeout.
     #[error("key not found in signing backend")]
     KeyNotFound,
 
@@ -159,7 +167,7 @@ pub enum GateErrClass {
         /// Server-side detail to log when the client message is generic.
         log_detail: Option<String>,
     },
-    /// Sign succeeded; slashing-DB commit failed (nothing written).
+    /// Slashing-DB persist failed; no new history row (same-root retry safe).
     CommitFailed {
         /// Server-side detail (SQLite path / lock message) — log only.
         log_detail: String,
@@ -210,7 +218,7 @@ impl GateErrClass {
             Self::CommitFailed { log_detail } => {
                 tracing::error!(
                     error = %log_detail,
-                    "slashing DB commit failed after successful sign"
+                    "slashing DB persist failed; no new history row"
                 );
             }
             Self::Internal { log_detail } => {

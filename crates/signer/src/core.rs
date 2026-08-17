@@ -51,11 +51,12 @@ use eth_types::Root;
 use metrics::definitions::{
     attestation_status, slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL,
     RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SIGNING_DURATION_SECONDS,
-    RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
+    RVC_SLASHING_PROTECTION_CHECKS_TOTAL, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
 };
 use observability::logging::TruncatedPubkey;
 use slashing::{
-    PendingAudit, PubkeyScopedDb, SlashingDb, SlashingError, StagedAttestation, StagedBlock,
+    CommittedReservation, PendingAudit, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
+    SlashingDb, SlashingError, StagedAttestation, StagedBlock,
 };
 use tracing::{error, warn};
 
@@ -349,11 +350,12 @@ impl SignHooks for StandardSlashableHooks {
 
 // ── Session (runs on the blocking thread) ─────────────────────────────────────
 
-/// State for finishing a staged sign inside `spawn_blocking`.
+/// State for finishing a staged or reserved sign inside `spawn_blocking`.
 ///
 /// Created by [`sign_slashable`]. Production stages through the single core
 /// consumer; unit tests may still call [`SlashableSignSession::stage_then_sign`]
-/// directly (ARCH-5d keeps this method).
+/// directly (ARCH-5d keeps this method). [`Self::reserve_then_sign`] is the
+/// additive ADR-005 sibling (ARCH-5i) — no production caller yet.
 pub struct SlashableSignSession {
     handle: tokio::runtime::Handle,
     signer: Arc<dyn Signer>,
@@ -368,6 +370,9 @@ pub struct SlashableSignSession {
     policy_recheck: Option<Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>>,
     hooks: Arc<dyn SignHooks>,
     op_name: &'static str,
+    /// Used by [`Self::reserve_then_sign`] to run `reconcile_unsigned`. Unused
+    /// by [`Self::stage_then_sign`].
+    slashing_db: Arc<SlashingDb>,
 }
 
 impl SlashableSignSession {
@@ -458,6 +463,183 @@ impl SlashableSignSession {
             // Ambiguous signer errors — policy decides discard vs retain.
             // Remote may already have signed (transport/HTTP after possible sign).
             Ok(Err(e)) => self.finish_ambiguous_error(staged, tx_hold_ms, e),
+        }
+    }
+
+    /// Reserve (commit) a history row, then sign, then dispatch on architecture §5.3.
+    ///
+    /// Additive sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
+    /// [`StagedRow`] impl (VD-5.4): `discard_row` returns `()`, which would drop
+    /// the compensating-delete failure signal. Production still calls
+    /// [`Self::stage_then_sign`]; this method is test-driven until ARCH-5l.
+    ///
+    /// Ordering: `reserve` → hooks → SEC-1 policy re-resolution → sign →
+    /// §5.3 table. `on_tx_hold_ms` keeps the ARCH-5b window (reserve-start →
+    /// sign-return). The reserve-only series is observed at reserve return.
+    pub fn reserve_then_sign<F>(mut self, reserve: F) -> Result<Vec<u8>, SigningGateError>
+    where
+        F: FnOnce() -> Result<CommittedReservation, SlashingError>,
+    {
+        let tx_start = Instant::now();
+        let reservation = match reserve() {
+            Ok(r) => {
+                let reserve_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+                RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS
+                    .with_label_values(&[reservation_metric_kind(r.kind)])
+                    .observe(reserve_ms);
+                self.hooks.on_stage_safe();
+                r
+            }
+            Err(e) => {
+                self.hooks.on_stage_blocked();
+                self.hooks.on_tx_hold_ms(tx_start.elapsed().as_secs_f64() * 1000.0);
+                return Err(self.map_reserve_error(e));
+            }
+        };
+
+        // SEC-1: re-resolve after reserve, immediately before contacting the backend.
+        // The row is already COMMITTED. A Discard → Retain upgrade in this window
+        // therefore means "retain a row that already exists" — i.e. do not
+        // reconcile. That is still fail-closed. `fail_closed_max` itself is unchanged.
+        if let Some(ref recheck) = self.policy_recheck {
+            self.policy = TimeoutPolicySource::fail_closed_max(self.policy, recheck());
+        }
+
+        let sign_result = self.handle.block_on(tokio::time::timeout(
+            self.sign_timeout,
+            self.signer.sign(&self.signing_root, &self.pubkey_bytes),
+        ));
+        // ARCH-5b: existing series keeps stage/reserve-start → sign-return.
+        let tx_hold_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+
+        match sign_result {
+            Err(_elapsed) => self.finish_reserve_timeout(reservation, tx_hold_ms),
+
+            // Sign succeeded — the row is already committed; nothing to persist.
+            Ok(Ok(sig)) => {
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                Ok(sig.to_bytes().to_vec())
+            }
+
+            // VD-5.3: `is_unambiguous_no_signature` lives on `crypto::SigningError`,
+            // not `SignerError`. `e` here is that type (bound by `Signer::sign`).
+            Ok(Err(e)) if e.is_unambiguous_no_signature() => {
+                let reconciled = self.reconcile_reservation(&reservation);
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                match e {
+                    SigningError::KeyNotFound(_) => {
+                        if reconciled {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                                op = self.op_name,
+                                "reserve_then_sign: key not found; reconciled reserved row"
+                            );
+                        }
+                        Err(SigningGateError::KeyNotFound)
+                    }
+                    other => {
+                        if reconciled {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                                op = self.op_name,
+                                error = %other,
+                                "reserve_then_sign: local/no-remote-contact error; reconciled reserved row"
+                            );
+                        }
+                        Err(SigningGateError::SigningFailed(other.to_string()))
+                    }
+                }
+            }
+
+            Ok(Err(e)) => self.finish_reserve_ambiguous(reservation, tx_hold_ms, e),
+        }
+    }
+
+    fn map_reserve_error(&self, err: SlashingError) -> SigningGateError {
+        if err.is_reserve_commit_failure() {
+            SigningGateError::CommitFailed { signing_root: self.signing_root, source: err }
+        } else {
+            SigningGateError::SlashingBlocked(err)
+        }
+    }
+
+    /// `false` on Failed so a follow-up log cannot claim the row was removed.
+    fn reconcile_reservation(&self, reservation: &CommittedReservation) -> bool {
+        match self.slashing_db.reconcile_unsigned(reservation) {
+            ReconcileOutcome::Deleted | ReconcileOutcome::NotApplicable => true,
+            ReconcileOutcome::Failed(ref e) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                    op = self.op_name,
+                    error = %e,
+                    "reserve_then_sign: compensating delete failed; reserved row retained (C1)"
+                );
+                false
+            }
+        }
+    }
+
+    fn finish_reserve_timeout(
+        self,
+        reservation: CommittedReservation,
+        tx_hold_ms: f64,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        match self.policy {
+            TimeoutPolicy::DiscardStagedRow => {
+                let reconciled = self.reconcile_reservation(&reservation);
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                if reconciled {
+                    error!(
+                        pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                        op = self.op_name,
+                        timeout_secs = self.sign_timeout.as_secs_f64(),
+                        "reserve_then_sign: signer timed out; reserved row reconciled"
+                    );
+                }
+                Err(SigningGateError::SigningFailed("signer timed out".to_string()))
+            }
+            TimeoutPolicy::RetainStagedRow => {
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                error!(
+                    pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                    op = self.op_name,
+                    timeout_secs = self.sign_timeout.as_secs_f64(),
+                    "reserve_then_sign: signer timed out; reserved row retained"
+                );
+                Err(SigningGateError::SigningFailed("signer timed out".to_string()))
+            }
+        }
+    }
+
+    fn finish_reserve_ambiguous(
+        self,
+        reservation: CommittedReservation,
+        tx_hold_ms: f64,
+        err: SigningError,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        match self.policy {
+            TimeoutPolicy::DiscardStagedRow => {
+                let reconciled = self.reconcile_reservation(&reservation);
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                if reconciled {
+                    error!(
+                        pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                        op = self.op_name,
+                        error = %err,
+                        "reserve_then_sign: signer error; reserved row reconciled"
+                    );
+                }
+                Err(SigningGateError::SigningFailed(err.to_string()))
+            }
+            TimeoutPolicy::RetainStagedRow => {
+                self.hooks.on_tx_hold_ms(tx_hold_ms);
+                error!(
+                    pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                    op = self.op_name,
+                    "reserve_then_sign: signer error; reserved row retained"
+                );
+                Err(SigningGateError::SigningFailed(err.to_string()))
+            }
         }
     }
 
@@ -712,6 +894,13 @@ fn emit_stage_trace(kind: SlashableKind) {
     }
 }
 
+fn reservation_metric_kind(kind: ReservationKind) -> &'static str {
+    match kind {
+        ReservationKind::Block { .. } => tx_hold_kind::BLOCK,
+        ReservationKind::Attestation { .. } => tx_hold_kind::ATTESTATION,
+    }
+}
+
 fn log_stage_rejected(pubkey_hex: &str, kind: SlashableKind, err: SlashingError) -> SlashingError {
     match kind {
         SlashableKind::Block { slot } => {
@@ -791,6 +980,7 @@ where
         policy_recheck,
         hooks: req.hooks,
         op_name,
+        slashing_db: Arc::clone(&req.slashing_db),
     };
 
     let result = tokio::task::spawn_blocking(move || body(session)).await.map_err(|e| {
@@ -1184,5 +1374,439 @@ mod tests {
     #[test]
     fn test_timeout_policy_variants_are_distinct() {
         assert_ne!(TimeoutPolicy::DiscardStagedRow, TimeoutPolicy::RetainStagedRow);
+    }
+
+    // ── ARCH-5i: reserve_then_sign (additive; no production caller) ───────────
+
+    use slashing::{BlockSlashingViolation, CommittedReservation};
+
+    /// Signer that, when invoked, queries the slashing DB from another thread.
+    /// Under `stage_then_sign` that query blocks (mutex held, row not committed).
+    /// Under `reserve_then_sign` it must complete and see the reserved row.
+    struct PeekingSigner {
+        inner: LocalSigner,
+        db: Arc<SlashingDb>,
+        pubkey_hex: String,
+        saw_row: Arc<AtomicBool>,
+        query_ok: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Signer for PeekingSigner {
+        async fn sign(
+            &self,
+            signing_root: &Root,
+            pubkey: &[u8; 48],
+        ) -> Result<Signature, SigningError> {
+            let db = Arc::clone(&self.db);
+            let pubkey_hex = self.pubkey_hex.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(db.get_blocks(&pubkey_hex));
+            });
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(blocks)) => {
+                    self.query_ok.store(true, Ordering::SeqCst);
+                    self.saw_row.store(blocks.len() == 1, Ordering::SeqCst);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    self.query_ok.store(false, Ordering::SeqCst);
+                    self.saw_row.store(false, Ordering::SeqCst);
+                }
+            }
+            self.inner.sign(signing_root, pubkey).await
+        }
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.inner.public_keys()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn session_for_reserve(
+        signer: Arc<dyn Signer>,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        sign_timeout: Duration,
+        policy: TimeoutPolicy,
+        policy_recheck: Option<Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>>,
+        slashing_db: Arc<SlashingDb>,
+        hooks: Arc<dyn SignHooks>,
+    ) -> SlashableSignSession {
+        let pubkey_bytes = pubkey.to_bytes();
+        SlashableSignSession {
+            handle: tokio::runtime::Handle::current(),
+            signer,
+            pubkey_bytes,
+            pubkey_hex: hex::encode(pubkey_bytes),
+            signing_root,
+            sign_timeout,
+            policy,
+            policy_recheck,
+            hooks,
+            op_name: "test_reserve_then_sign",
+            slashing_db,
+        }
+    }
+
+    async fn run_reserve_then_sign<F>(
+        session: SlashableSignSession,
+        reserve: F,
+    ) -> Result<Vec<u8>, SigningGateError>
+    where
+        F: FnOnce() -> Result<CommittedReservation, SlashingError> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || session.reserve_then_sign(reserve))
+            .await
+            .expect("reserve_then_sign join")
+    }
+
+    /// RED against `stage_then_sign`: the row is committed and the mutex is
+    /// released before the backend is contacted (ADR-005).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_commits_before_the_sign_is_attempted() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let mut km = KeyManager::new();
+        km.insert(sk);
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let saw_row = Arc::new(AtomicBool::new(false));
+        let query_ok = Arc::new(AtomicBool::new(false));
+        let signer: Arc<dyn Signer> = Arc::new(PeekingSigner {
+            inner: LocalSigner::new(km),
+            db: Arc::clone(&db),
+            pubkey_hex: pubkey_hex.clone(),
+            saw_row: Arc::clone(&saw_row),
+            query_ok: Arc::clone(&query_ok),
+        });
+        let signing_root: Root = [0xa1; 32];
+        let session = session_for_reserve(
+            signer,
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 21, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await;
+
+        assert!(result.is_ok(), "sign must succeed: {result:?}");
+        assert!(
+            query_ok.load(Ordering::SeqCst),
+            "DB query from the signer thread must complete; mutex must not still be held"
+        );
+        assert!(
+            saw_row.load(Ordering::SeqCst),
+            "reserved row must already be visible when the sign is attempted"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(blocks.len(), 1, "success leaves the already-committed row: {blocks:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_failure_returns_commit_failed_not_slashing_blocked() {
+        let sk = SecretKey::generate();
+        let (pubkey, signer) = make_local(sk);
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa2; 32];
+
+        db.fail_next_commits(1);
+        let session = session_for_reserve(
+            Arc::clone(&signer),
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = hex::encode(pubkey.to_bytes());
+        let err = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 3, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await
+        .expect_err("reserve commit inject must fail");
+
+        match &err {
+            SigningGateError::CommitFailed { signing_root: r, source } => {
+                assert_eq!(*r, signing_root);
+                assert!(
+                    source.is_reserve_commit_failure(),
+                    "source must be ReserveCommitFailed, got: {source:?}"
+                );
+            }
+            SigningGateError::SlashingBlocked(_) => {
+                panic!("reserve commit failure must NOT be SlashingBlocked")
+            }
+            other => panic!("expected CommitFailed, got: {other:?}"),
+        }
+        assert!(
+            db.get_blocks(&hex::encode(pubkey.to_bytes())).expect("query").is_empty(),
+            "failed reserve must leave no row"
+        );
+
+        let session = session_for_reserve(
+            signer,
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let err = run_reserve_then_sign(session, || {
+            Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                slot: 3,
+            }))
+        })
+        .await
+        .expect_err("rule violation must fail");
+        assert!(
+            matches!(err, SigningGateError::SlashingBlocked(_)),
+            "rule violation stays SlashingBlocked, got {err:?}"
+        );
+    }
+
+    /// SEC-1: Discard → Retain between reserve and sign means "do not reconcile"
+    /// — the row already exists. fail_closed_max is unchanged (Retain wins).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_policy_upgrade_between_reserve_and_sign_retains_the_row() {
+        assert_eq!(
+            TimeoutPolicySource::fail_closed_max(
+                TimeoutPolicy::DiscardStagedRow,
+                TimeoutPolicy::RetainStagedRow,
+            ),
+            TimeoutPolicy::RetainStagedRow,
+            "fail_closed_max merge must stay Retain-wins"
+        );
+
+        let sk = SecretKey::generate();
+        let (pubkey, signer) = make_slow(sk, SIGNER_SLEEP);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa3; 32];
+        let session = session_for_reserve(
+            signer,
+            &pubkey,
+            signing_root,
+            TEST_TIMEOUT,
+            TimeoutPolicy::DiscardStagedRow,
+            Some(Arc::new(|| TimeoutPolicy::RetainStagedRow)),
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 31, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await;
+
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(ref m)) if m.contains("timed out")),
+            "expected timeout error, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(blocks.len(), 1, "Discard→Retain upgrade must not reconcile; found {blocks:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_timeout_discard_reconciles() {
+        let sk = SecretKey::generate();
+        let (pubkey, signer) = make_slow(sk, SIGNER_SLEEP);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa4; 32];
+        let session = session_for_reserve(
+            signer,
+            &pubkey,
+            signing_root,
+            TEST_TIMEOUT,
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 33, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(ref m)) if m.contains("timed out")),
+            "expected timeout, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert!(blocks.is_empty(), "Discard timeout must reconcile the reserved row: {blocks:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_ambiguous_discard_reconciles() {
+        let pubkey = SecretKey::generate().public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa7; 32];
+        let session = session_for_reserve(
+            Arc::new(RemoteFailSigner),
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 39, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(_))),
+            "ambiguous error must surface, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert!(blocks.is_empty(), "Discard ambiguous must reconcile: {blocks:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_ambiguous_retain_does_not_reconcile() {
+        let pubkey = SecretKey::generate().public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa8; 32];
+        let session = session_for_reserve(
+            Arc::new(RemoteFailSigner),
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::RetainStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            db_r.reserve_block(&pk, 41, Some(hex::encode(signing_root)), &GVR)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(_))),
+            "ambiguous error must surface, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(blocks.len(), 1, "Retain ambiguous must not reconcile: {blocks:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_unambiguous_reconciles_under_both_policies() {
+        for policy in [TimeoutPolicy::DiscardStagedRow, TimeoutPolicy::RetainStagedRow] {
+            let pubkey = SecretKey::generate().public_key();
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+            let signing_root: Root = [0xa5; 32];
+            struct LocalReject;
+            #[async_trait]
+            impl Signer for LocalReject {
+                async fn sign(
+                    &self,
+                    _signing_root: &Root,
+                    _pubkey: &[u8; 48],
+                ) -> Result<Signature, SigningError> {
+                    Err(SigningError::LocalRejected("gRPC raw-root".into()))
+                }
+                fn public_keys(&self) -> Vec<[u8; 48]> {
+                    vec![]
+                }
+            }
+            let session = session_for_reserve(
+                Arc::new(LocalReject),
+                &pubkey,
+                signing_root,
+                Duration::from_secs(4),
+                policy,
+                None,
+                Arc::clone(&db),
+                Arc::new(NoopSignHooks),
+            );
+            let db_r = Arc::clone(&db);
+            let pk = pubkey_hex.clone();
+            let result = run_reserve_then_sign(session, move || {
+                db_r.reserve_block(&pk, 35, Some(hex::encode(signing_root)), &GVR)
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SigningGateError::SigningFailed(_))),
+                "unambiguous no-signature must surface the original error, got {result:?} ({policy:?})"
+            );
+            let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+            assert!(
+                blocks.is_empty(),
+                "unambiguous-no-signature must reconcile under {policy:?}; found {blocks:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_reserve_then_sign_unambiguous_failed_reconcile_returns_original_error() {
+        let pubkey = SecretKey::generate().public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let signing_root: Root = [0xa6; 32];
+        struct MissingKey;
+        #[async_trait]
+        impl Signer for MissingKey {
+            async fn sign(
+                &self,
+                _signing_root: &Root,
+                _pubkey: &[u8; 48],
+            ) -> Result<Signature, SigningError> {
+                Err(SigningError::KeyNotFound("absent".into()))
+            }
+            fn public_keys(&self) -> Vec<[u8; 48]> {
+                vec![]
+            }
+        }
+        let session = session_for_reserve(
+            Arc::new(MissingKey),
+            &pubkey,
+            signing_root,
+            Duration::from_secs(4),
+            TimeoutPolicy::DiscardStagedRow,
+            None,
+            Arc::clone(&db),
+            Arc::new(NoopSignHooks),
+        );
+        let db_r = Arc::clone(&db);
+        let pk = pubkey_hex.clone();
+        let result = run_reserve_then_sign(session, move || {
+            let reserved = db_r.reserve_block(&pk, 37, Some(hex::encode(signing_root)), &GVR)?;
+            db_r.fail_next_commits(1);
+            Ok(reserved)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(SigningGateError::KeyNotFound)),
+            "Failed reconcile must still return the original KeyNotFound, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "Failed compensating delete retains the row (C1); found {blocks:?}"
+        );
     }
 }
