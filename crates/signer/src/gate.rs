@@ -88,12 +88,13 @@ use crypto::{CompositeSigner, PublicKey, Signer};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
 use observability::logging::TruncatedPubkey;
-use slashing::{PubkeyScopedDb, SlashingDb};
+use slashing::SlashingDb;
 use tracing::{error, warn};
 
 use crate::core::{
     sign_nonslashable_core, sign_slashable, NonSlashableFailure, SignSlashableRequest,
-    StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
+    SlashableKind, StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource,
+    DEFAULT_SIGN_TIMEOUT,
 };
 use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
@@ -251,43 +252,22 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        let db = Arc::clone(&self.slashing_db);
-        let client_cn_owned = client_cn.to_string();
-        let pubkey_hex_clone = pubkey_hex.clone();
-
         // Explicit policy: gate backends are in-process — discard on timeout.
-        sign_slashable(
-            SignSlashableRequest {
-                locks: self.locks.as_ref(),
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.signer),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(StandardSlashableHooks::block()),
-                op_name: "sign_block",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
-                session.stage_then_sign(|| {
-                    // Bind PendingAudit explicitly; StagedRow bridge emits after
-                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
-                    let (staged, audit) = scoped
-                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot,
-                                rejection_reason = %e,
-                                "SigningGate: sign_block blocked by slashing protection"
-                            );
-                            e
-                        })?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        sign_slashable(SignSlashableRequest {
+            locks: self.locks.as_ref(),
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.signer),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: client_cn.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+        })
         .await
     }
 
@@ -340,49 +320,22 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        let db = Arc::clone(&self.slashing_db);
-        let client_cn_owned = client_cn.to_string();
-        let pubkey_hex_clone = pubkey_hex.clone();
-
         // Explicit policy: gate backends are in-process — discard on timeout.
-        sign_slashable(
-            SignSlashableRequest {
-                locks: self.locks.as_ref(),
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.signer),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(StandardSlashableHooks::attestation()),
-                op_name: "sign_attestation",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
-                session.stage_then_sign(|| {
-                    // Bind PendingAudit explicitly; StagedRow bridge emits after
-                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
-                    let (staged, audit) = scoped
-                        .stage_attestation(
-                            &pubkey_hex_clone,
-                            source_epoch,
-                            target_epoch,
-                            Some(hex::encode(signing_root)),
-                        )
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                source_epoch,
-                                target_epoch,
-                                rejection_reason = %e,
-                                "SigningGate: sign_attestation blocked by slashing protection"
-                            );
-                            e
-                        })?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        sign_slashable(SignSlashableRequest {
+            locks: self.locks.as_ref(),
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.signer),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::new(StandardSlashableHooks::attestation()),
+            op_name: "sign_attestation",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: client_cn.to_string(),
+            gvr,
+            kind: SlashableKind::Attestation { source_epoch, target_epoch },
+        })
         .await
     }
 

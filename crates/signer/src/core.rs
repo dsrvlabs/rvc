@@ -41,6 +41,7 @@
 //! `tokio::task::spawn_blocking`, driving the async sign via
 //! `Handle::block_on(timeout(...))` on that same thread.
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,9 @@ use metrics::definitions::{
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
 use observability::logging::TruncatedPubkey;
-use slashing::{PendingAudit, SlashingError, StagedAttestation, StagedBlock};
+use slashing::{
+    PendingAudit, PubkeyScopedDb, SlashingDb, SlashingError, StagedAttestation, StagedBlock,
+};
 use tracing::{error, warn};
 
 use crate::error::SigningGateError;
@@ -243,6 +246,27 @@ impl<S: StagedRow> StagedRow for (S, PendingAudit) {
     }
 }
 
+/// Type-erased staged guard so the core consumer has one `stage_then_sign` site.
+enum AnyStaged<'db> {
+    Block(StagedBlock<'db>),
+    Attestation(StagedAttestation<'db>),
+}
+
+impl StagedRow for AnyStaged<'_> {
+    fn commit_row(self) -> Result<(), SlashingError> {
+        match self {
+            Self::Block(row) => row.commit(),
+            Self::Attestation(row) => row.commit(),
+        }
+    }
+    fn discard_row(self) {
+        match self {
+            Self::Block(row) => row.discard(),
+            Self::Attestation(row) => row.discard(),
+        }
+    }
+}
+
 // ── Sign hooks (metrics) ──────────────────────────────────────────────────────
 
 /// Metrics / observability callbacks invoked from the slashable core.
@@ -327,9 +351,9 @@ impl SignHooks for StandardSlashableHooks {
 
 /// State for finishing a staged sign inside `spawn_blocking`.
 ///
-/// Created by [`sign_slashable`] and handed to the caller's body closure so the
-/// caller can build a `PubkeyScopedDb` / stage locally (keeping `!Send` guards
-/// on this thread) then call [`SlashableSignSession::stage_then_sign`].
+/// Created by [`sign_slashable`]. Production stages through the single core
+/// consumer; unit tests may still call [`SlashableSignSession::stage_then_sign`]
+/// directly (ARCH-5d keeps this method).
 pub struct SlashableSignSession {
     handle: tokio::runtime::Handle,
     signer: Arc<dyn Signer>,
@@ -546,10 +570,45 @@ impl SlashableSignSession {
 
 // ── Public core entry ─────────────────────────────────────────────────────────
 
+/// Which slashable duty to stage inside [`sign_slashable`].
+///
+/// Call sites pass this data instead of a `body` closure so ARCH-5l's
+/// switchover flips one `stage_then_sign` site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashableKind {
+    /// Beacon block proposal at `slot`.
+    Block {
+        /// Proposal slot.
+        slot: u64,
+    },
+    /// Attestation covering `[source_epoch, target_epoch]`.
+    Attestation {
+        /// Source checkpoint epoch.
+        source_epoch: u64,
+        /// Target checkpoint epoch.
+        target_epoch: u64,
+    },
+}
+
+impl SlashableKind {
+    fn duty_label(self) -> &'static str {
+        match self {
+            Self::Block { .. } => "block",
+            Self::Attestation { .. } => "attestation",
+        }
+    }
+}
+
+/// 1-in-N rate for the attestation-stage trace (issue 5.3).
+const ATTESTATION_STAGE_TRACE_SAMPLE_N: u64 = 16;
+static ATTESTATION_STAGE_TRACE_CTR: AtomicU64 = AtomicU64::new(0);
+
 /// Inputs for [`sign_slashable`] (bundled to keep the call surface explicit).
 ///
 /// Policy is required with **no default** — every call site must choose
 /// [`TimeoutPolicySource`] deliberately (fixed or resolve-under-lock).
+/// Staging is data (`slashing_db` / `client_cn` / `gvr` / [`SlashableKind`]),
+/// not a caller-supplied `body` closure (ARCH-5d).
 pub struct SignSlashableRequest<'a> {
     pub locks: &'a ValidatorLockMap,
     pub pubkey: &'a PublicKey,
@@ -561,6 +620,14 @@ pub struct SignSlashableRequest<'a> {
     pub policy: TimeoutPolicySource,
     pub hooks: Arc<dyn SignHooks>,
     pub op_name: &'static str,
+    /// Slashing DB used to build `PubkeyScopedDb` on the blocking thread.
+    pub slashing_db: Arc<SlashingDb>,
+    /// Audit CN recorded by `PubkeyScopedDb` (gate: caller mTLS CN; VC: `"local-vc"`).
+    pub client_cn: String,
+    /// Genesis validators root for the M-6 pin.
+    pub gvr: Root,
+    /// Block vs attestation staging parameters.
+    pub kind: SlashableKind,
 }
 
 /// Shared slashable-signing core.
@@ -569,8 +636,8 @@ pub struct SignSlashableRequest<'a> {
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
-/// 4. `spawn_blocking`: caller `body` stages, then
-///    [`SlashableSignSession::stage_then_sign`] signs with timeout and
+/// 4. `spawn_blocking`: build `PubkeyScopedDb`, stage per [`SlashableKind`],
+///    then [`SlashableSignSession::stage_then_sign`] signs with timeout and
 ///    commit/discards per policy.
 ///
 /// # Errors
@@ -578,7 +645,100 @@ pub struct SignSlashableRequest<'a> {
 /// Propagates [`SigningGateError`] variants from enablement, stage, sign, commit,
 /// and join failures. On success, records `hooks.on_success` with the full
 /// wall-clock duration of the operation.
-pub async fn sign_slashable<F>(
+pub async fn sign_slashable(req: SignSlashableRequest<'_>) -> Result<Vec<u8>, SigningGateError> {
+    let slashing_db = Arc::clone(&req.slashing_db);
+    let client_cn = req.client_cn.clone();
+    let gvr = req.gvr;
+    let kind = req.kind;
+    let span = tracing::Span::current();
+    sign_slashable_with_body(req, move |session| {
+        let _enter = span.enter();
+        stage_then_sign_duty(session, slashing_db, client_cn, gvr, kind)
+    })
+    .await
+}
+
+/// Sole production `stage_then_sign` consumer (ARCH-5d). Must run on the
+/// `spawn_blocking` thread: staged guards are `!Send`.
+fn stage_then_sign_duty(
+    session: SlashableSignSession,
+    slashing_db: Arc<SlashingDb>,
+    client_cn: String,
+    gvr: Root,
+    kind: SlashableKind,
+) -> Result<Vec<u8>, SigningGateError> {
+    emit_stage_trace(kind);
+    let pubkey_hex = session.pubkey_hex.clone();
+    let signing_root = session.signing_root;
+    let scoped = PubkeyScopedDb::new(slashing_db, client_cn, gvr);
+    session.stage_then_sign(|| match kind {
+        SlashableKind::Block { slot } => {
+            let (staged, audit) = scoped
+                .stage_block(&pubkey_hex, slot, Some(hex::encode(signing_root)))
+                .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e))?;
+            Ok((AnyStaged::Block(staged), audit))
+        }
+        SlashableKind::Attestation { source_epoch, target_epoch } => {
+            let (staged, audit) = scoped
+                .stage_attestation(
+                    &pubkey_hex,
+                    source_epoch,
+                    target_epoch,
+                    Some(hex::encode(signing_root)),
+                )
+                .map_err(|e| log_stage_rejected(&pubkey_hex, kind, e))?;
+            Ok((AnyStaged::Attestation(staged), audit))
+        }
+    })
+}
+
+fn emit_stage_trace(kind: SlashableKind) {
+    match kind {
+        SlashableKind::Attestation { .. } => {
+            if tracing::enabled!(tracing::Level::TRACE)
+                && observability::logging::should_log_sampled(
+                    &ATTESTATION_STAGE_TRACE_CTR,
+                    ATTESTATION_STAGE_TRACE_SAMPLE_N,
+                )
+            {
+                tracing::trace!(
+                    "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
+                );
+            }
+        }
+        SlashableKind::Block { .. } => {
+            tracing::trace!("staging block slashing-protection record on blocking thread");
+        }
+    }
+}
+
+fn log_stage_rejected(pubkey_hex: &str, kind: SlashableKind, err: SlashingError) -> SlashingError {
+    match kind {
+        SlashableKind::Block { slot } => {
+            error!(
+                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                duty = kind.duty_label(),
+                slot,
+                rejection_reason = %err,
+                "slashing protection rejected duty"
+            );
+        }
+        SlashableKind::Attestation { source_epoch, target_epoch } => {
+            error!(
+                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                duty = kind.duty_label(),
+                source_epoch,
+                target_epoch,
+                rejection_reason = %err,
+                "slashing protection rejected duty"
+            );
+        }
+    }
+    err
+}
+
+/// Lock → enablement re-check → policy resolve → `spawn_blocking(body)`.
+async fn sign_slashable_with_body<F>(
     req: SignSlashableRequest<'_>,
     body: F,
 ) -> Result<Vec<u8>, SigningGateError>
@@ -657,7 +817,7 @@ mod tests {
 
     use async_trait::async_trait;
     use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError};
-    use slashing::{PubkeyScopedDb, SlashingDb};
+    use slashing::SlashingDb;
 
     const GVR: Root = [0xc0; 32];
     const TEST_TIMEOUT: Duration = Duration::from_millis(50);
@@ -752,29 +912,21 @@ mod tests {
         let hooks = Arc::new(NoopSignHooks);
         let signing_root: Root = [0x11; 32];
 
-        let db_c = Arc::clone(&db);
-        let pk_hex = pubkey_hex.clone();
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &locks,
-                pubkey: &pubkey,
-                enablement: &AlwaysEnabled,
-                signer,
-                signing_root,
-                sign_timeout: TEST_TIMEOUT,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
-                hooks,
-                op_name: "test_retain",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                session.stage_then_sign(|| {
-                    let (staged, audit) =
-                        scoped.stage_block(&pk_hex, 7, Some(hex::encode(signing_root)))?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: &AlwaysEnabled,
+            signer,
+            signing_root,
+            sign_timeout: TEST_TIMEOUT,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
+            hooks,
+            op_name: "test_retain",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Block { slot: 7 },
+        })
         .await;
 
         assert!(
@@ -833,29 +985,21 @@ mod tests {
         }
         let signer: Arc<dyn Signer> = Arc::new(LocalReject);
 
-        let db_c = Arc::clone(&db);
-        let pk_hex = pubkey_hex.clone();
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &locks,
-                pubkey: &pubkey,
-                enablement: &AlwaysEnabled,
-                signer,
-                signing_root,
-                sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
-                hooks,
-                op_name: "test_local_rejected",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                session.stage_then_sign(|| {
-                    let (staged, audit) =
-                        scoped.stage_block(&pk_hex, 15, Some(hex::encode(signing_root)))?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: &AlwaysEnabled,
+            signer,
+            signing_root,
+            sign_timeout: Duration::from_secs(4),
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
+            hooks,
+            op_name: "test_local_rejected",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Block { slot: 15 },
+        })
         .await;
 
         assert!(
@@ -878,29 +1022,21 @@ mod tests {
         let signing_root: Root = [0x44; 32];
         let signer: Arc<dyn Signer> = Arc::new(RemoteFailSigner);
 
-        let db_c = Arc::clone(&db);
-        let pk_hex = pubkey_hex.clone();
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &locks,
-                pubkey: &pubkey,
-                enablement: &AlwaysEnabled,
-                signer,
-                signing_root,
-                sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
-                hooks,
-                op_name: "test_retain_remote_err",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                session.stage_then_sign(|| {
-                    let (staged, audit) =
-                        scoped.stage_block(&pk_hex, 13, Some(hex::encode(signing_root)))?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: &AlwaysEnabled,
+            signer,
+            signing_root,
+            sign_timeout: Duration::from_secs(4),
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
+            hooks,
+            op_name: "test_retain_remote_err",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Block { slot: 13 },
+        })
         .await;
 
         assert!(
@@ -933,29 +1069,21 @@ mod tests {
         let hooks = Arc::new(NoopSignHooks);
         let signing_root: Root = [0x22; 32];
 
-        let db_c = Arc::clone(&db);
-        let pk_hex = pubkey_hex.clone();
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &locks,
-                pubkey: &pubkey,
-                enablement: &AlwaysEnabled,
-                signer,
-                signing_root,
-                sign_timeout: TEST_TIMEOUT,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks,
-                op_name: "test_discard",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                session.stage_then_sign(|| {
-                    let (staged, audit) =
-                        scoped.stage_block(&pk_hex, 9, Some(hex::encode(signing_root)))?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: &AlwaysEnabled,
+            signer,
+            signing_root,
+            sign_timeout: TEST_TIMEOUT,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks,
+            op_name: "test_discard",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Block { slot: 9 },
+        })
         .await;
 
         assert!(
@@ -974,36 +1102,27 @@ mod tests {
     async fn test_core_hooks_on_success() {
         let sk = SecretKey::generate();
         let (pubkey, signer) = make_local(sk);
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
         let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
         let locks = ValidatorLockMap::new();
         let hooks = Arc::new(CountingHooks::new());
         let signing_root: Root = [0x33; 32];
 
-        let db_c = Arc::clone(&db);
-        let pk_hex = pubkey_hex.clone();
         let hooks_c = Arc::clone(&hooks);
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &locks,
-                pubkey: &pubkey,
-                enablement: &AlwaysEnabled,
-                signer,
-                signing_root,
-                sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: hooks_c,
-                op_name: "test_hooks",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                session.stage_then_sign(|| {
-                    let (staged, audit) =
-                        scoped.stage_block(&pk_hex, 11, Some(hex::encode(signing_root)))?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &locks,
+            pubkey: &pubkey,
+            enablement: &AlwaysEnabled,
+            signer,
+            signing_root,
+            sign_timeout: Duration::from_secs(4),
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: hooks_c,
+            op_name: "test_hooks",
+            slashing_db: Arc::clone(&db),
+            client_cn: "test".into(),
+            gvr: GVR,
+            kind: SlashableKind::Block { slot: 11 },
+        })
         .await;
 
         assert!(result.is_ok(), "sign must succeed: {result:?}");
@@ -1030,30 +1149,22 @@ mod tests {
         let en_c = Arc::clone(&enablement);
         let db_c = Arc::clone(&db);
         let pk = pubkey.clone();
-        let pk_for_stage = pubkey.clone();
         let join = tokio::spawn(async move {
-            sign_slashable(
-                SignSlashableRequest {
-                    locks: locks_c.as_ref(),
-                    pubkey: &pk,
-                    enablement: en_c.as_ref(),
-                    signer,
-                    signing_root: [0x44; 32],
-                    sign_timeout: Duration::from_secs(4),
-                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                    hooks: Arc::new(NoopSignHooks),
-                    op_name: "test_recheck",
-                },
-                move |session| {
-                    let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
-                    let pk_hex = hex::encode(pk_for_stage.to_bytes());
-                    session.stage_then_sign(|| {
-                        let (staged, audit) =
-                            scoped.stage_block(&pk_hex, 13, Some(hex::encode([0x44; 32])))?;
-                        Ok((staged, audit))
-                    })
-                },
-            )
+            sign_slashable(SignSlashableRequest {
+                locks: locks_c.as_ref(),
+                pubkey: &pk,
+                enablement: en_c.as_ref(),
+                signer,
+                signing_root: [0x44; 32],
+                sign_timeout: Duration::from_secs(4),
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+                hooks: Arc::new(NoopSignHooks),
+                op_name: "test_recheck",
+                slashing_db: db_c,
+                client_cn: "test".into(),
+                gvr: GVR,
+                kind: SlashableKind::Block { slot: 13 },
+            })
             .await
         });
 

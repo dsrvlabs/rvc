@@ -25,8 +25,8 @@ pub use crypto::is_aggregator;
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 pub use core::{
     sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
-    SignSlashableRequest, SlashableSignSession, StagedRow, StandardSlashableHooks, TimeoutPolicy,
-    TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
+    SignSlashableRequest, SlashableKind, SlashableSignSession, StagedRow, StandardSlashableHooks,
+    TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 pub use doppelganger::SigningEnablement;
 pub use error::{classify, GateErrClass, SigningGateError};
@@ -59,7 +59,7 @@ use eth_types::{
 };
 use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
-use slashing::{PubkeyScopedDb, SlashingDb, SlashingError};
+use slashing::{SlashingDb, SlashingError};
 
 /// Errors that can occur during signing operations (VC / `SignerService` path).
 ///
@@ -162,7 +162,7 @@ impl From<SigningError> for SignerError {
     }
 }
 
-/// Audit CN recorded by [`PubkeyScopedDb`] on the VC slashable path.
+/// Audit CN recorded by [`slashing::PubkeyScopedDb`] on the VC slashable path.
 const AUDIT_CN_VC: &str = "local-vc";
 
 /// How the composite routes a pubkey — drives fail-closed [`TimeoutPolicy`].
@@ -196,7 +196,7 @@ pub enum BackendKind {
 ///
 /// Slashable paths (`sign_block` / `sign_attestation`) delegate to
 /// [`sign_slashable`]: outer enablement → per-validator lock → enablement
-/// re-check under lock → `PubkeyScopedDb` stage → timed sign → commit/discard
+/// re-check under lock → [`slashing::PubkeyScopedDb`] stage → timed sign → commit/discard
 /// per per-pubkey [`TimeoutPolicy`] (fail-closed retain for remote/unknown).
 /// Metrics use [`StandardSlashableHooks`] (same families as the gate).
 ///
@@ -261,13 +261,6 @@ impl SigningEnablement for AlwaysEnabled {
 pub fn always_enabled() -> Arc<dyn SigningEnablement> {
     Arc::new(AlwaysEnabled)
 }
-
-/// 1-in-N rate for the attestation-stage trace (issue 5.3). The site fires once per
-/// validator per slot; at 16 a 1000-validator load drops ~63 trace lines/slot to ~4
-/// while still proving the path is live. Per-call-site counter the sampler advances.
-const ATTESTATION_STAGE_TRACE_SAMPLE_N: u64 = 16;
-static ATTESTATION_STAGE_TRACE_CTR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
@@ -566,65 +559,25 @@ impl ValidatorSigner for SignerService {
         let _slashing_span = tracing::info_span!("slashing.check").entered();
         drop(_slashing_span);
 
-        let db = Arc::clone(&self.slashing_db);
         let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
-        let slot_for_log = data.slot;
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
 
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::attestation()),
-                op_name: "sign_attestation",
-            },
-            move |session| {
-                let _e = span.enter();
-                // Sampled 1-in-N stage trace (issue 5.3); zero-cost when TRACE off.
-                if tracing::enabled!(tracing::Level::TRACE)
-                    && observability::logging::should_log_sampled(
-                        &ATTESTATION_STAGE_TRACE_CTR,
-                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
-                    )
-                {
-                    tracing::trace!(
-                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
-                    );
-                }
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    // Bind PendingAudit explicitly; StagedRow bridge emits after
-                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
-                    let (staged, audit) = scoped
-                        .stage_attestation(
-                            &pubkey_hex_clone,
-                            source_epoch,
-                            target_epoch,
-                            Some(hex::encode(signing_root)),
-                        )
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot_for_log,
-                                source_epoch = source_epoch,
-                                target_epoch = target_epoch,
-                                rejection_reason = %e,
-                                "Slashing protection rejected attestation"
-                            );
-                            e
-                        })?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.sign_backend),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::attestation()),
+            op_name: "sign_attestation",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Attestation { source_epoch, target_epoch },
+        })
         .await;
 
         match result {
@@ -682,47 +635,25 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
 
-        let db = Arc::clone(&self.slashing_db);
         let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
 
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::block()),
-                op_name: "sign_block",
-            },
-            move |session| {
-                let _e = span.enter();
-                tracing::trace!("staging block slashing-protection record on blocking thread");
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    // Bind PendingAudit explicitly; StagedRow bridge emits after
-                    // commit/discard releases the connection mutex (ARCH-1b / ADR-006).
-                    let (staged, audit) = scoped
-                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot,
-                                rejection_reason = %e,
-                                "Slashing protection rejected block proposal"
-                            );
-                            e
-                        })?;
-                    Ok((staged, audit))
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.sign_backend),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+        })
         .await;
 
         match result {
@@ -1197,7 +1128,7 @@ mod tests {
         // ...and the blocking-thread rejection line carries the truncated pubkey.
         let rejection = events
             .iter()
-            .find(|e| e.message.contains("Slashing protection rejected attestation"))
+            .find(|e| e.message.contains("slashing protection rejected duty"))
             .expect("rejection error line must be captured");
         assert!(
             rejection.fields_text.contains("..."),

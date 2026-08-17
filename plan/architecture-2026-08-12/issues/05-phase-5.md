@@ -561,17 +561,17 @@ materialises.
 - **KAT note (A-5.10):** none of these may be named `*_root`.
 
 **Acceptance criteria**
-- [ ] Exactly **one** *production* `session.stage_then_sign(...)` call site (in `core.rs`, outside
+- [x] Exactly **one** *production* `session.stage_then_sign(...)` call site (in `core.rs`, outside
       `#[cfg(test)]`), asserted by a test; `gate.rs` and `lib.rs` contain none.
-- [ ] The four public entry points (`SigningGate::{sign_block, sign_attestation}`,
+- [x] The four public entry points (`SigningGate::{sign_block, sign_attestation}`,
       `SignerService::{sign_block, sign_attestation}`) keep their signatures and their error types.
-- [ ] `client_cn` is still per-caller on the gate path and `"local-vc"` on the VC path, asserted.
-- [ ] `TimeoutPolicySource::ResolveUnderLock`'s **double resolution** is untouched — the
+- [x] `client_cn` is still per-caller on the gate path and `"local-vc"` on the VC path, asserted.
+- [x] `TimeoutPolicySource::ResolveUnderLock`'s **double resolution** is untouched — the
       `fail_closed_max` merge at `core.rs:280-282` is not moved, reordered, or made conditional
       (SEC-1).
-- [ ] `spawn_blocking` still wraps the sequence (`core.rs:542`) — **C9 anchor 7** (X9).
-- [ ] `phantom_row_m1.rs`, `commit_failed_path.rs`, `tx_hold_metric.rs` green with **zero** edits.
-- [ ] **If the fold measures beyond 3 points**, split at the error-type boundary: `ARCH-5d1`
+- [x] `spawn_blocking` still wraps the sequence (`core.rs:542`) — **C9 anchor 7** (X9).
+- [x] `phantom_row_m1.rs`, `commit_failed_path.rs`, `tx_hold_metric.rs` green with **zero** edits.
+- [x] **If the fold measures beyond 3 points**, split at the error-type boundary: `ARCH-5d1`
       (gate pair) / `ARCH-5d2` (SignerService pair). Recorded up front, not discovered.
 
 ---
