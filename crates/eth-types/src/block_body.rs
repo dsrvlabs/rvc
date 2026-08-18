@@ -29,7 +29,6 @@
 //!
 //! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
 //! | --- | --- | --- |
-//! | [`WireCheckpoint`] | [`crate::Checkpoint`] | ssz 0.9 vs ethereum_ssz 0.8 + ssz_types |
 //! | [`WireAttestationData`] | [`crate::AttestationData`] | same |
 //! | [`WireBeaconBlockHeader`] | [`crate::BeaconBlockHeader`] | same |
 //! | [`WireAttestation`] | [`crate::Attestation`] | same |
@@ -331,11 +330,11 @@ ssz_container! {
     }
 }
 
+// Path C: crate-root Checkpoint already has ssz 0.9 + TreeHash.
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireCheckpoint {
-        pub epoch: u64,
-        pub root: [u8; 32],
+    impl crate::Checkpoint {
+        epoch: crate::Epoch,
+        root: crate::Root,
     }
 }
 
@@ -345,8 +344,8 @@ ssz_container! {
         pub slot: u64,
         pub index: u64,
         pub beacon_block_root: [u8; 32],
-        pub source: WireCheckpoint,
-        pub target: WireCheckpoint,
+        pub source: crate::Checkpoint,
+        pub target: crate::Checkpoint,
     }
 }
 
@@ -1042,6 +1041,23 @@ mod tests {
     fn hex32(s: &str) -> Hash256 {
         let bytes = hex::decode(s.trim_start_matches("0x")).expect("hex");
         Hash256::from_slice(&bytes)
+    }
+
+    /// remerkleable `Checkpoint(epoch=100, root=0x00…32)` SSZ + HTR.
+    const SPEC_CHECKPOINT_SSZ_HEX: &str =
+        "64000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    const SPEC_CHECKPOINT_HTR_HEX: &str =
+        "f59927591e6e3283d4419e376e4ebb4e08f4f547a3d1076474a29c9d44a07b28";
+
+    #[test]
+    fn test_checkpoint_ssz09_and_ssz08_match_spec_bytes() {
+        let checkpoint = crate::Checkpoint { epoch: 100, root: [0u8; 32] };
+        let expected = hex::decode(SPEC_CHECKPOINT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&checkpoint), expected);
+        assert_eq!(Encode::as_ssz_bytes(&checkpoint), expected);
+        assert_eq!(checkpoint.tree_hash_root(), hex32(SPEC_CHECKPOINT_HTR_HEX));
+        let back = <crate::Checkpoint as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, checkpoint);
     }
 
     #[test]
