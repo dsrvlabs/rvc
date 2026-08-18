@@ -133,6 +133,7 @@ async fn test_propose_block_unblinded() {
 /// block_root TRUNCATED (0x{first10}...{last8}), never the full 64-hex.
 #[tracing_test::traced_test]
 #[tokio::test]
+// kat_exempt: logging truncation only — asserts publish hex is redacted, not a spec root
 async fn test_propose_block_publish_truncates_block_root() {
     let pubkey = test_pubkey();
     let slot = 100;

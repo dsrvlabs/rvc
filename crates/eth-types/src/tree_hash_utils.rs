@@ -403,6 +403,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — Bitlist[N] limit changes the root; not a container-root KAT
     fn test_bitlist_limit_changes_root() {
         // The same SSZ bits hash to different roots under different `Bitlist[N]` limits, because
         // the chunk tree is padded to a different chunk_count. This is the bug this fix closes.

@@ -438,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — different beacon_block_root must yield different roots; not a container-root KAT
     fn test_sync_committee_contribution_tree_hash_field_sensitivity_block_root() {
         let contrib1 = sample_contribution();
         let mut contrib2 = contrib1.clone();

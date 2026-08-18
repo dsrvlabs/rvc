@@ -1130,13 +1130,13 @@ strictly shorter than 57 and never longer.
 
 **Acceptance criteria.**
 
-- [ ] `EXEMPTIONS` is strictly shorter than 57 entries; each removal is justified in the PR by
+- [x] `EXEMPTIONS` is strictly shorter than 57 entries; each removal is justified in the PR by
       category (a)/(b) above.
-- [ ] The seven `signing_root_kat.rs` entries (`:92-104`) are individually adjudicated — removed or
+- [x] The seven `signing_root_kat.rs` entries (`:92-104`) are individually adjudicated — removed or
       justified in writing; "left as-is" without a reason is not acceptable.
-- [ ] `kat_policy` and `kat_policy_exemptions_are_sorted_and_unique` (`:463`) are green.
-- [ ] A `EXEMPTIONS.len()` ratchet assertion exists so the list cannot grow.
-- [ ] The detector at `:238` / `:275` is **unchanged** — no entry was retired by weakening the scan.
+- [x] `kat_policy` and `kat_policy_exemptions_are_sorted_and_unique` (`:463`) are green.
+- [x] A `EXEMPTIONS.len()` ratchet assertion exists so the list cannot grow.
+- [x] The detector at `:238` / `:275` is **unchanged** — no entry was retired by weakening the scan.
 
 ---
 
