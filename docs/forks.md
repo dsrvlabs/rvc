@@ -50,13 +50,13 @@ Two SSZ layouts exist for `BeaconBlockBody` (blob era). Electra added
 | `BlockContents::kzg_commitment_root` | `crates/eth-types/src/block.rs` | 282–284 | Internal KZG fingerprint (not spec `hash_tree_root`). Takes `layout`. |
 | `BeaconBlock::kzg_commitment_root` | `crates/eth-types/src/block.rs` | 350–352 | Same fingerprint on a bare block. |
 | `try_tree_hash_root_for_layout` | `crates/eth-types/src/tree_hash_utils.rs` | 125–147 | Spec block HTR with an explicit layout (prefer this on proposal paths). |
-| `BeaconBlockBodyElectra` | `crates/eth-types/src/block_body.rs` | 566 | 13-field full body. Comment: Fulu shares this layout. |
-| `BlindedBeaconBlockBodyElectra` | `crates/eth-types/src/block_body.rs` | 598 | Electra blinded (`ExecutionPayloadHeader`). |
-| `BeaconBlockBodyDeneb` | `crates/eth-types/src/block_body.rs` | 638 | 12-field full body; pre-Electra attestation limits. |
-| `BlindedBeaconBlockBodyDeneb` | `crates/eth-types/src/block_body.rs` | 670 | Deneb blinded. |
-| `body_tree_hash_root_for_layout` | `crates/eth-types/src/block_body.rs` | 757–767 | Full-body leaf HTR, explicit layout. |
-| `blinded_body_tree_hash_root_for_layout` | `crates/eth-types/src/block_body.rs` | 770–782 | Blinded leaf HTR, explicit layout. |
-| Auto-detect HTR | `crates/eth-types/src/block_body.rs` | 735–753 | Electra decode first, then Deneb. Use only when `consensus_version` is unknown. |
+| `BeaconBlockBodyElectra` | `crates/eth-types/src/block_body.rs` | 915 | 13-field full body. Comment: Fulu shares this layout. |
+| `BlindedBeaconBlockBodyElectra` | `crates/eth-types/src/block_body.rs` | 947 | Electra blinded (`ExecutionPayloadHeader`). |
+| `BeaconBlockBodyDeneb` | `crates/eth-types/src/block_body.rs` | 987 | 12-field full body; pre-Electra attestation limits. |
+| `BlindedBeaconBlockBodyDeneb` | `crates/eth-types/src/block_body.rs` | 1019 | Deneb blinded. |
+| `body_tree_hash_root_for_layout` | `crates/eth-types/src/block_body.rs` | 1106–1116 | Full-body leaf HTR, explicit layout. |
+| `blinded_body_tree_hash_root_for_layout` | `crates/eth-types/src/block_body.rs` | 1119–1131 | Blinded leaf HTR, explicit layout. |
+| Auto-detect HTR | `crates/eth-types/src/block_body.rs` | 1084–1103 | Electra decode first, then Deneb. Use only when `consensus_version` is unknown. |
 
 Proposal path that already has the BN `consensus_version`:
 
@@ -119,7 +119,7 @@ Name pattern `.*(tree_hash|signing_root|_root)$` must, in the **test body**:
 
 ### Pattern to copy — body/block roots
 
-The six body/block KATs live in `crates/eth-types/src/block_body.rs` (794–825).
+The six body/block KATs live in `crates/eth-types/src/block_body.rs` (1143–1174).
 They are independent `remerkleable` vectors. A new body-changing fork adds the
 same four-constant set (full body/block + blinded body/block). Deneb blinded
 currently reuses `EXTERNAL_DENEB_BLOCK_ROOT_HEX` because empty-ops full/blinded
@@ -127,12 +127,12 @@ bodies share HTR (`crates/eth-types/src/block.rs` 737–738).
 
 | Constant | Line | Hex |
 |---|---|---|
-| `EXTERNAL_ELECTRA_BODY_ROOT_HEX` | 794 | `58953d11e9b51a6e95c8c70ca51b7ad6b6e557a91caab298a71688dfab9e4870` |
-| `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX` | 801 | `b3f19bf190b0ab2466738ba06bbaf6e481041ca66db733c549975b27b53c92b9` |
-| `EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX` | 807 | `e9e9fd39cc7fc4345e43bf31af21838d9389767cf62c0f8fdaf740b06d26f3e7` |
-| `EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX` | 813 | `6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24` |
-| `EXTERNAL_DENEB_BODY_ROOT_HEX` | 818 | `6c74513b682d097373d9f9a962637d753a8f8d6af4efb0283ae5c4941308ec67` |
-| `EXTERNAL_DENEB_BLOCK_ROOT_HEX` | 824 | `86714640e5ee761d6ccc664996816f10ec496324bcac46a999f778abce1f906e` |
+| `EXTERNAL_ELECTRA_BODY_ROOT_HEX` | 1143 | `58953d11e9b51a6e95c8c70ca51b7ad6b6e557a91caab298a71688dfab9e4870` |
+| `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX` | 1150 | `b3f19bf190b0ab2466738ba06bbaf6e481041ca66db733c549975b27b53c92b9` |
+| `EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX` | 1156 | `e9e9fd39cc7fc4345e43bf31af21838d9389767cf62c0f8fdaf740b06d26f3e7` |
+| `EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX` | 1162 | `6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24` |
+| `EXTERNAL_DENEB_BODY_ROOT_HEX` | 1167 | `6c74513b682d097373d9f9a962637d753a8f8d6af4efb0283ae5c4941308ec67` |
+| `EXTERNAL_DENEB_BLOCK_ROOT_HEX` | 1173 | `86714640e5ee761d6ccc664996816f10ec496324bcac46a999f778abce1f906e` |
 
 Assertions that must stay green and **byte-identical** after any body/SSZ edit
 (`crates/eth-types/src/block.rs`):
@@ -163,57 +163,36 @@ not satisfy `kat_policy` — put the token in the test body).
 | Lockfile | `Cargo.lock` 1526 / 1541 | both `ethereum_ssz` **0.8.3** and **0.9.1** |
 
 Crate-root types (`Checkpoint` at `crates/eth-types/src/lib.rs` 121–127, and the
-other `ssz_derive` 0.9 containers) use workspace `ssz` 0.9. Typed block bodies
-use `ssz_types` 0.10.1 + `ssz08`. Eight encode/decode-facing `Wire*` twins exist
-only inside `crates/eth-types/src/block_body.rs`:
+other containers) carry **both** workspace `ssz` 0.9 and `ssz08` 0.8
+`Encode`/`Decode`. Typed block bodies still encode through `ssz_types` 0.10.1
++ `ssz08`. **One struct per container.**
 
-| Twin | Line | Crate-root counterpart |
+### Path C landed (ARCH-7h, 2026-08-18, baseline `ce9048c`)
+
+The eight encode/decode-facing twins were collapsed onto the crate-root
+types. Do not reintroduce a second struct per container.
+
+How each class was collapsed (spike:
+`plan/architecture-2026-08-12/measurements/wire-twins-spike.md`):
+
+| Class | Types | How |
 |---|---|---|
-| `WireCheckpoint` | 302 | `Checkpoint` |
-| `WireAttestationData` | 310 | `AttestationData` |
-| `WireBeaconBlockHeader` | 321 | `BeaconBlockHeader` |
-| `WireAttestation` | 368 | `Attestation` |
-| `WireAttestationElectra` | 394 | `ElectraAttestation` |
-| `WireDepositData` | 404 | `DepositData` |
-| `WireVoluntaryExit` | 422 | `VoluntaryExit` |
-| `WireSignedVoluntaryExit` | 430 | `SignedVoluntaryExit` |
+| Isomorphic | `Checkpoint`, `AttestationData`, `BeaconBlockHeader`, `DepositData`, `VoluntaryExit` | `ssz_container! { impl Type { fields… } }` decorate-macro (`ssz08_codec_impls!`) |
+| Not isomorphic (`Vec<u8>` JSON vs BitList / BitVector / `[u8; 96]`) | `Attestation`, `ElectraAttestation`, `SignedVoluntaryExit` | Custom `ssz` 0.9 + `ssz08` impls that treat the existing bytes as spec bitlist / bitvector / Bytes96 |
 
-### Deletion trigger (verbatim, `block_body.rs` 41–43)
-
-```text
-**Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
-against `ethereum_ssz` 0.9 (or workspace `ssz` aligns with the stack
-`ssz_types` implements); see plan §5 / F80 full unification (deferred).
-```
-
-That comment describes **Path A/B** (bump `ssz_types` to 0.11+ / drop workspace
-`ssz` 0.9). It is **not** satisfied at HEAD, and satisfying it as written is a
-workspace-wide `tree_hash` 0.9 → 0.10 upgrade.
-
-### ARCH-7f verdict: Path C holds
-
-Spike: `plan/architecture-2026-08-12/measurements/wire-twins-spike.md`.
-
-**Path C:** one struct per container; implement both trait sets on it
-(`ssz` 0.9 + `ssz08` 0.8). Dual `Encode`/`Decode` is legal Rust — the traits
-come from different crates, so there is no coherence conflict. `VariableList`
-element bounds are `ssz08::{Encode,Decode}` + `TreeHash`; they compiled when
-the element type was `crate::ElectraAttestation`.
+Naive decorate of `Vec<u8>` encodes List[byte] (signature and committee bits
+become **variable** fields). Empty-ops `EXTERNAL_*` body roots stay green
+anyway because empty `List[T, N]` HTR depends only on `N`. A non-empty
+Electra attestation-list encode/HTR KAT
+(`KAT_ELECTRA_ATTESTATION_LIST_*` in `crates/eth-types/src/block_body.rs`)
+is the proof the custom impls are spec SSZ.
 
 **Do not take Path A or Path B.** Path A is the `tree_hash` 0.10 workspace
-upgrade. Path B abandons 0.9. Neither is required for collapse.
+upgrade. Path B abandons 0.9. Path C does not need either.
 
-**Do not record a Branch-2 deferral.** The “wait until `ssz_types` is on 0.9”
-trigger is the Path A/B problem. Path C does not need it. ARCH-7h collapses
-the twins via Path C (five isomorphic twins by decorate-macro; the three
-`Vec<u8>` vs BitList/`[u8; 96]` twins need custom `ssz08` or a field-shape
-fix first). The spike prototype was **reverted**; the eight `Wire*` types
-remain at HEAD until 7h lands.
-
-Empty-list body KATs staying green is **not** proof that a non-empty Electra
-attestation list encodes identically after a naive field-type swap. 7h must
-add a non-empty attestation-list encode/HTR KAT before collapsing
-`WireAttestationElectra`.
+The old Path A/B trigger comment on the body module is replaced by the
+Path C record (date + baseline). Dual `ethereum_ssz` in `Cargo.lock` is
+expected until a later, separately sized stack unification.
 
 ---
 
@@ -227,10 +206,10 @@ variant and new body structs.
 
 - [ ] Decide: new SSZ body, or share the previous layout (as Fulu shares Electra)?
 - [ ] If new: add `BeaconBlockBody{Fork}` + `BlindedBeaconBlockBody{Fork}` in
-      `crates/eth-types/src/block_body.rs` next to Electra (566 / 598) and Deneb
-      (638 / 670). Spec field **order** is merkleization-sensitive.
+      `crates/eth-types/src/block_body.rs` next to Electra (915 / 947) and Deneb
+      (987 / 1019). Spec field **order** is merkleization-sensitive.
 - [ ] Wire decode helpers (`decode_beacon_block_body_*`) and both HTR functions
-      (`body_tree_hash_root_for_layout` 757, `blinded_body_tree_hash_root_for_layout` 770).
+      (`body_tree_hash_root_for_layout` 1106, `blinded_body_tree_hash_root_for_layout` 1119).
 - [ ] Prefer crate-root types at the API boundary. New `Wire*` twins are forbidden
       (Path C; see §3). `EXEMPTIONS` must not grow.
 
@@ -256,7 +235,7 @@ variant and new body structs.
 - [ ] Independent `remerkleable` (or consensus-spec) vectors for full + blinded
       **body** and **block** roots. Name them `EXTERNAL_{FORK}_BODY_ROOT_HEX` /
       `EXTERNAL_{FORK}_BLOCK_ROOT_HEX` (and blinded pair) next to the six
-      constants at `crates/eth-types/src/block_body.rs` 794–825.
+      constants at `crates/eth-types/src/block_body.rs` 1143–1174.
 - [ ] Assert them from tests whose names match `*(tree_hash|signing_root|_root)`
       and whose **bodies** mention the `EXTERNAL_*` token (copy
       `crates/eth-types/src/block.rs` 669–740).

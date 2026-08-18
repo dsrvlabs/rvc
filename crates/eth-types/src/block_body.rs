@@ -19,21 +19,22 @@
 //! - [`BeaconBlockBodyDeneb`] / [`BlindedBeaconBlockBodyDeneb`] — 12 fields
 //!   (no `execution_requests`; pre-Electra attestation limits/types)
 //!
-//! # Dual-SSZ wire twins
+//! # Dual SSZ — Path C (one struct per container)
 //!
-//! Crate-root types use workspace `ssz` 0.9 (`ssz_derive`); body containers need
-//! `ssz_types` 0.10, which implements `Encode`/`Decode` only against
-//! `ethereum_ssz` 0.8. Eight body-path sub-containers therefore exist as
-//! encode/decode-facing `Wire*` twins of the crate-root forms. Prefer the
-//! crate-root type at the API boundary; use `Wire*` only inside typed body SSZ.
+//! Crate-root types carry both workspace `ssz` 0.9 and `ssz08` 0.8
+//! `Encode`/`Decode`. Typed bodies still encode through `ssz08` because
+//! `ssz_types` 0.10.1 implements those traits against 0.8 only.
 //!
-//! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
-//! | --- | --- | --- |
+//! Isomorphic containers (primitive / already-aliased fields) use
+//! `ssz_container! { impl Type { fields… } }`. JSON `Vec<u8>` fields that are
+//! spec bitlist / bitvector / Bytes96 get **custom** impls — naive decorate
+//! encodes `Vec<u8>` as List[byte] (variable signature / committee bits).
 //!
-
-//! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
-//! against `ethereum_ssz` 0.9 (or workspace `ssz` aligns with the stack
-//! `ssz_types` implements); see plan §5 / F80 full unification (deferred).
+//! **Path C landed ARCH-7h, 2026-08-18, baseline `ce9048c`.** Do not
+//! reintroduce encode/decode-facing twins. Path A (`ssz_types` 0.11+ /
+//! workspace `tree_hash` 0.10) and Path B (drop `ssz` 0.9) are not required;
+//! see `docs/forks.md` §3 and
+//! `plan/architecture-2026-08-12/measurements/wire-twins-spike.md`.
 
 use ssz08::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder, BYTES_PER_LENGTH_OFFSET};
 use ssz_types::{
