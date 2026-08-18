@@ -29,7 +29,6 @@
 //!
 //! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
 //! | --- | --- | --- |
-//! | [`WireBeaconBlockHeader`] | [`crate::BeaconBlockHeader`] | same |
 //! | [`WireAttestation`] | [`crate::Attestation`] | same |
 //! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
 //! | [`WireDepositData`] | [`crate::DepositData`] | same |
@@ -348,20 +347,19 @@ ssz_container! {
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireBeaconBlockHeader {
-        pub slot: u64,
-        pub proposer_index: u64,
-        pub parent_root: [u8; 32],
-        pub state_root: [u8; 32],
-        pub body_root: [u8; 32],
+    impl crate::BeaconBlockHeader {
+        slot: crate::Slot,
+        proposer_index: u64,
+        parent_root: crate::Root,
+        state_root: crate::Root,
+        body_root: crate::Root,
     }
 }
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct SignedBeaconBlockHeader {
-        pub message: WireBeaconBlockHeader,
+        pub message: crate::BeaconBlockHeader,
         pub signature: [u8; 96],
     }
 }
@@ -1087,6 +1085,33 @@ mod tests {
         assert_eq!(back, data);
     }
 
+    /// remerkleable header from the non-empty-ops fixture (slot=1, proposer=2).
+    const SPEC_BEACON_BLOCK_HEADER_SSZ_HEX: &str = concat!(
+        "01000000000000000200000000000000",
+        "abababababababababababababababababababababababababababababababab",
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    );
+    const SPEC_BEACON_BLOCK_HEADER_HTR_HEX: &str =
+        "67fcec3237c5acf5a660dda06f4fbe5af7a87620dd6c3cdd4cc9d6b1240f3e29";
+
+    #[test]
+    fn test_beacon_block_header_ssz09_and_ssz08_match_spec_bytes() {
+        let header = crate::BeaconBlockHeader {
+            slot: 1,
+            proposer_index: 2,
+            parent_root: [0xab; 32],
+            state_root: [0xcd; 32],
+            body_root: [0xef; 32],
+        };
+        let expected = hex::decode(SPEC_BEACON_BLOCK_HEADER_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&header), expected);
+        assert_eq!(Encode::as_ssz_bytes(&header), expected);
+        assert_eq!(header.tree_hash_root(), hex32(SPEC_BEACON_BLOCK_HEADER_HTR_HEX));
+        let back = <crate::BeaconBlockHeader as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, header);
+    }
+
     #[test]
     fn test_beacon_block_body_electra_htr_matches_external_vector() {
         let body = external_vector_electra_body();
@@ -1331,7 +1356,7 @@ mod tests {
         // Non-empty lists exercise VariableList of composites + FixedVector proof.
         let mut body = external_vector_electra_body();
 
-        let header = WireBeaconBlockHeader {
+        let header = crate::BeaconBlockHeader {
             slot: 1,
             proposer_index: 2,
             parent_root: [0xab; 32],
@@ -1342,7 +1367,7 @@ mod tests {
         let slashing = ProposerSlashing {
             signed_header_1: signed.clone(),
             signed_header_2: SignedBeaconBlockHeader {
-                message: WireBeaconBlockHeader {
+                message: crate::BeaconBlockHeader {
                     slot: 1,
                     proposer_index: 2,
                     parent_root: [0xab; 32],
