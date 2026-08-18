@@ -98,6 +98,33 @@ fn dvt_enforcement_variant_is_rejected_on_the_v2_service() {
     );
 }
 
+/// Inverse C9: a DVT-service slashable kind that is not `SlashingScopedShare`.
+#[test]
+fn dvt_service_slashable_kind_must_be_slashing_scoped_share() {
+    let scratch = SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignBeaconBlock",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::NonSlashable,
+        gate_method: None,
+    };
+    let err = scratch
+        .enforcement_error()
+        .expect("DVT slashable kind classified NonSlashable must be rejected");
+    assert!(err.contains("SlashingScopedShare"), "rejection must name the required routing: {err}");
+
+    let gated = SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignBeaconBlock",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_block"),
+    };
+    let err =
+        gated.enforcement_error().expect("DVT slashable kind classified Gated must be rejected");
+    assert!(err.contains("SlashingScopedShare"), "rejection must name the required routing: {err}");
+}
+
 /// C9: `SlashingScopedShare` with `gate_method = None` is a hard failure.
 #[test]
 fn slashing_scoped_share_requires_a_named_stage_method() {

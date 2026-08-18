@@ -236,3 +236,12 @@ jobs:
       # G-3 (`tests/env_allowlist.rs`: env allow-list + figment absence) is in this package.
       - name: Run architecture tests
         run: cargo nextest run -p rvc-architecture-tests
+
+      # ARCH-7j / M5: enumeration gate under `--features dvt`.
+      # protoc is already installed above (signer-proto build.rs).
+      # Clippy `--features dvt` stays on the check job (Gate 1 secret-sink);
+      # this step is the test run those cfg(dvt) gates need.
+      # `--final-status-level pass` lists passed names so a vacuous empty
+      # feature-gated suite cannot hide in a green summary.
+      - name: Run signer-server DVT enumeration gate
+        run: cargo nextest run -p rvc-signer-server --features dvt --final-status-level pass

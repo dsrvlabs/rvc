@@ -376,9 +376,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
     // ── PartialSignSyncCommittee ──────────────────────────────────────────────
 
-    /// `signer.v2.PeerSignerService/PartialSignSyncCommittee`.
+    /// `signer.v2.PeerSignerService/PartialSignSyncCommittee` (ARCH-7j).
     ///
-    /// Not slashable (FR-P0-3); not a `SLASHING_STAGE_METHODS` registry entry.
+    /// Enforcement: `GateRouting::NonSlashable` (FR-P0-3 / DOMAIN_SYNC_COMMITTEE).
+    /// No `SLASHING_STAGE_METHODS` member — sync is not slashable.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_sync_committee",
         skip_all,

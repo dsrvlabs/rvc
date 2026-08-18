@@ -95,6 +95,18 @@ fn live_listener_serves_v2_only() {
     );
 }
 
+/// ARCH-7j: the DVT peer service tonic name matches the registry constant.
+#[cfg(feature = "dvt")]
+#[test]
+fn live_listener_dvt_peer_service_name_matches_registry() {
+    use signer_server::PeerSignerServiceServerV2;
+    assert_eq!(
+        <PeerSignerServiceServerV2<()> as NamedService>::NAME,
+        DVT_PEER_SERVICE,
+        "PeerSignerServiceServerV2 NamedService name must equal DVT_PEER_SERVICE"
+    );
+}
+
 /// M4 core (zero v1 raw-root on the live listener): no enumerated method is a
 /// v1 raw-root entry — neither by `MessageKind::V1RawRoot` nor by carrying the
 /// retired v1 service name.

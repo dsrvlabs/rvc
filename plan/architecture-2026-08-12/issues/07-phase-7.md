@@ -1071,13 +1071,13 @@ vacuously, and that is the failure mode here.
 
 **Acceptance criteria.**
 
-- [ ] `cargo nextest run -p rvc-signer-server --features dvt` runs in the `arch-gates` job and passes.
-- [ ] The step's output demonstrably includes the `#[cfg(feature = "dvt")]` tests (non-vacuity).
-- [ ] Removing a registry entry turns the step RED while the default run stays green (output in PR).
-- [ ] The existing `cargo clippy -p rvc-signer-bin --all-targets --features dvt` step (`:46-47`) is
+- [x] `cargo nextest run -p rvc-signer-server --features dvt` runs in the `arch-gates` job and passes.
+- [x] The step's output demonstrably includes the `#[cfg(feature = "dvt")]` tests (non-vacuity).
+- [x] Removing a registry entry turns the step RED while the default run stays green (output in PR).
+- [x] The existing `cargo clippy -p rvc-signer-bin --all-targets --features dvt` step (`:46-47`) is
       **kept** — it is Gate 1 secret-sink coverage and is not what this replaces.
-- [ ] CI wall-clock increase recorded in the PR (NFR-5).
-- [ ] **M5:** the third and last of the +3 CI checks is landed (`prd.md:995`); with G-6 from
+- [x] CI wall-clock increase recorded in the PR (NFR-5).
+- [x] **M5:** the third and last of the +3 CI checks is landed (`prd.md:995`); with G-6 from
       `ARCH-7a` as the 7th gate, M5's enumerated target is reached.
 
 ---

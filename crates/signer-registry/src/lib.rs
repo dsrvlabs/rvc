@@ -54,6 +54,13 @@ pub enum MessageKind {
     V1RawRoot,
 }
 
+impl MessageKind {
+    /// Slashable kinds must never be `GateRouting::NonSlashable`.
+    pub const fn is_slashable(self) -> bool {
+        matches!(self, Self::Block | Self::Attestation | Self::Aggregate | Self::ElectraAggregate)
+    }
+}
+
 /// Whether a signing method routes through the slashing/doppelganger `SigningGate`.
 ///
 /// An enum (rather than a bare `bool`) so a mis-typed registry entry for a slashable
@@ -122,7 +129,15 @@ impl SigningMethod {
                     }
                 }
             }
-            GateRouting::Gated | GateRouting::NonSlashable => None,
+            // Inverse: a slashable kind on the DVT service that is not
+            // SlashingScopedShare would bypass the registered share-signing contract.
+            GateRouting::Gated | GateRouting::NonSlashable => {
+                if self.service == DVT_PEER_SERVICE && self.message_kind.is_slashable() {
+                    Some("DVT-service slashable kind must be GateRouting::SlashingScopedShare")
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -173,7 +188,8 @@ pub const SLASHING_STAGE_METHODS: &[&str] = &["stage_block", "stage_attestation"
 /// Only live-listener signing methods are listed:
 /// - `list_public_keys` and `get_status` are informational, not signing methods.
 /// - The v1 raw-root `sign` RPC has been removed from the live listener (SS-1, Issue 2.2).
-/// - DVT `PartialSignSyncCommittee` is not slashable and is not a slashing-stage method.
+/// - DVT `PartialSignSyncCommittee` is registered as [`GateRouting::NonSlashable`]
+///   with `gate_method = None` (sync is not slashable; no stage method).
 ///
 /// Service path is the protobuf fully-qualified service name (`package.ServiceName`).
 pub const REGISTERED_METHODS: &[SigningMethod] = &[
@@ -262,5 +278,13 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         message_kind: MessageKind::Attestation,
         gate_routing: GateRouting::SlashingScopedShare,
         gate_method: Some("stage_attestation"),
+    },
+    #[cfg(feature = "dvt")]
+    SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignSyncCommittee",
+        message_kind: MessageKind::SyncMessage,
+        gate_routing: GateRouting::NonSlashable,
+        gate_method: None,
     },
 ];

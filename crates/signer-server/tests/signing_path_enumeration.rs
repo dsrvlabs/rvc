@@ -173,11 +173,11 @@ fn all_entries_use_v2_service_path() {
 #[test]
 fn registered_methods_count_matches_live_listener() {
     // Update when a v2 (or DVT) signing method is added/removed
-    // (see crates/signer-registry/src/lib.rs). 10 default / 12 with `--features dvt`.
+    // (see crates/signer-registry/src/lib.rs). 10 default / 13 with `--features dvt`.
     #[cfg(not(feature = "dvt"))]
     const EXPECTED: usize = 10;
     #[cfg(feature = "dvt")]
-    const EXPECTED: usize = 12;
+    const EXPECTED: usize = 13;
     let run = if cfg!(feature = "dvt") { " --features dvt" } else { " default features" };
     assert_eq!(
         signer_registry::REGISTERED_METHODS.len(),
@@ -327,6 +327,27 @@ fn dvt_partial_sign_methods_are_registered() {
     assert_eq!(att.gate_method, Some("stage_attestation"));
     assert!(SLASHING_STAGE_METHODS.contains(&att.gate_method.unwrap()));
     assert!(att.enforcement_error().is_none(), "{:?}", att.enforcement_error());
+
+    // proto/signer.v2.proto PeerSignerService — third live RPC, non-slashable.
+    let sync = find("PartialSignSyncCommittee")
+        .expect("PartialSignSyncCommittee must be in REGISTERED_METHODS under --features dvt");
+    assert_eq!(sync.message_kind, MessageKind::SyncMessage);
+    assert_eq!(sync.gate_routing, GateRouting::NonSlashable);
+    assert_eq!(sync.gate_method, None);
+    assert!(sync.enforcement_error().is_none(), "{:?}", sync.enforcement_error());
+
+    // Unlisted live DVT RPC fails CI: registry rows must match the proto inventory.
+    const LIVE_DVT_RPCS: &[&str] =
+        &["PartialSignBeaconBlock", "PartialSignAttestationData", "PartialSignSyncCommittee"];
+    let dvt_count = REGISTERED_METHODS.iter().filter(|m| m.service == DVT_PEER_SERVICE).count();
+    assert_eq!(
+        dvt_count,
+        LIVE_DVT_RPCS.len(),
+        "REGISTERED_METHODS DVT rows must match proto PeerSignerService RPCs {LIVE_DVT_RPCS:?}"
+    );
+    for method in LIVE_DVT_RPCS {
+        assert!(find(method).is_some(), "live DVT RPC {method} is missing from REGISTERED_METHODS");
+    }
 }
 
 /// ARCH-7i / C9: the new enforcement variant must never appear on the v2 service.
