@@ -10,6 +10,10 @@ Checked-in baselines for success metrics that later phases must improve against.
 - **M3 post-ADR-005 (Phase 5 X6/X7/X8):** recorded under **ARCH-5m** on
   `b68d32b` against the same ARCH-5a profile. Cites the baseline measured
   commit `11bb5696b6025ee8dd19b17a2c1dbbf066e25c2b`.
+- **M3 scale 200×200 ms (Phase 7 P1-15b):** recorded under **ARCH-7m** on
+  `41e7646` against the same ARCH-5a profile. Cites
+  [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) and
+  [`m3-post-adr005.md`](./m3-post-adr005.md).
 
 | File | Metric | Role |
 |---|---|---|
@@ -18,6 +22,7 @@ Checked-in baselines for success metrics that later phases must improve against.
 | [`m1-m2-post-phase3.md`](./m1-m2-post-phase3.md) | **M1/M2 after ADR-004** (ARCH-3k) | M1 = 0 at 60 s and 80 s; M2 p99 0 ms at slot start (≤1 s / ≤2 s) |
 | [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) | **M3** slashing tx-hold (ARCH-5a / ARCH-5b) | Three-run median; concurrency = 1; observation-window decision (keep current series, add reserve-tx in 5l); per-sign budget = 3999/200 = 19.995 ms |
 | [`m3-post-adr005.md`](./m3-post-adr005.md) | **M3 after ADR-005** (ARCH-5m) | Three-run median under **both** windows; X6 unmet (reserve-tx p99 917 ms ≫ 19.995 ms); fsync named; group commit filed; X7 rollback; X8 no G6 |
+| [`m3-scale-200keys-200ms.md`](./m3-scale-200keys-200ms.md) | **M3 scale 200×200 ms** (ARCH-7m) | Post-ADR-005 tree; 0 missed deadlines; p99 1131 ms vs 19.995 ms; fsync still binds; no group commit; A-A8 signer-server only |
 | [`wire-twins-spike.md`](./wire-twins-spike.md) | **ARCH-7f** `Wire*` collapse spike | **Path C**; docs only — prototype must not merge |
 
 ---

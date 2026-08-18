@@ -1191,17 +1191,17 @@ measurement task.
 
 **Acceptance criteria.**
 
-- [ ] `plan/architecture-2026-08-12/measurements/m3-scale-200keys-200ms.md` exists and is checked in —
+- [x] `plan/architecture-2026-08-12/measurements/m3-scale-200keys-200ms.md` exists and is checked in —
       "documented" means **a file in this directory**, not a run log or a PR comment
       (`prd.md:934`, `project-plan.md:714`).
-- [ ] Zero missed attestation deadlines at 200 keys / 200 ms.
-- [ ] `rvc_signer_slashing_tx_hold_duration_ms` p99 recorded per kind and compared against the
+- [x] Zero missed attestation deadlines at 200 keys / 200 ms.
+- [x] `rvc_signer_slashing_tx_hold_duration_ms` p99 recorded per kind and compared against the
       Phase-5 pre-redesign baseline; no single hold exceeds the remote-signer timeout.
-- [ ] The environment is recorded in enough detail to reproduce.
-- [ ] The write-up states that this validates the `signer-server` path (A-A8), and names the VC path
+- [x] The environment is recorded in enough detail to reproduce.
+- [x] The write-up states that this validates the `signer-server` path (A-A8), and names the VC path
       as unvalidated at this count.
-- [ ] The calibration (deliberately-failing) run is recorded alongside the passing one.
-- [ ] If fsync binds, it is recorded as follow-on work — **no group-commit change lands here**.
+- [x] The calibration (deliberately-failing) run is recorded alongside the passing one.
+- [x] If fsync binds, it is recorded as follow-on work — **no group-commit change lands here**.
 
 ---
 
