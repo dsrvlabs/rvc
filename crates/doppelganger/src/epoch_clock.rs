@@ -46,8 +46,7 @@ impl MonotonicEpochClock {
 
     /// Test/helper constructor with explicit anchors.
     ///
-    /// Production paths use [`Self::new`]; tests and
-    /// [`crate::DoppelgangerService::with_start_time`] use this to drive
+    /// Production paths use [`Self::new`]; tests use this to drive
     /// deterministic epoch values.
     pub fn with_start_time(
         genesis_time: u64,

@@ -12,7 +12,7 @@
 //!
 //! Detected liveness permanently closes the gate for that key (machine semantics).
 //! A clean fully-observed window opens the gate. This loop is the sole production
-//! doppelganger mechanism (the backward one-shot `DoppelgangerService` is not wired).
+//! doppelganger mechanism.
 //!
 //! # Multi-BN OR-merge (ARCH-P1-13)
 //!

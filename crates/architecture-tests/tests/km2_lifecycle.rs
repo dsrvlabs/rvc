@@ -10,7 +10,7 @@
 //!   time-based / log-only / test-double implementors and **fatal** for
 //!   machine-backed ones. This gate is therefore a **classification**, not a ban.
 //!
-//! Four load-bearing clauses:
+//! Five load-bearing clauses:
 //!
 //! 1. Every workspace `impl DoppelgangerMonitor for <T>` appears in **exactly
 //!    one** of [`MUST_OVERRIDE_CANCEL`] / [`DEFAULT_IS_SAFE`]. A new
@@ -20,6 +20,8 @@
 //!    `fn cancel_monitoring` — the collapse detector ADR-015 names.
 //! 4. `DoppelgangerLifecycle::on_delete` still calls `cancel_monitoring`
 //!    paired with `remove_validator` (HTTP handlers must still go through it).
+//! 5. ARCH-7b: the GVR-blind slashing-history reader identifier is gone from
+//!    `crates/` and `bin/` (`no_legacy_slashing_history_reader_symbol`).
 //!
 //! The behavioural half (`stop_monitoring` ⇒ `Pending`, `cancel_monitoring` ⇒
 //! `Unmonitored`) stays in `keymanager_adapters/tests/misc_adapters.rs` and is
@@ -1011,5 +1013,63 @@ fn km2_scanner_flags_unpaired_delete() {
     assert!(
         paired_delete_fns(commented).is_empty(),
         "commented remove_validator must not satisfy the pairing clause"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ARCH-7b: GVR-blind reader identifier is gone
+// ---------------------------------------------------------------------------
+
+/// Split so this file is not itself a hit for the identifier.
+fn legacy_slashing_history_reader_ident() -> String {
+    format!("{}{}", "Legacy", "SlashingHistoryReader")
+}
+
+fn collect_all_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            collect_all_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn no_legacy_slashing_history_reader_symbol() {
+    let needle = legacy_slashing_history_reader_ident();
+    let root = workspace_root();
+    let mut files = Vec::new();
+    collect_all_files(&root.join("crates"), &mut files);
+    collect_all_files(&root.join("bin"), &mut files);
+    assert!(
+        files.len() > 100,
+        "scanned only {} files under crates/ and bin/; walk likely broke",
+        files.len()
+    );
+
+    let mut hits = Vec::new();
+    for file in &files {
+        let Ok(src) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        if src.contains(&needle) {
+            hits.push(file.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"));
+        }
+    }
+    hits.sort();
+    assert!(
+        hits.is_empty(),
+        "ARCH-7b: `{needle}` must not appear under crates/ or bin/ (got {} hit(s)):\n  {}",
+        hits.len(),
+        hits.join("\n  ")
     );
 }

@@ -422,14 +422,14 @@ file list.
 
 **Acceptance criteria.**
 
-- [ ] `rg 'LegacySlashingHistoryReader'` returns nothing under `crates/` and `bin/`.
-- [ ] `rg 'DoppelgangerService'` returns nothing under `crates/` and `bin/` (doc comments included).
-- [ ] `BeaconLivenessAdapter` survives and its test at `doppelganger_adapter.rs:147` still passes.
-- [ ] `crates/doppelganger/tests/clock_m7.rs` still asserts the `MonotonicEpochClock` formula.
-- [ ] `cargo doc --workspace` produces no new broken intra-doc link warnings.
-- [ ] `ARCHITECTURE.md` regenerates byte-identically after the classification-neutral edit (C9
+- [x] `rg 'LegacySlashingHistoryReader'` returns nothing under `crates/` and `bin/`.
+- [x] `rg 'DoppelgangerService'` returns nothing under `crates/` and `bin/` (doc comments included).
+- [x] `BeaconLivenessAdapter` survives and its test at `doppelganger_adapter.rs:147` still passes.
+- [x] `crates/doppelganger/tests/clock_m7.rs` still asserts the `MonotonicEpochClock` formula.
+- [x] `cargo doc --workspace` produces no new broken intra-doc link warnings.
+- [x] `ARCHITECTURE.md` regenerates byte-identically after the classification-neutral edit (C9
       anchor 1) — this deletes **types**, not a workspace member, so the member count stays 28.
-- [ ] G-6 (7a) still green.
+- [x] G-6 (7a) still green.
 
 ---
 

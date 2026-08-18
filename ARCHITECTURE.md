@@ -550,9 +550,9 @@ Builder registration management and proposer preparation.
 
 Detects duplicate validator instances before activating signing (Lodestar pattern).
 
-- **`DoppelgangerService`** — 2-epoch monitoring via `post_validator_liveness` endpoint.
+- **`ForwardWindowMachine`** — 2-epoch forward-window monitoring via `post_validator_liveness`.
 - **Restart-aware** — Validators with recent slashing DB entries skip detection.
-- **`DoppelgangerStatus`** — `Safe`, `DetectionInProgress`, `DoppelgangerDetected`.
+- **`ForwardWindowStatus`** — `Unmonitored`, `Pending`, `Safe`, `Detected`.
 
 ### `crates/beacon` — Beacon Node HTTP Client
 
