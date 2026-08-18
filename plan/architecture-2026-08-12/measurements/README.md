@@ -18,6 +18,7 @@ Checked-in baselines for success metrics that later phases must improve against.
 | [`m1-m2-post-phase3.md`](./m1-m2-post-phase3.md) | **M1/M2 after ADR-004** (ARCH-3k) | M1 = 0 at 60 s and 80 s; M2 p99 0 ms at slot start (≤1 s / ≤2 s) |
 | [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) | **M3** slashing tx-hold (ARCH-5a / ARCH-5b) | Three-run median; concurrency = 1; observation-window decision (keep current series, add reserve-tx in 5l); per-sign budget = 3999/200 = 19.995 ms |
 | [`m3-post-adr005.md`](./m3-post-adr005.md) | **M3 after ADR-005** (ARCH-5m) | Three-run median under **both** windows; X6 unmet (reserve-tx p99 917 ms ≫ 19.995 ms); fsync named; group commit filed; X7 rollback; X8 no G6 |
+| [`wire-twins-spike.md`](./wire-twins-spike.md) | **ARCH-7f** `Wire*` collapse spike | **Path C**; docs only — prototype must not merge |
 
 ---
 

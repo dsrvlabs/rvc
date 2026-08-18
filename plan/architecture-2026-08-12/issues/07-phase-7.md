@@ -792,13 +792,13 @@ policy exists to catch, and the spike ends there.
 
 **Acceptance criteria.**
 
-- [ ] A written verdict naming **one** path as chosen or all three as blocked, with `cargo check` /
+- [x] A written verdict naming **one** path as chosen or all three as blocked, with `cargo check` /
       `cargo nextest` output pasted in.
-- [ ] If Path C: a working single-container prototype and the `VariableList`-element case verified.
+- [x] If Path C: a working single-container prototype and the `VariableList`-element case verified.
 - [ ] If blocked: the **specific** blocking fact (compiler error, or the counted `tree_hash` upgrade
       surface) recorded, so `ARCH-7h`'s deferral carries a trigger a future reader can re-test.
-- [ ] The six `EXTERNAL_*` root assertions in `block.rs:671-738` are unchanged in the prototype.
-- [ ] **No commit lands on `develop` from this issue.**
+- [x] The six `EXTERNAL_*` root assertions in `block.rs:671-738` are unchanged in the prototype.
+- [x] **No product-code commit lands on `develop` from this issue.** (Verdict measurement only; prototype reverted.)
 
 ---
 
