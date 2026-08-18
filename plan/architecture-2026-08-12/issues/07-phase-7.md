@@ -919,15 +919,15 @@ deferral**, not a skipped issue:
 
 **Acceptance criteria.**
 
-- [ ] **Branch 1:** `rg 'Wire(Checkpoint|AttestationData|BeaconBlockHeader|Attestation|AttestationElectra|DepositData|VoluntaryExit|SignedVoluntaryExit)'`
+- [x] **Branch 1:** `rg 'Wire(Checkpoint|AttestationData|BeaconBlockHeader|Attestation|AttestationElectra|DepositData|VoluntaryExit|SignedVoluntaryExit)'`
       returns nothing; one struct per container; all six `EXTERNAL_*` root assertions green and
       **unchanged in value**; SSZ round-trips byte-identical; `EXEMPTIONS` has not grown.
 - [ ] **Branch 2:** the trigger, the blocking fact, the re-test procedure and the date are in
       `docs/forks.md`; the `block_body.rs` comment is updated; a CI detector fires when the trigger
       becomes satisfiable; the PR states plainly that M9's `Wire*` entry is **not** closed.
-- [ ] Either branch: `cargo nextest run -p rvc-eth-types` and the workspace run green;
+- [x] Either branch: `cargo nextest run -p rvc-eth-types` and the workspace run green;
       `ARCHITECTURE.md` regenerates byte-identically (C9 anchor 1 — no crate boundary moved).
-- [ ] Either branch: `docs/forks.md` §3 tells the next fork engineer what is true.
+- [x] Either branch: `docs/forks.md` §3 tells the next fork engineer what is true.
 
 ---
 
