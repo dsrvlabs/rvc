@@ -1152,6 +1152,88 @@ mod tests {
         assert_eq!(back, exit);
     }
 
+    /// remerkleable Electra `Attestation` matching `aggregation.rs` sample:
+    /// Bitlist[131072] of 31 set bits (`0xffffffff`), data as
+    /// [`SPEC_ATTESTATION_DATA_HTR_HEX`], signature `[0xaa;96]`,
+    /// Bitvector[64] = `[0x01;8]`.
+    const KAT_ELECTRA_ATTESTATION_SSZ_HEX: &str = concat!(
+        "ec000000",
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0101010101010101",
+        "ffffffff",
+    );
+    const KAT_ELECTRA_ATTESTATION_HTR_HEX: &str =
+        "26b23c318b00c7e774670fa8c54f3ba256018f798226d717df0d82c2e143914f";
+    /// `List[Attestation, MAX_ATTESTATIONS_ELECTRA=8]` of one
+    /// [`KAT_ELECTRA_ATTESTATION_SSZ_HEX`] element (remerkleable).
+    const KAT_ELECTRA_ATTESTATION_LIST_SSZ_HEX: &str = concat!(
+        "04000000",
+        "ec000000",
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0101010101010101",
+        "ffffffff",
+    );
+    const KAT_ELECTRA_ATTESTATION_LIST_ROOT_HEX: &str =
+        "64a119d1221d09e3da3eb8e25bd302f4ccd6498ba3d637bbf4411145c7633af1";
+
+    fn kat_electra_wire_attestation() -> WireAttestationElectra {
+        WireAttestationElectra {
+            aggregation_bits: BitList::<MaxValidatorsPerSlot>::from_ssz_bytes(&[0xff; 4])
+                .expect("31-bit bitlist"),
+            data: crate::AttestationData {
+                slot: 100,
+                index: 0,
+                beacon_block_root: [1u8; 32],
+                source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: [0xaa; 96],
+            committee_bits: BitVector::<MaxCommitteesPerSlot>::from_ssz_bytes(&[0x01; 8])
+                .expect("64-bit bitvector"),
+        }
+    }
+
+    #[test]
+    fn test_electra_attestation_list_encode_and_tree_hash_root() {
+        let att = kat_electra_wire_attestation();
+        assert_eq!(
+            att.tree_hash_root(),
+            hex32(KAT_ELECTRA_ATTESTATION_HTR_HEX),
+            "single Electra attestation HTR must match remerkleable KAT"
+        );
+        assert_eq!(
+            Encode::as_ssz_bytes(&att),
+            hex::decode(KAT_ELECTRA_ATTESTATION_SSZ_HEX).expect("hex"),
+        );
+        let list = VariableList::<WireAttestationElectra, MaxAttestationsElectra>::from(vec![att]);
+        assert_eq!(
+            Encode::as_ssz_bytes(&list),
+            hex::decode(KAT_ELECTRA_ATTESTATION_LIST_SSZ_HEX).expect("hex"),
+            "non-empty Electra attestation list SSZ must match remerkleable"
+        );
+        assert_eq!(
+            list.tree_hash_root(),
+            hex32(KAT_ELECTRA_ATTESTATION_LIST_ROOT_HEX),
+            "non-empty Electra attestation list HTR must match remerkleable"
+        );
+    }
+
     #[test]
     fn test_beacon_block_body_electra_htr_matches_external_vector() {
         let body = external_vector_electra_body();
