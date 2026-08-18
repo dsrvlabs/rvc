@@ -15,7 +15,7 @@ use super::notifier::pubkey_hex;
 /// doppelganger `gate` for any key whose import timestamp is recent enough
 /// that the doppelganger window (`window_secs`) has not yet elapsed.
 ///
-/// Called once at startup after the `DoppelgangerGate` is created to restore
+/// Called once at startup after the doppelganger monitor is created to restore
 /// in-memory monitoring state that was lost when the process was restarted.
 ///
 /// # Safety guarantee
@@ -111,16 +111,21 @@ pub fn scan_and_rearm_gate(
         }
     }
 }
-#[derive(Default)]
-pub struct DoppelgangerMonitorAdapter;
 
-impl DoppelgangerMonitorAdapter {
+/// Always-safe [`DoppelgangerMonitor`] for the doppelganger opt-out path.
+///
+/// `is_doppelganger_safe` is always `true`. `cancel_monitoring` inherits the
+/// trait default (`stop_monitoring`) — both are log-only.
+#[derive(Default)]
+pub struct DoppelgangerDisabledMonitor;
+
+impl DoppelgangerDisabledMonitor {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl DoppelgangerMonitor for DoppelgangerMonitorAdapter {
+impl DoppelgangerMonitor for DoppelgangerDisabledMonitor {
     fn start_monitoring(&self, pubkey: Pubkey) {
         info!(pubkey = %pubkey_hex(pubkey), "Doppelganger monitoring requested for new key");
     }

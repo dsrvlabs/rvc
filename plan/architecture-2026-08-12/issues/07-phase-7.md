@@ -506,16 +506,16 @@ the exact failure C5 exists to prevent, and 7a's gate now fails CI if anyone tri
 
 **Acceptance criteria.**
 
-- [ ] `rg 'DoppelgangerGate'` returns nothing under `crates/` and `bin/`.
-- [ ] Exactly **two** production `impl DoppelgangerMonitor for` sites remain
+- [x] `rg 'DoppelgangerGate'` returns nothing under `crates/` and `bin/`.
+- [x] Exactly **two** production `impl DoppelgangerMonitor for` sites remain
       (`ForwardWindowMonitor`, `DoppelgangerDisabledMonitor`) — four mechanisms are now one plus the
       store-level flag, per ADR-015.
-- [ ] G-6's non-vacuity clause is green with its tables updated in the same PR.
-- [ ] The opt-out path's observable behaviour is unchanged: every key signing-enabled immediately, no
+- [x] G-6's non-vacuity clause is green with its tables updated in the same PR.
+- [x] The opt-out path's observable behaviour is unchanged: every key signing-enabled immediately, no
       re-arm scan, `handles.forward_window_machine.is_none()` (`enablement.rs:403`) still holds.
-- [ ] The DELETE path still calls `remove_validator` + `cancel_monitoring`; `misc_adapters.rs:112-122`
+- [x] The DELETE path still calls `remove_validator` + `cancel_monitoring`; `misc_adapters.rs:112-122`
       unchanged and green.
-- [ ] No new `.unwrap()` in production code (`CLAUDE.md`).
+- [x] No new `.unwrap()` in production code (`CLAUDE.md`).
 
 ---
 

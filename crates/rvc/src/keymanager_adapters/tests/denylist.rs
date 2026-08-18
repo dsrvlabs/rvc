@@ -74,8 +74,8 @@ fn test_delete_keystore_removes_import_meta_sidecar() {
 /// `scan_and_rearm_gate` must call `start_monitoring` for any key whose
 /// sidecar shows an import timestamp within the configured window.
 #[test]
+#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_rearms_recent_keys() {
-    use keymanager_api::gate::DoppelgangerGate;
     use keymanager_api::traits::DoppelgangerMonitor;
     let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xABu8; 48];
@@ -87,21 +87,21 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", now_unix)).unwrap();
 
     let window_secs = 768u64; // 2 epochs on mainnet
-    let gate = DoppelgangerGate::new(std::time::Duration::from_secs(window_secs));
+    let monitor = DoppelgangerDisabledMonitor::new();
 
-    // Before rearm: key is not monitored → safe by default
-    assert!(gate.is_doppelganger_safe(&pk), "key must be safe before monitoring starts");
+    // Opt-out monitor is always safe; re-arm is observed via the scan log.
+    assert!(monitor.is_doppelganger_safe(&pk), "key must be safe before monitoring starts");
 
-    scan_and_rearm_gate(dir.path(), &gate, window_secs);
+    scan_and_rearm_gate(dir.path(), &monitor, window_secs);
 
-    // After rearm: key is monitored → not safe yet (just started)
-    assert!(!gate.is_doppelganger_safe(&pk), "key must be blocked after gate is re-armed");
+    assert!(logs_contain("re-arming"), "recent import must be re-armed");
+    assert!(monitor.is_doppelganger_safe(&pk), "Disabled monitor stays safe after re-arm");
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.
 #[test]
+#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_skips_expired_keys() {
-    use keymanager_api::gate::DoppelgangerGate;
     let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xCDu8; 48];
     let window_secs = 768u64;
@@ -115,11 +115,11 @@ fn test_scan_and_rearm_gate_skips_expired_keys() {
     let meta_path = import_meta_path(dir.path(), &pk);
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", old_unix)).unwrap();
 
-    let gate = DoppelgangerGate::new(std::time::Duration::from_secs(window_secs));
-    scan_and_rearm_gate(dir.path(), &gate, window_secs);
+    let monitor = DoppelgangerDisabledMonitor::new();
+    scan_and_rearm_gate(dir.path(), &monitor, window_secs);
 
-    // Key should NOT be re-armed because window has expired
-    assert!(gate.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
+    assert!(!logs_contain("re-arming"), "expired key must not be re-armed");
+    assert!(monitor.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
 }
 
 // ── SEC-1a: real signing registry for list/has/delete ─────────────────

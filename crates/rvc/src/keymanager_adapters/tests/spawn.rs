@@ -124,16 +124,16 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
     )
     .unwrap();
 
-    // 1) Time-based gate path (no ForwardWindowMachine)
+    // 1) Disabled / no-machine path (window non-zero so re-arm still runs)
     {
         let config = spawn_test_config(&dir, true, "127.0.0.1:0");
         let deps = spawn_test_deps(dir.path(), None);
         let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
-        assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::TimeBasedGate);
+        assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::Disabled);
         assert!(!built.doppelganger_window.is_zero());
         assert!(
-            !built.doppelganger_monitor.is_doppelganger_safe(&pk),
-            "time-based gate must re-arm recent import exactly once"
+            built.doppelganger_monitor.is_doppelganger_safe(&pk),
+            "always-safe Disabled monitor stays safe after re-arm"
         );
     }
 
@@ -162,6 +162,66 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
         // Machine registered the key as Pending (import-strict)
         assert_eq!(machine.status(&crypto_pk), doppelganger::ForwardWindowStatus::Pending);
     }
+}
+
+/// Opt-out (`forward_window_machine: None`) selects the always-safe monitor.
+///
+/// Written against `DoppelgangerMonitorKind::Disabled` so this is RED until
+/// the TimeBasedGate rename lands (ARCH-7c).
+#[test]
+fn test_doppelganger_optout_monitor_reports_every_key_safe() {
+    let dir = TempDir::new().unwrap();
+    let mut config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    config.doppelganger_detection = false;
+    let deps = spawn_test_deps(dir.path(), None);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert_eq!(
+        built.monitor_kind,
+        DoppelgangerMonitorKind::Disabled,
+        "opt-out must select the always-safe Disabled monitor"
+    );
+    assert!(
+        built.doppelganger_window.is_zero(),
+        "opt-out window is Duration::ZERO (keys enable immediately)"
+    );
+
+    let unknown = test_pubkey(0x11);
+    assert!(
+        built.doppelganger_monitor.is_doppelganger_safe(&unknown),
+        "unknown key is immediately safe on the opt-out path"
+    );
+
+    let monitored = test_pubkey(0x22);
+    built.doppelganger_monitor.start_monitoring(monitored);
+    assert!(
+        built.doppelganger_monitor.is_doppelganger_safe(&monitored),
+        "freshly start_monitoring-ed key is immediately safe on the opt-out path"
+    );
+}
+
+/// Zero window must skip `scan_and_rearm_gate` (spawn.rs re-arm guard).
+#[test]
+#[tracing_test::traced_test]
+fn test_doppelganger_optout_rearm_is_not_invoked_on_zero_window() {
+    let dir = TempDir::new().unwrap();
+    let pk = test_pubkey(0x33);
+    let now_unix =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(
+        import_meta_path(dir.path(), &pk),
+        format!("{{\"imported_unix_seconds\":{now_unix}}}"),
+    )
+    .unwrap();
+
+    let mut config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    config.doppelganger_detection = false;
+    let deps = spawn_test_deps(dir.path(), None);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert!(built.doppelganger_window.is_zero());
+    assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::Disabled);
+    assert!(!logs_contain("re-arming"), "zero window must not invoke scan_and_rearm_gate");
 }
 
 /// Machine present → ForwardWindow monitor is selected.

@@ -6,17 +6,19 @@
 //!   - Once the window elapses, `doppelganger_safe` flips to `true` and
 //!     the validator is enabled in the validator store.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::routing::get;
 use axum::Router;
+use common::PendingSetMonitor;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use rvc_keymanager_api::error::ApiError;
-use rvc_keymanager_api::gate::DoppelgangerGate;
 use rvc_keymanager_api::handlers::{import_keystores, list_keystores, AppState};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
@@ -191,7 +193,7 @@ fn keystore_json_for(pubkey: &Pubkey) -> String {
 
 fn make_state(
     vm: Arc<SpyValidatorManager>,
-    gate: Arc<DoppelgangerGate>,
+    monitor: Arc<PendingSetMonitor>,
     window: Duration,
 ) -> Arc<AppState> {
     Arc::new(AppState {
@@ -200,7 +202,7 @@ fn make_state(
         validator_manager: Arc::clone(&vm) as Arc<dyn ValidatorManager>,
         doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
             window,
-            gate,
+            monitor,
             Arc::clone(&vm) as Arc<dyn ValidatorManager>,
         )),
         remote_key_manager: Arc::new(NoopRemoteKeyManager),
@@ -251,8 +253,8 @@ async fn test_imported_key_runs_doppelganger() {
 
     let pubkey = test_pubkey();
     let vm = Arc::new(SpyValidatorManager::new());
-    let gate = Arc::new(DoppelgangerGate::new(DOPPELGANGER_WINDOW));
-    let state = make_state(vm.clone(), gate, DOPPELGANGER_WINDOW);
+    let monitor = Arc::new(PendingSetMonitor::new());
+    let state = make_state(vm.clone(), monitor, DOPPELGANGER_WINDOW);
     let app = make_router(state);
 
     // POST import the keystore
@@ -297,8 +299,8 @@ async fn test_imported_key_attesting_after_window() {
 
     let pubkey = test_pubkey();
     let vm = Arc::new(SpyValidatorManager::new());
-    let gate = Arc::new(DoppelgangerGate::new(DOPPELGANGER_WINDOW));
-    let state = make_state(vm.clone(), gate, DOPPELGANGER_WINDOW);
+    let monitor = Arc::new(PendingSetMonitor::new());
+    let state = make_state(vm.clone(), monitor, DOPPELGANGER_WINDOW);
     let app = make_router(state);
 
     // POST import the keystore

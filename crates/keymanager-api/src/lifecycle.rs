@@ -246,7 +246,31 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
 
-    use crate::gate::DoppelgangerGate;
+    /// Test double: unsafe while `start_monitoring` is outstanding.
+    /// `cancel_monitoring` inherits the prune-pending default.
+    struct PendingSetMonitor {
+        pending: StdMutex<std::collections::HashSet<Pubkey>>,
+    }
+
+    impl PendingSetMonitor {
+        fn new() -> Self {
+            Self { pending: StdMutex::new(std::collections::HashSet::new()) }
+        }
+    }
+
+    impl DoppelgangerMonitor for PendingSetMonitor {
+        fn start_monitoring(&self, pubkey: Pubkey) {
+            self.pending.lock().unwrap().insert(pubkey);
+        }
+
+        fn stop_monitoring(&self, pubkey: &Pubkey) {
+            self.pending.lock().unwrap().remove(pubkey);
+        }
+
+        fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool {
+            !self.pending.lock().unwrap().contains(pubkey)
+        }
+    }
 
     struct SpyValidatorManager {
         state: StdMutex<StdHashMap<Pubkey, bool>>,
@@ -291,14 +315,14 @@ mod tests {
     fn lifecycle(
         window: Duration,
         vm: Arc<SpyValidatorManager>,
-    ) -> (Arc<DoppelgangerLifecycle>, Arc<DoppelgangerGate>) {
-        let gate = Arc::new(DoppelgangerGate::new(window));
+    ) -> (Arc<DoppelgangerLifecycle>, Arc<PendingSetMonitor>) {
+        let monitor = Arc::new(PendingSetMonitor::new());
         let life = Arc::new(DoppelgangerLifecycle::new(
             window,
-            gate.clone() as Arc<dyn DoppelgangerMonitor>,
+            monitor.clone() as Arc<dyn DoppelgangerMonitor>,
             vm as Arc<dyn ValidatorManager>,
         ));
-        (life, gate)
+        (life, monitor)
     }
 
     #[tokio::test]
@@ -353,7 +377,7 @@ mod tests {
         assert!(t1.is_cancelled(), "delete during window cancels the enable task");
         assert!(life.current_cancel_token(&pk).is_none());
         assert!(!vm.is_tracked(&pk), "local delete removes validator");
-        // cancel_monitoring on DoppelgangerGate defaults to stop_monitoring → safe
+        // cancel_monitoring on PendingSetMonitor defaults to stop_monitoring → safe
         assert!(gate.is_doppelganger_safe(&pk));
     }
 

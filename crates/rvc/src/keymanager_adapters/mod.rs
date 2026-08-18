@@ -18,7 +18,7 @@ mod tests;
 
 pub use config::ValidatorConfigManagerAdapter;
 pub use doppelganger::{
-    scan_and_rearm_gate, wall_clock_epoch, DoppelgangerMonitorAdapter, ForwardWindowMonitor,
+    scan_and_rearm_gate, wall_clock_epoch, DoppelgangerDisabledMonitor, ForwardWindowMonitor,
 };
 pub use keystore::KeystoreManagerAdapter;
 pub use notifier::KeyChangeNotifier;

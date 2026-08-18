@@ -54,11 +54,11 @@ fn test_validator_manager_adapter_add_remove() {
     assert!(!adapter.remove_validator(&test_pubkey(99)));
 }
 
-// --- DoppelgangerMonitorAdapter tests ---
+// --- DoppelgangerDisabledMonitor tests ---
 
 #[test]
 fn test_doppelganger_adapter_start_stop() {
-    let adapter = DoppelgangerMonitorAdapter::new();
+    let adapter = DoppelgangerDisabledMonitor::new();
     adapter.start_monitoring(test_pubkey(1));
     adapter.stop_monitoring(&test_pubkey(1));
 }

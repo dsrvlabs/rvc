@@ -81,8 +81,8 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
     /// a fresh window (`ForwardWindowMachine::cancel`).
     ///
-    /// Default: same as [`Self::stop_monitoring`] (time-based gates where both
-    /// mean "prune pending").
+    /// Default: same as [`Self::stop_monitoring`] (log-only / pending-set
+    /// implementors where both mean "prune pending").
     fn cancel_monitoring(&self, pubkey: &Pubkey) {
         self.stop_monitoring(pubkey);
     }

@@ -1,7 +1,7 @@
 use super::keystore::import_meta_path;
 use super::notifier::pubkey_hex;
 use super::{
-    build_keymanager_api, scan_and_rearm_gate, spawn_keymanager_api, DoppelgangerMonitorAdapter,
+    build_keymanager_api, scan_and_rearm_gate, spawn_keymanager_api, DoppelgangerDisabledMonitor,
     DoppelgangerMonitorKind, ForwardWindowMonitor, KeymanagerApiDeps, KeystoreManagerAdapter,
     RemoteKeyManagerAdapter, SlashingProtectionAdapter, ValidatorConfigManagerAdapter,
     ValidatorManagerAdapter, VoluntaryExitManagerAdapter,

@@ -200,6 +200,37 @@ impl DoppelgangerMonitor for MockDoppelgangerMonitor {
     }
 }
 
+/// Test double: unsafe while `start_monitoring` is outstanding.
+///
+/// Replaces the retired time-based gate in M-12 / KM-2 tests. `cancel_monitoring`
+/// inherits the prune-pending default.
+pub struct PendingSetMonitor {
+    pending: Mutex<Vec<Pubkey>>,
+}
+
+impl PendingSetMonitor {
+    pub fn new() -> Self {
+        Self { pending: Mutex::new(Vec::new()) }
+    }
+}
+
+impl DoppelgangerMonitor for PendingSetMonitor {
+    fn start_monitoring(&self, pubkey: Pubkey) {
+        self.pending.lock().push(pubkey);
+    }
+
+    fn stop_monitoring(&self, pubkey: &Pubkey) {
+        let mut pending = self.pending.lock();
+        if let Some(pos) = pending.iter().position(|pk| pk == pubkey) {
+            pending.remove(pos);
+        }
+    }
+
+    fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool {
+        !self.pending.lock().contains(pubkey)
+    }
+}
+
 pub struct MockRemoteKeyManager {
     pub keys: Mutex<Vec<(Pubkey, String)>>,
 }

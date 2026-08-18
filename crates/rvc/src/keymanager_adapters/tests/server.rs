@@ -11,7 +11,7 @@ fn build_test_server() -> keymanager_api::KeymanagerServer {
     let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
     let slashing_prot = Arc::new(SlashingProtectionAdapter::new(slashing_db, [0u8; 32]));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-    let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
+    let doppelganger_mon = Arc::new(DoppelgangerDisabledMonitor::new());
     let remote_key_mgr = Arc::new(test_remote_adapter(composite, None).0);
     let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 
@@ -127,7 +127,7 @@ async fn test_keymanager_server_import_remote_key_lifecycle() {
     let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
     let slashing_prot = Arc::new(SlashingProtectionAdapter::new(slashing_db, [0u8; 32]));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-    let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
+    let doppelganger_mon = Arc::new(DoppelgangerDisabledMonitor::new());
     let remote_key_mgr = Arc::new(test_remote_adapter(composite.clone(), None).0);
     let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 

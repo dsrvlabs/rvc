@@ -16,8 +16,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod common;
+
 use rvc_keymanager_api::error::ApiError;
-use rvc_keymanager_api::gate::DoppelgangerGate;
 use rvc_keymanager_api::handlers::{delete_keystores, import_keystores, AppState};
 use rvc_keymanager_api::lifecycle::{DoppelgangerLifecycle, ImportKind};
 use rvc_keymanager_api::traits::{
@@ -65,16 +66,16 @@ impl ValidatorManager for SpyValidatorManager {
 /// Doppelganger monitor that can park delete at `cancel_monitoring` /
 /// `stop_monitoring` so HTTP race tests can interleave re-import.
 struct GatedDoppelgangerMonitor {
-    inner: DoppelgangerGate,
+    inner: common::PendingSetMonitor,
     start_signaled: Mutex<Option<mpsc::Sender<()>>>,
     stop_arrived: Mutex<Option<mpsc::Sender<()>>>,
     stop_release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl GatedDoppelgangerMonitor {
-    fn new(window: Duration) -> Self {
+    fn new(_window: Duration) -> Self {
         Self {
-            inner: DoppelgangerGate::new(window),
+            inner: common::PendingSetMonitor::new(),
             start_signaled: Mutex::new(None),
             stop_arrived: Mutex::new(None),
             stop_release: Mutex::new(None),

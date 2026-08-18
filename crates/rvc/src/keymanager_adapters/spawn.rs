@@ -23,7 +23,7 @@ use crate::key_admission::KeyAdmissionService;
 use crate::orchestrator::PubkeyMap;
 
 use super::config::ValidatorConfigManagerAdapter;
-use super::doppelganger::{scan_and_rearm_gate, ForwardWindowMonitor};
+use super::doppelganger::{scan_and_rearm_gate, DoppelgangerDisabledMonitor, ForwardWindowMonitor};
 use super::keystore::KeystoreManagerAdapter;
 use super::remote_keys::RemoteKeyManagerAdapter;
 use super::slashing::SlashingProtectionAdapter;
@@ -56,8 +56,8 @@ pub struct KeymanagerApiDeps {
 pub enum DoppelgangerMonitorKind {
     /// SEC-2b: imports register on the shared [`ForwardWindowMachine`].
     ForwardWindow,
-    /// Time-based [`keymanager_api::gate::DoppelgangerGate`] (doppelganger opt-out path).
-    TimeBasedGate,
+    /// Always-safe [`DoppelgangerDisabledMonitor`] (doppelganger opt-out path).
+    Disabled,
 }
 
 /// Assembled keymanager server + monitor (no bind yet).
@@ -85,7 +85,7 @@ pub enum SpawnKeymanagerApiError {
 /// Select the doppelganger monitor and re-arm recently imported keys **once**.
 ///
 /// Hoists the previously duplicated `scan_and_rearm_gate` calls that lived in
-/// both branches of the forward-window vs time-based gate selection.
+/// both branches of the forward-window vs opt-out monitor selection.
 fn select_and_rearm_doppelganger_monitor(
     keystore_path: &Path,
     doppelganger_window: Duration,
@@ -100,8 +100,8 @@ fn select_and_rearm_doppelganger_monitor(
             let mon = Arc::new(ForwardWindowMonitor::new(machine, epoch_provider));
             (mon, DoppelgangerMonitorKind::ForwardWindow)
         } else {
-            let gate = Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
-            (gate, DoppelgangerMonitorKind::TimeBasedGate)
+            let mon = Arc::new(DoppelgangerDisabledMonitor::new());
+            (mon, DoppelgangerMonitorKind::Disabled)
         };
 
     // Single re-arm after the branch (both monitor variants).
@@ -175,7 +175,7 @@ pub fn build_keymanager_api(
 
     // SEC-2b: when a ForwardWindowMachine is wired, keymanager imports
     // register with it (signing gate). Same monotonic epoch_clock as boot.
-    // Fall back to the time-based DoppelgangerGate when doppelganger is opted out.
+    // Fall back to the always-safe Disabled monitor when doppelganger is opted out.
     let (doppelganger_mon, monitor_kind) = select_and_rearm_doppelganger_monitor(
         &config.keystore_path,
         doppelganger_window,

@@ -49,15 +49,20 @@ const MUST_OVERRIDE_CANCEL: &[(&str, &str)] =
 /// is correct. `(file, impl type, reason)`.
 const DEFAULT_IS_SAFE: &[(&str, &str, &str)] = &[
     (
-        "crates/keymanager-api/src/gate.rs",
-        "DoppelgangerGate",
-        "time-based; both methods mean prune-pending — lifecycle.rs:356",
+        "crates/keymanager-api/src/lifecycle.rs",
+        "PendingSetMonitor",
+        "test double; pending-set, cancel defaults to stop — lifecycle.rs:356",
     ),
     ("crates/keymanager-api/src/server.rs", "StubDoppelganger", "test double"),
     (
         "crates/keymanager-api/tests/common/mod.rs",
         "MockDoppelgangerMonitor",
         "test double; in-memory pending list, cancel defaults to stop",
+    ),
+    (
+        "crates/keymanager-api/tests/common/mod.rs",
+        "PendingSetMonitor",
+        "test double; pending-set, cancel defaults to stop",
     ),
     (
         "crates/keymanager-api/tests/delete_export_error_fail_closed.rs",
@@ -72,13 +77,18 @@ const DEFAULT_IS_SAFE: &[(&str, &str, &str)] = &[
     (
         "crates/keymanager-api/tests/km2_cancel_token_race.rs",
         "GatedDoppelgangerMonitor",
-        "test double wrapping a time-based gate",
+        "test double wrapping a pending-set monitor",
     ),
     ("crates/keymanager-api/tests/set_attesting_m9.rs", "NoopDoppelgangerMonitor", "test double"),
     (
         "crates/rvc/src/keymanager_adapters/doppelganger.rs",
-        "DoppelgangerMonitorAdapter",
-        "log-only, no teardown state",
+        "DoppelgangerDisabledMonitor",
+        "opt-out always-safe; log-only, no teardown state",
+    ),
+    (
+        "crates/rvc/tests/post_import_doppelganger_signing_block_m12.rs",
+        "RecordingMonitor",
+        "test double; records start_monitoring for re-arm scan",
     ),
 ];
 
@@ -92,8 +102,9 @@ const DELETE_HANDLER_PATH: &str = "crates/keymanager-api/src/lifecycle.rs";
 const DELETE_HANDLER_FN: &str = "on_delete";
 const DELETE_HTTP_PATH: &str = "crates/keymanager-api/src/handlers.rs";
 
-/// Floor so a silent empty walk cannot go green. Seeded at ARCH-7a land.
-const MIN_IMPLS: usize = 9;
+/// Floor so a silent empty walk cannot go green. Seeded at ARCH-7c
+/// (gate.rs deleted; PendingSetMonitor test doubles classified).
+const MIN_IMPLS: usize = 11;
 
 // ---------------------------------------------------------------------------
 // Workspace walk

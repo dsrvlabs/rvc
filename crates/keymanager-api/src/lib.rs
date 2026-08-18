@@ -1,6 +1,5 @@
 pub mod auth;
 pub mod error;
-pub mod gate;
 pub mod handlers;
 pub mod lifecycle;
 pub mod server;
