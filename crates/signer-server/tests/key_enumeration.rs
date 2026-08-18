@@ -26,13 +26,14 @@
 //! 2. The live-listener enumeration shows **zero** v1 raw-root entries: no
 //!    `REGISTERED_METHODS` entry carries `MessageKind::V1RawRoot`, and no entry's
 //!    `service` string is the retired v1 service name.
-//! 3. Every **slashable** signing handler routes through `SigningGate`
-//!    (`GateRouting::Gated`).  A slashable method classified `NonSlashable`
-//!    would be a method that can sign without slashing-DB consultation — the
-//!    exact thing M4 forbids.
-//! 4. Every `REGISTERED_METHODS` entry's `service` string equals the live
-//!    listener's introspected v2 service name (no drift between the static
-//!    registry and the wired service).
+//! 3. Every **slashable** signing handler is either `GateRouting::Gated` on
+//!    `signer.v2.SignerService` or `GateRouting::SlashingScopedShare` on
+//!    `signer.v2.PeerSignerService`.  A slashable method classified
+//!    `NonSlashable` would be a method that can sign without slashing-DB
+//!    consultation — the exact thing M4 forbids.
+//! 4. Every `REGISTERED_METHODS` entry's `service` string is on the live
+//!    listener allow-list (`signer.v2.SignerService`, plus
+//!    `signer.v2.PeerSignerService` under `--features dvt`).
 //!
 //! # Relationship to `signing_path_enumeration.rs`
 //!
@@ -42,7 +43,10 @@
 //! overlap deliberately — the standing gate prevents regressions; this test is
 //! the auditor-facing M4 evidence.
 
-use signer_registry::{GateRouting, MessageKind, SigningMethod, REGISTERED_METHODS};
+use signer_registry::{
+    GateRouting, MessageKind, SigningMethod, DVT_PEER_SERVICE, REGISTERED_METHODS,
+    V2_SIGNER_SERVICE,
+};
 use tonic::server::NamedService;
 
 // The v2 typed service — the ONLY signing service registered on the live
@@ -126,6 +130,14 @@ fn every_slashable_method_routes_through_signing_gate() {
     );
 
     for m in slashable {
+        if m.gate_routing == GateRouting::SlashingScopedShare {
+            assert_eq!(
+                m.service, DVT_PEER_SERVICE,
+                "SlashingScopedShare is only valid on {DVT_PEER_SERVICE}, got {}/{}",
+                m.service, m.method
+            );
+            continue;
+        }
         assert_eq!(
             m.gate_routing,
             GateRouting::Gated,
@@ -145,12 +157,21 @@ fn every_slashable_method_routes_through_signing_gate() {
 #[test]
 fn every_registered_method_is_on_the_live_listener_service() {
     let live = live_listener_service_name();
+    assert_eq!(live, V2_SIGNER_SERVICE);
+    let allowed: &[&str] = if cfg!(feature = "dvt") {
+        &[V2_SIGNER_SERVICE, DVT_PEER_SERVICE]
+    } else {
+        &[V2_SIGNER_SERVICE]
+    };
     for m in REGISTERED_METHODS {
-        assert_eq!(
-            m.service, live,
+        assert!(
+            allowed.contains(&m.service),
             "REGISTERED_METHODS entry {}/{} is on service '{}', but the live listener \
-             serves '{}'; the registry has drifted from the wired service",
-            m.service, m.method, m.service, live,
+             serves {:?} ; the registry has drifted from the wired service",
+            m.service,
+            m.method,
+            m.service,
+            allowed,
         );
     }
 }

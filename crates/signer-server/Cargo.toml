@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [features]
 default = []
 # Enables PeerSignerService client stubs (DVT dial-out) via the shared proto crate.
-dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client"]
+dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client", "signer-registry/dvt"]
 
 [dependencies]
 async-trait.workspace = true

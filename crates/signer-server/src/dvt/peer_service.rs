@@ -169,6 +169,10 @@ fn authenticate_peer<'a>(
 impl PeerSignerService for PeerSignerServiceImpl {
     // ── PartialSignBeaconBlock ────────────────────────────────────────────────
 
+    /// `signer.v2.PeerSignerService/PartialSignBeaconBlock` (ARCH-7i).
+    ///
+    /// Enforcement: `GateRouting::SlashingScopedShare` via `stage_block`.
+    /// Not `SigningGate`-routed.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_beacon_block",
         skip_all,
@@ -271,6 +275,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
     // ── PartialSignAttestationData ────────────────────────────────────────────
 
+    /// `signer.v2.PeerSignerService/PartialSignAttestationData` (ARCH-7i).
+    ///
+    /// Enforcement: `GateRouting::SlashingScopedShare` via `stage_attestation`.
+    /// Not `SigningGate`-routed.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_attestation_data",
         skip_all,
@@ -367,9 +375,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
     }
 
     // ── PartialSignSyncCommittee ──────────────────────────────────────────────
-    //
-    // Sync committee signing is NOT slashable (per FR-P0-3). No staging.
 
+    /// `signer.v2.PeerSignerService/PartialSignSyncCommittee`.
+    ///
+    /// Not slashable (FR-P0-3); not a `SLASHING_STAGE_METHODS` registry entry.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_sync_committee",
         skip_all,

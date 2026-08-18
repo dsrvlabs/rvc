@@ -1012,16 +1012,16 @@ not spec-defined roots — the same inverse obligation the architecture places o
 
 **Acceptance criteria.**
 
-- [ ] Both DVT partial-sign methods appear in `REGISTERED_METHODS` under `--features dvt` with an
+- [x] Both DVT partial-sign methods appear in `REGISTERED_METHODS` under `--features dvt` with an
       explicit enforcement contract naming their stage method.
-- [ ] The new variant cannot appear on `signer.v2.SignerService` (test-asserted).
-- [ ] A DVT partial signature cannot be produced without a committed slashing row (test-asserted
+- [x] The new variant cannot appear on `signer.v2.SignerService` (test-asserted).
+- [x] A DVT partial signature cannot be produced without a committed slashing row (test-asserted
       through the real path).
-- [ ] Default-features `cargo nextest run --workspace` is unaffected — count still 10, service
+- [x] Default-features `cargo nextest run --workspace` is unaffected — count still 10, service
       allow-list still effectively single-valued.
-- [ ] `crates/signer/src/gate.rs`'s single wiring site (`config/builder.rs:394`) and the
+- [x] `crates/signer/src/gate.rs`'s single wiring site (`config/builder.rs:394`) and the
       `CompositeSigner` grep gate are **untouched and green** (C9 anchor 5).
-- [ ] G-4's ban list has **not** gained `signer-server/src/dvt/peer_service.rs:231` or `:323`
+- [x] G-4's ban list has **not** gained `signer-server/src/dvt/peer_service.rs:231` or `:323`
       (C9 anchor 7).
 
 ---
