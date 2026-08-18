@@ -29,7 +29,6 @@
 //!
 //! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
 //! | --- | --- | --- |
-//! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
 //! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
 //!
 //! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
@@ -401,6 +400,12 @@ fn ssz08_sig96(bytes: &[u8]) -> Result<[u8; 96], DecodeError> {
     <[u8; 96]>::from_ssz_bytes(bytes)
 }
 
+fn ssz08_bitvector<N: ssz_types::typenum::Unsigned + Clone>(
+    bytes: &[u8],
+) -> Result<BitVector<N>, DecodeError> {
+    BitVector::<N>::from_ssz_bytes(bytes)
+}
+
 /// Variable-length raw bytes for `ssz` 0.9 container fields (bitlist payload).
 struct Ssz09VarBytes<'a>(&'a [u8]);
 
@@ -539,13 +544,124 @@ ssz_container! {
     }
 }
 
-ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireAttestationElectra {
-        pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
-        pub data: crate::AttestationData,
-        pub signature: [u8; 96],
-        pub committee_bits: BitVector<MaxCommitteesPerSlot>,
+impl Encode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+            + <BitVector<MaxCommitteesPerSlot> as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let bits = ssz08_bitlist::<MaxValidatorsPerSlot>(&self.aggregation_bits)
+            .expect("ElectraAttestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_SLOT]");
+        let sig =
+            ssz08_sig96(&self.signature).expect("ElectraAttestation.signature must be 96 bytes");
+        let committee = ssz08_bitvector::<MaxCommitteesPerSlot>(&self.committee_bits)
+            .expect("ElectraAttestation.committee_bits must be Bitvector[MAX_COMMITTEES_PER_SLOT]");
+        let offset = <BitList<MaxValidatorsPerSlot> as Encode>::ssz_fixed_len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+            + <BitVector<MaxCommitteesPerSlot> as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&bits);
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.append(&committee);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<BitList<MaxValidatorsPerSlot>>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        builder.register_type::<BitVector<MaxCommitteesPerSlot>>()?;
+        let mut decoder = builder.build()?;
+        let bits: BitList<MaxValidatorsPerSlot> = decoder.decode_next()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        let committee: BitVector<MaxCommitteesPerSlot> = decoder.decode_next()?;
+        Ok(Self {
+            aggregation_bits: bits.as_ssz_bytes(),
+            data,
+            signature: sig.to_vec(),
+            committee_bits: committee.as_ssz_bytes(),
+        })
+    }
+}
+
+impl ssz::Encode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+            + 8
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let _ = ssz08_bitlist::<MaxValidatorsPerSlot>(&self.aggregation_bits)
+            .expect("ElectraAttestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_SLOT]");
+        let sig =
+            ssz08_sig96(&self.signature).expect("ElectraAttestation.signature must be 96 bytes");
+        let committee: [u8; 8] = self
+            .committee_bits
+            .as_slice()
+            .try_into()
+            .expect("ElectraAttestation.committee_bits must be Bitvector[64] (8 bytes)");
+        let offset = BYTES_PER_LENGTH_OFFSET
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+            + 8;
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+        encoder.append(&Ssz09VarBytes(&self.aggregation_bits));
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.append(&committee);
+        encoder.finalize();
+    }
+}
+
+impl ssz::Decode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+        builder.register_type::<Ssz09VarBytesOwned>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        builder.register_type::<[u8; 8]>()?;
+        let mut decoder = builder.build()?;
+        let bits = decoder.decode_next::<Ssz09VarBytesOwned>()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        let committee: [u8; 8] = decoder.decode_next()?;
+        ssz08_bitlist::<MaxValidatorsPerSlot>(&bits.0)
+            .map_err(|e| ssz::DecodeError::BytesInvalid(format!("aggregation_bits: {e:?}")))?;
+        Ok(Self {
+            aggregation_bits: bits.0,
+            data,
+            signature: sig.to_vec(),
+            committee_bits: committee.to_vec(),
+        })
     }
 }
 
@@ -717,7 +833,7 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
         pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
@@ -749,7 +865,7 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
         pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
@@ -1315,10 +1431,9 @@ mod tests {
     const KAT_ELECTRA_ATTESTATION_LIST_ROOT_HEX: &str =
         "64a119d1221d09e3da3eb8e25bd302f4ccd6498ba3d637bbf4411145c7633af1";
 
-    fn kat_electra_wire_attestation() -> WireAttestationElectra {
-        WireAttestationElectra {
-            aggregation_bits: BitList::<MaxValidatorsPerSlot>::from_ssz_bytes(&[0xff; 4])
-                .expect("31-bit bitlist"),
+    fn kat_electra_attestation() -> crate::ElectraAttestation {
+        crate::ElectraAttestation {
+            aggregation_bits: vec![0xff; 4],
             data: crate::AttestationData {
                 slot: 100,
                 index: 0,
@@ -1326,9 +1441,8 @@ mod tests {
                 source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
                 target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
             },
-            signature: [0xaa; 96],
-            committee_bits: BitVector::<MaxCommitteesPerSlot>::from_ssz_bytes(&[0x01; 8])
-                .expect("64-bit bitvector"),
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01; 8],
         }
     }
 
@@ -1399,17 +1513,22 @@ mod tests {
 
     #[test]
     fn test_electra_attestation_list_encode_and_tree_hash_root() {
-        let att = kat_electra_wire_attestation();
+        let att = kat_electra_attestation();
         assert_eq!(
             att.tree_hash_root(),
             hex32(KAT_ELECTRA_ATTESTATION_HTR_HEX),
             "single Electra attestation HTR must match remerkleable KAT"
         );
+        let expected = hex::decode(KAT_ELECTRA_ATTESTATION_SSZ_HEX).expect("hex");
+        assert_eq!(Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(ssz::Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(<crate::ElectraAttestation as Decode>::from_ssz_bytes(&expected).unwrap(), att);
         assert_eq!(
-            Encode::as_ssz_bytes(&att),
-            hex::decode(KAT_ELECTRA_ATTESTATION_SSZ_HEX).expect("hex"),
+            <crate::ElectraAttestation as ssz::Decode>::from_ssz_bytes(&expected).unwrap(),
+            att
         );
-        let list = VariableList::<WireAttestationElectra, MaxAttestationsElectra>::from(vec![att]);
+        let list =
+            VariableList::<crate::ElectraAttestation, MaxAttestationsElectra>::from(vec![att]);
         assert_eq!(
             Encode::as_ssz_bytes(&list),
             hex::decode(KAT_ELECTRA_ATTESTATION_LIST_SSZ_HEX).expect("hex"),
@@ -1472,7 +1591,7 @@ mod tests {
             hex32("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
         );
         assert_eq!(
-            VariableList::<WireAttestationElectra, MaxAttestationsElectra>::from(vec![])
+            VariableList::<crate::ElectraAttestation, MaxAttestationsElectra>::from(vec![])
                 .tree_hash_root(),
             hex32("e8e527e84f666163a90ef900e013f56b0a4d020148b2224057b719f351b003a6"),
         );
@@ -1588,7 +1707,8 @@ mod tests {
         let _: VariableList<crate::Attestation, MaxAttestations> = full_d.attestations;
         let _: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra> =
             full_e.attester_slashings;
-        let _: VariableList<WireAttestationElectra, MaxAttestationsElectra> = full_e.attestations;
+        let _: VariableList<crate::ElectraAttestation, MaxAttestationsElectra> =
+            full_e.attestations;
     }
 
     #[test]
