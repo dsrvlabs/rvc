@@ -846,12 +846,12 @@ obligation for future fork work, which is the point.
 
 **Acceptance criteria.**
 
-- [ ] `docs/forks.md` exists; every path in it resolves under the docs-freshness scan.
-- [ ] Every dispatch site listed was opened and verified, with `file:line`.
-- [ ] The KAT-anchoring obligation for new container roots is stated with the existing `EXTERNAL_*`
+- [x] `docs/forks.md` exists; every path in it resolves under the docs-freshness scan.
+- [x] Every dispatch site listed was opened and verified, with `file:line`.
+- [x] The KAT-anchoring obligation for new container roots is stated with the existing `EXTERNAL_*`
       constants named as the pattern.
-- [ ] `ARCH-7f`'s verdict is recorded in the doc.
-- [ ] The scan is RED against a scratch dead path (output in the PR).
+- [x] `ARCH-7f`'s verdict is recorded in the doc.
+- [x] The scan is RED against a scratch dead path (output in the PR).
 
 ---
 
