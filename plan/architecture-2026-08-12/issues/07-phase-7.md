@@ -342,14 +342,14 @@ obligation the architecture places on ADR-003, applied here by analogy).
 
 **Acceptance criteria.**
 
-- [ ] `crates/architecture-tests/tests/km2_lifecycle.rs` exists and runs in the `arch-gates` job.
-- [ ] Every `impl DoppelgangerMonitor for` site in the workspace is in exactly one classification
+- [x] `crates/architecture-tests/tests/km2_lifecycle.rs` exists and runs in the `arch-gates` job.
+- [x] Every `impl DoppelgangerMonitor for` site in the workspace is in exactly one classification
       table; an unclassified new implementor fails with the file and type named.
-- [ ] Removing `ForwardWindowMonitor`'s `cancel_monitoring` override turns the gate RED (output
+- [x] Removing `ForwardWindowMonitor`'s `cancel_monitoring` override turns the gate RED (output
       pasted in the PR).
-- [ ] Collapsing `stop_monitoring`/`cancel_monitoring` on the trait turns the gate RED.
-- [ ] The gate is green on `develop` with **no production file modified** by this issue.
-- [ ] `rg 'KM-2|km2' crates/architecture-tests` now returns hits — the VD-6 finding is closed.
+- [x] Collapsing `stop_monitoring`/`cancel_monitoring` on the trait turns the gate RED.
+- [x] The gate is green on `develop` with **no production file modified** by this issue.
+- [x] `rg 'KM-2|km2' crates/architecture-tests` now returns hits — the VD-6 finding is closed.
 
 ---
 
