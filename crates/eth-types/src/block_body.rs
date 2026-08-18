@@ -31,8 +31,6 @@
 //! | --- | --- | --- |
 //! | [`WireAttestation`] | [`crate::Attestation`] | same |
 //! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
-
-//! | [`WireVoluntaryExit`] | [`crate::VoluntaryExit`] | same |
 //! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
 //!
 //! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
@@ -446,17 +444,16 @@ ssz_container! {
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireVoluntaryExit {
-        pub epoch: u64,
-        pub validator_index: u64,
+    impl crate::VoluntaryExit {
+        epoch: crate::Epoch,
+        validator_index: u64,
     }
 }
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct WireSignedVoluntaryExit {
-        pub message: WireVoluntaryExit,
+        pub message: crate::VoluntaryExit,
         pub signature: [u8; 96],
     }
 }
@@ -1137,6 +1134,22 @@ mod tests {
         assert_eq!(data.tree_hash_root(), hex32(SPEC_DEPOSIT_DATA_HTR_HEX));
         let back = <crate::DepositData as Decode>::from_ssz_bytes(&expected).unwrap();
         assert_eq!(back, data);
+    }
+
+    /// remerkleable `VoluntaryExit(epoch=100, validator_index=42)`.
+    const SPEC_VOLUNTARY_EXIT_SSZ_HEX: &str = "64000000000000002a00000000000000";
+    const SPEC_VOLUNTARY_EXIT_HTR_HEX: &str =
+        "e723f4e7c43eee8834008a6a65806077b39842db5e84c590a5d74d2208cc4083";
+
+    #[test]
+    fn test_voluntary_exit_ssz09_and_ssz08_match_spec_bytes() {
+        let exit = crate::VoluntaryExit { epoch: 100, validator_index: 42 };
+        let expected = hex::decode(SPEC_VOLUNTARY_EXIT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&exit), expected);
+        assert_eq!(Encode::as_ssz_bytes(&exit), expected);
+        assert_eq!(exit.tree_hash_root(), hex32(SPEC_VOLUNTARY_EXIT_HTR_HEX));
+        let back = <crate::VoluntaryExit as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, exit);
     }
 
     #[test]
