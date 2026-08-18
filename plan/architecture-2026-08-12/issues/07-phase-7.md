@@ -722,15 +722,15 @@ existing `All`-role fallback fires — and if that is also empty, fall back to *
 
 **Acceptance criteria.**
 
-- [ ] A role-scoped broadcast reaches only the intended tier of nodes and `tried` reflects the
+- [x] A role-scoped broadcast reaches only the intended tier of nodes and `tried` reflects the
       **filtered** count (`prd.md:960`'s literal criterion).
-- [ ] Broadcast is **not** tier-filtered, and a test enforces that.
-- [ ] The `All`-role fallback is preserved and tested; an empty selection never means "publish to
-      nobody".
-- [ ] **M7 = 0** is now reachable — this is the fifth and last inert surface (`prd.md:997`).
-- [ ] The pre-slot BN health re-check is **explicitly out of scope** (A-7.9) and recorded as follow-on
+- [x] Broadcast is **not** tier-filtered, and a test enforces that.
+- [x] The `All`-role fallback is preserved and tested; an empty selection never means "publish to
+      nobody" (fail-closed `NoEligibleBn`; never off-role last-resort).
+- [x] **M7 = 0** is now reachable — this is the fifth and last inert surface (`prd.md:997`).
+- [x] The pre-slot BN health re-check is **explicitly out of scope** (A-7.9) and recorded as follow-on
       work in the PR description, not silently dropped.
-- [ ] Zero new unbounded channels; no `tokio::spawn` added (C9 anchors 6 and 7 untouched).
+- [x] Zero new unbounded channels; no `tokio::spawn` added (C9 anchors 6 and 7 untouched).
 
 ---
 

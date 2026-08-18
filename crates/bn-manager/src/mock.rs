@@ -435,6 +435,10 @@ impl MockBeaconNodeClient {
     pub fn submit_sync_committee_messages_calls(&self) -> Vec<Vec<SyncCommitteeMessage>> {
         self.submit_sync_committee_messages.calls()
     }
+
+    pub fn submit_attestation_calls(&self) -> Vec<VersionedAttestation> {
+        self.submit_attestation.calls()
+    }
 }
 
 // ---------------------------------------------------------------------------

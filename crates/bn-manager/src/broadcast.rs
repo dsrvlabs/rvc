@@ -23,7 +23,7 @@ impl<T> BroadcastResult<T> {
     }
 
     pub fn all_success(&self) -> bool {
-        self.outcomes.iter().all(|o| o.result.is_ok())
+        !self.outcomes.is_empty() && self.outcomes.iter().all(|o| o.result.is_ok())
     }
 
     pub fn into_result(self) -> Result<T, BeaconError> {
@@ -34,7 +34,10 @@ impl<T> BroadcastResult<T> {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.expect("at least one BN"))
+        Err(last_err.unwrap_or(BeaconError::NoEligibleBn {
+            operation: "broadcast".to_string(),
+            role: "none".to_string(),
+        }))
     }
 
     pub fn failures(&self) -> Vec<(&str, &BeaconError)> {
@@ -115,6 +118,20 @@ mod tests {
             outcomes: vec![err_outcome("http://bn1"), err_outcome("http://bn2")],
         };
         assert!(br.into_result().is_err());
+    }
+
+    #[test]
+    fn test_into_result_empty_is_typed_error() {
+        let br: BroadcastResult<()> = BroadcastResult { outcomes: vec![] };
+        assert!(!br.any_success());
+        assert!(!br.all_success());
+        match br.into_result() {
+            Err(BeaconError::NoEligibleBn { operation, role }) => {
+                assert_eq!(operation, "broadcast");
+                assert_eq!(role, "none");
+            }
+            other => panic!("expected NoEligibleBn, got {other:?}"),
+        }
     }
 
     #[test]

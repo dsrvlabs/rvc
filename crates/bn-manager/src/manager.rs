@@ -61,9 +61,13 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   duty fetches, attestation/aggregate data, genesis/config, sync status reads.
 /// - **Best-of**: query healthy BNs in parallel and pick the highest-value result —
 ///   block production (`produce_block_v3`).
-/// - **Broadcast**: send to all BNs (subject to `BroadcastTopics`), succeed if any
-///   succeeds — attestations, blocks, sync committee messages, subscriptions,
-///   preparations, validator registrations.
+/// - **Broadcast**: send to **role-matching** BNs (subject to `BroadcastTopics`),
+///   succeed if any succeeds — attestations, blocks, sync committee messages,
+///   subscriptions, preparations, validator registrations. Role filter only;
+///   health **tier is not applied** and unhealthy role-matching peers are not
+///   dropped (a lagging / previously-erroring BN still gossips). `All`-role
+///   fallback is shared with the query path. An empty role+All selection is
+///   `BeaconError::NoEligibleBn` — never off-role fan-out, never Ok.
 ///
 /// # Retries under multi-BN failover
 ///
@@ -238,7 +242,8 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         if topic_enabled {
-            self.with_op_timeout(op_name, timeout, self.broadcast_with_result(op_name, op)).await
+            self.with_op_timeout(op_name, timeout, self.broadcast_with_result(op_name, role, op))
+                .await
         } else {
             self.with_op_timeout(op_name, timeout, self.query_first(op_name, role, min_tier, op))
                 .await
@@ -316,6 +321,21 @@ impl BnManager {
         })
     }
 
+    /// Role match, then `All`-role fallback. Does **not** fall back to every client.
+    /// Shared by query (`synced_indices`) and broadcast so All-fallback is one path.
+    fn role_matching_indices(&self, role: BnRole) -> Vec<usize> {
+        let matched: Vec<usize> =
+            (0..self.clients.len()).filter(|&i| BnRole::matches(&self.roles[i], role)).collect();
+        if !matched.is_empty() {
+            return matched;
+        }
+        warn!(
+            role = %role,
+            "no BNs assigned for role, falling back to all-role BNs"
+        );
+        (0..self.clients.len()).filter(|&i| self.roles[i].contains(&BnRole::All)).collect()
+    }
+
     /// Returns indices of BNs matching the given role and meeting the minimum health tier,
     /// ordered by health score (highest first).
     ///
@@ -324,7 +344,7 @@ impl BnManager {
     /// Fallback chain:
     /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
     /// 2. If no BNs meet the tier, try the next lower tier with WARN
-    /// 3. If still empty, fall back to all BNs
+    /// 3. If still empty, fall back to all BNs (query path only)
     #[tracing::instrument(name = "bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
     async fn synced_indices(&self, role: BnRole, min_tier: HealthTier) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
@@ -333,25 +353,7 @@ impl BnManager {
         let healthy_count = health_guard.iter().filter(|t| t.is_healthy()).count();
         debug!(bn_count = self.clients.len(), healthy_count = healthy_count, "Health check cycle");
 
-        // Step 1: Filter by role
-        let role_indices: Vec<usize> =
-            (0..self.clients.len()).filter(|&i| BnRole::matches(&self.roles[i], role)).collect();
-
-        // Cross-role fallback: if no BNs for the role, use All-role BNs
-        let role_indices = if role_indices.is_empty() {
-            warn!(
-                role = %role,
-                "no BNs assigned for role, falling back to all-role BNs"
-            );
-            (0..self.clients.len())
-                .filter(|&i| {
-                    BnRole::matches(&self.roles[i], BnRole::All)
-                        || self.roles[i].contains(&BnRole::All)
-                })
-                .collect::<Vec<usize>>()
-        } else {
-            role_indices
-        };
+        let role_indices = self.role_matching_indices(role);
 
         // If still empty after role fallback, use all BNs
         let role_indices = if role_indices.is_empty() {
@@ -735,34 +737,68 @@ impl BnManager {
         None
     }
 
-    /// Broadcast an operation to all BNs (regardless of sync status). Returns first success.
-    /// If all fail, returns the last error. Logs partial failures at warn level.
-    async fn broadcast<'s, F>(&'s self, op_name: &str, op: F) -> Result<(), BeaconError>
+    /// Broadcast an operation to role-matching BNs (**regardless of sync / health
+    /// tier / health-score**). Returns first success. If all fail, returns the last
+    /// error. If no BN matches the role and no `All`-role BN exists, returns
+    /// [`BeaconError::NoEligibleBn`] without publishing (fail-closed).
+    ///
+    /// Role: yes. Tier: no. Health-score prune: no. Selection is
+    /// [`Self::role_matching_indices`] so All-fallback is shared with the query
+    /// path but the query last-resort (every client) and the health-score cut
+    /// are not. `tried` is the filtered count.
+    async fn broadcast<'s, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        op: F,
+    ) -> Result<(), BeaconError>
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
     {
         let strategy_span = tracing::info_span!(
             "bn.strategy.broadcast",
             strategy = "broadcast",
-            tried = self.clients.len(),
+            tried = tracing::field::Empty,
         );
         async {
-            let broadcast = self.broadcast_inner(op_name, &op).await;
+            let broadcast = self.broadcast_inner(op_name, role, &op).await;
             Self::log_partial_failure(op_name, &broadcast);
+            if broadcast.outcomes.is_empty() {
+                return Err(BeaconError::NoEligibleBn {
+                    operation: op_name.to_string(),
+                    role: role.to_string(),
+                });
+            }
             broadcast.into_result()
         }
         .instrument(strategy_span)
         .await
     }
 
-    async fn broadcast_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> BroadcastResult<T>
+    async fn broadcast_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        op: &F,
+    ) -> BroadcastResult<T>
     where
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
+        let indices = self.role_matching_indices(role);
+        if indices.is_empty() {
+            warn!(
+                op = op_name,
+                role = %role,
+                "no BNs eligible for broadcast; not publishing to off-role clients"
+            );
+        }
+        tracing::Span::current().record("tried", indices.len());
 
-        for (i, client) in self.clients.iter().enumerate() {
+        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(indices.len());
+
+        for i in indices {
+            let client = &self.clients[i];
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
             let attempt_span = tracing::info_span!(
@@ -844,6 +880,7 @@ impl BnManager {
     async fn broadcast_with_result<'s, T, F>(
         &'s self,
         op_name: &str,
+        role: BnRole,
         op: F,
     ) -> Result<T, BeaconError>
     where
@@ -853,11 +890,17 @@ impl BnManager {
         let strategy_span = tracing::info_span!(
             "bn.strategy.broadcast",
             strategy = "broadcast",
-            tried = self.clients.len(),
+            tried = tracing::field::Empty,
         );
         async {
-            let broadcast = self.broadcast_inner(op_name, &op).await;
+            let broadcast = self.broadcast_inner(op_name, role, &op).await;
             Self::log_partial_failure(op_name, &broadcast);
+            if broadcast.outcomes.is_empty() {
+                return Err(BeaconError::NoEligibleBn {
+                    operation: op_name.to_string(),
+                    role: role.to_string(),
+                });
+            }
             broadcast.into_result()
         }
         .instrument(strategy_span)
@@ -1106,7 +1149,7 @@ impl BlockProducer for BnManager {
             self.with_op_timeout(
                 "publish_block_ssz",
                 self.op_timeout(|t| t.block_publication),
-                self.broadcast("publish_block_ssz", |c| {
+                self.broadcast("publish_block_ssz", BnRole::Submission, |c| {
                     Box::pin(c.publish_block_ssz(ssz_bytes, consensus_version, is_blinded))
                 }),
             )
@@ -1135,7 +1178,7 @@ impl BlockProducer for BnManager {
         self.with_op_timeout(
             "prepare_beacon_proposer",
             self.op_timeout(|t| t.preparation),
-            self.broadcast("prepare_beacon_proposer", |c| {
+            self.broadcast("prepare_beacon_proposer", BnRole::Proposal, |c| {
                 Box::pin(c.prepare_beacon_proposer(preparations))
             }),
         )
@@ -1151,7 +1194,7 @@ impl BlockProducer for BnManager {
         self.with_op_timeout(
             "register_validators",
             self.op_timeout(|t| t.preparation),
-            self.broadcast("register_validators", |c| {
+            self.broadcast("register_validators", BnRole::Proposal, |c| {
                 Box::pin(c.register_validators(registrations))
             }),
         )
@@ -1181,21 +1224,35 @@ impl AttestationApi for BnManager {
         .await
     }
 
-    // -- Attestation submission: broadcast or Submission role, accept LargeLag --
+    // -- Attestation submission: broadcast by Attestation role; query_first
+    //    stays Submission + LargeLag when the topic is off. --
 
     async fn submit_attestation(
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        self.submit(
-            "submit_attestation",
-            self.broadcast_topics.attestations,
-            BnRole::Submission,
-            HealthTier::LargeLag,
-            self.op_timeout(|t| t.attestation_submit),
-            |c| Box::pin(c.submit_attestation(attestations)),
-        )
-        .await
+        if self.broadcast_topics.attestations {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.broadcast_with_result("submit_attestation", BnRole::Attestation, |c| {
+                    Box::pin(c.submit_attestation(attestations))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.query_first(
+                    "submit_attestation",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_attestation(attestations)),
+                ),
+            )
+            .await
+        }
     }
 
     // -- Aggregation: Aggregation role, accept SmallLag for fetch; broadcast for submit --
@@ -1232,7 +1289,7 @@ impl AttestationApi for BnManager {
         self.with_op_timeout(
             "submit_aggregate_and_proofs",
             self.op_timeout(|t| t.aggregate_submit),
-            self.broadcast("submit_aggregate_and_proofs", |c| {
+            self.broadcast("submit_aggregate_and_proofs", BnRole::Aggregation, |c| {
                 Box::pin(c.submit_aggregate_and_proofs(proofs))
             }),
         )
@@ -1308,7 +1365,7 @@ impl SyncCommitteeApi for BnManager {
         self.with_op_timeout(
             "submit_contribution_and_proofs",
             self.op_timeout(|t| t.sync_contribution),
-            self.broadcast("submit_contribution_and_proofs", |c| {
+            self.broadcast("submit_contribution_and_proofs", BnRole::SyncCommittee, |c| {
                 Box::pin(c.submit_contribution_and_proofs(proofs))
             }),
         )
@@ -1339,11 +1396,17 @@ impl LivenessApi for BnManager {
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         let broadcast = self
-            .broadcast_inner("post_validator_liveness_merged", &|c| {
+            .broadcast_inner("post_validator_liveness_merged", BnRole::All, &|c| {
                 Box::pin(c.post_validator_liveness(epoch, validator_indices))
             })
             .await;
         Self::log_partial_failure("post_validator_liveness_merged", &broadcast);
+        if broadcast.outcomes.is_empty() {
+            return Err(BeaconError::NoEligibleBn {
+                operation: "post_validator_liveness_merged".to_string(),
+                role: BnRole::All.to_string(),
+            });
+        }
         merge_liveness_broadcast(broadcast)
     }
 }

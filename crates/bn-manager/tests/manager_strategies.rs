@@ -4,6 +4,7 @@
 //! (RF6-08 / H1). Unit tests that touch private helpers (`primary_endpoint`,
 //! `is_better_block`) remain in `src/manager.rs`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,9 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
-    BnSyncDetail, BnSyncStatus, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    SignedBeaconBlock, SignedBlindedBeaconBlock, SyncCommitteeApi, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    BnRole, BnSyncDetail, BnSyncStatus, DutiesProvider, LivenessApi, NodeStatusApi,
+    OperationTimeouts, SignedBeaconBlock, SignedBlindedBeaconBlock, SyncCommitteeApi,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -2507,4 +2508,221 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
     }
+}
+
+// ===================================================================
+// ARCH-7k: honour BnRole on broadcast (role yes, tier no)
+// ===================================================================
+
+fn role_set(role: BnRole) -> HashSet<BnRole> {
+    HashSet::from([role])
+}
+
+async fn mount_attestation_publish(server: &MockServer, expect: u64) {
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(expect)
+        .mount(server)
+        .await;
+}
+
+/// Capture `tried` recorded on `bn.strategy.broadcast` (creation + later `record`).
+async fn with_broadcast_tried<T>(fut: impl std::future::Future<Output = T>) -> (T, Option<u64>) {
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Record};
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone, Default)]
+    struct TriedCap(Arc<std::sync::Mutex<Option<u64>>>);
+
+    struct TriedVisitor<'a>(&'a mut Option<u64>);
+    impl Visit for TriedVisitor<'_> {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if field.name() == "tried" {
+                *self.0 = Some(value);
+            }
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            if field.name() == "tried" {
+                *self.0 = Some(value as u64);
+            }
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "tried" {
+                if let Ok(v) = format!("{value:?}").parse::<u64>() {
+                    *self.0 = Some(v);
+                }
+            }
+        }
+    }
+
+    impl<S> Layer<S> for TriedCap
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &tracing::Id, ctx: Context<'_, S>) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            if span.name() != "bn.strategy.broadcast" {
+                return;
+            }
+            if let Ok(mut slot) = self.0.lock() {
+                attrs.record(&mut TriedVisitor(&mut slot));
+            }
+        }
+
+        fn on_record(&self, id: &tracing::Id, values: &Record<'_>, ctx: Context<'_, S>) {
+            let Some(span) = ctx.span(id) else {
+                return;
+            };
+            if span.name() != "bn.strategy.broadcast" {
+                return;
+            }
+            if let Ok(mut slot) = self.0.lock() {
+                values.record(&mut TriedVisitor(&mut slot));
+            }
+        }
+    }
+
+    let cap = TriedCap::default();
+    let subscriber = tracing_subscriber::registry().with(cap.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let result = fut.await;
+    let tried = *cap.0.lock().expect("tried cap lock");
+    (result, tried)
+}
+
+/// RED first (ARCH-7k): three BNs {Attestation}/{Proposal}/{All}; attestation
+/// publish must skip the Proposal-only ("block") BN and record `tried = 2`.
+#[tokio::test(flavor = "current_thread")]
+async fn test_broadcast_reaches_only_the_matching_role() {
+    let attestation_bn = MockServer::start().await;
+    let block_bn = MockServer::start().await;
+    let all_bn = MockServer::start().await;
+
+    mount_attestation_publish(&attestation_bn, 1).await;
+    mount_attestation_publish(&block_bn, 0).await;
+    mount_attestation_publish(&all_bn, 1).await;
+
+    let mut config = BnManagerConfig::new(vec![attestation_bn.uri(), block_bn.uri(), all_bn.uri()]);
+    config.roles =
+        vec![role_set(BnRole::Attestation), role_set(BnRole::Proposal), role_set(BnRole::All)];
+    let manager = BnManager::new(config).unwrap();
+
+    let empty = VersionedAttestation::Electra(vec![]);
+    let (result, tried) = with_broadcast_tried(manager.submit_attestation(&empty)).await;
+    assert!(result.is_ok(), "attestation broadcast must succeed: {result:?}");
+    assert_eq!(tried, Some(2), "tried must be the role-filtered count, not clients.len()=3");
+}
+
+/// Guard on the ARCH-P2-8 narrowing: broadcast is role-filtered, never tier-filtered.
+/// A BN below the healthy tier must still receive an already-signed publish.
+#[tokio::test]
+async fn test_broadcast_is_not_tier_filtered() {
+    let synced = MockServer::start().await;
+    let unsynced = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+        .mount(&unsynced)
+        .await;
+
+    mount_attestation_publish(&synced, 1).await;
+    mount_attestation_publish(&unsynced, 1).await;
+
+    let manager = make_multi_manager(&[&synced.uri(), &unsynced.uri()]);
+    manager.check_sync_status().await;
+
+    {
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
+        assert_eq!(guard[1].status, BnSyncStatus::Syncing);
+        assert!(
+            guard[1].tier(&rvc_bn_manager::TierThresholds::default())
+                > rvc_bn_manager::HealthTier::Synced,
+            "second BN must sit below the healthy tier so a later tier cut would drop it"
+        );
+    }
+
+    let empty = VersionedAttestation::Electra(vec![]);
+    let result = manager.submit_attestation(&empty).await;
+    assert!(result.is_ok(), "unsynced BN must still receive the publish: {result:?}");
+}
+
+/// Pins All-role fallback: no Attestation specialist → All-role BN is used.
+/// Off-role-only fleets fail closed: zero publishes, typed `NoEligibleBn`.
+#[tokio::test(flavor = "current_thread")]
+async fn test_broadcast_falls_back_to_all_role_when_no_bn_matches() {
+    let proposal_bn = MockServer::start().await;
+    let all_bn = MockServer::start().await;
+
+    mount_attestation_publish(&proposal_bn, 0).await;
+    mount_attestation_publish(&all_bn, 1).await;
+
+    let mut config = BnManagerConfig::new(vec![proposal_bn.uri(), all_bn.uri()]);
+    config.roles = vec![role_set(BnRole::Proposal), role_set(BnRole::All)];
+    let manager = BnManager::new(config).unwrap();
+
+    let empty = VersionedAttestation::Electra(vec![]);
+    let (result, tried) = with_broadcast_tried(manager.submit_attestation(&empty)).await;
+    assert!(result.is_ok(), "All-role fallback must succeed: {result:?}");
+    assert_eq!(tried, Some(1), "All-role fallback must try only the All BN");
+
+    // No All-role BN either: do not fan out off-role; return Err.
+    let only_a = MockServer::start().await;
+    let only_b = MockServer::start().await;
+    mount_attestation_publish(&only_a, 0).await;
+    mount_attestation_publish(&only_b, 0).await;
+    let mut config = BnManagerConfig::new(vec![only_a.uri(), only_b.uri()]);
+    config.roles = vec![role_set(BnRole::Proposal), role_set(BnRole::SyncCommittee)];
+    let manager = BnManager::new(config).unwrap();
+    let (result, tried) = with_broadcast_tried(manager.submit_attestation(&empty)).await;
+    match result {
+        Err(BeaconError::NoEligibleBn { operation, role }) => {
+            assert_eq!(operation, "submit_attestation");
+            assert_eq!(role, "attestation");
+        }
+        other => panic!("expected NoEligibleBn, got {other:?}"),
+    }
+    assert_eq!(tried, Some(0), "empty role+All selection must not try any client");
+}
+
+/// M2: an unhealthy role-matching BN still receives an already-signed publish.
+#[tokio::test]
+async fn test_broadcast_is_not_health_score_filtered() {
+    let healthy = MockServer::start().await;
+    let unhealthy = MockServer::start().await;
+
+    mount_attestation_publish(&healthy, 1).await;
+    mount_attestation_publish(&unhealthy, 1).await;
+
+    let manager = make_multi_manager(&[&healthy.uri(), &unhealthy.uri()]);
+    {
+        let mut guard = manager.health_trackers().write().await;
+        for _ in 0..100 {
+            guard[1].record_error();
+        }
+        for _ in 0..10 {
+            guard[0].record_success(Duration::from_millis(50));
+        }
+        assert!(!guard[1].is_healthy(), "second BN must be unhealthy so a score cut would drop it");
+        assert!(guard[0].is_healthy());
+    }
+
+    let empty = VersionedAttestation::Electra(vec![]);
+    let result = manager.submit_attestation(&empty).await;
+    assert!(
+        result.is_ok(),
+        "unhealthy role-matching BN must still receive the publish: {result:?}"
+    );
 }

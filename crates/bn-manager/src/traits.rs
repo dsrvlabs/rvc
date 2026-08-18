@@ -234,11 +234,14 @@ impl Default for OperationTimeouts {
     }
 }
 
-/// Controls which message types are broadcast to all BNs vs sent to the first healthy BN.
+/// Controls which message types are broadcast to role-matching BNs vs sent to the first healthy BN.
 ///
-/// When a topic is `true`, the corresponding submission is broadcast to all BNs.
-/// When `false`, only the first healthy BN receives the message (query_first strategy).
-/// Default: all topics enabled (current behavior preserved).
+/// When a topic is `true`, the corresponding submission is broadcast to BNs whose
+/// `BnRole` matches the message (plus the `All`-role fallback). Health tier and
+/// health-score are **not** applied. An empty role+All set is
+/// [`crate::BeaconError::NoEligibleBn`] — never off-role fan-out. When `false`,
+/// only the first healthy BN receives the message (query_first strategy).
+/// Default: all topics enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastTopics {
     pub attestations: bool,
@@ -264,9 +267,11 @@ pub struct BnManagerConfig {
     pub endpoints: Vec<String>,
     /// Per-BN request timeout.
     pub timeout: Duration,
-    /// Which submission types are broadcast to all BNs.
+    /// Which submission types are broadcast to role-matching BNs
+    /// (fail-closed if none).
     pub broadcast_topics: BroadcastTopics,
-    /// Per-BN role assignments (parallel to endpoints). Default: {All} for each.
+    /// Per-BN role assignments (parallel to endpoints). Honoured by query and
+    /// broadcast selection. Default: {All} for each.
     pub roles: Vec<std::collections::HashSet<crate::types::BnRole>>,
     /// Health tier thresholds for sync distance classification.
     pub tier_thresholds: crate::types::TierThresholds,
