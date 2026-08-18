@@ -31,7 +31,7 @@
 //! | --- | --- | --- |
 //! | [`WireAttestation`] | [`crate::Attestation`] | same |
 //! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
-//! | [`WireDepositData`] | [`crate::DepositData`] | same |
+
 //! | [`WireVoluntaryExit`] | [`crate::VoluntaryExit`] | same |
 //! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
 //!
@@ -429,12 +429,11 @@ ssz_container! {
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireDepositData {
-        pub pubkey: [u8; 48],
-        pub withdrawal_credentials: [u8; 32],
-        pub amount: u64,
-        pub signature: [u8; 96],
+    impl crate::DepositData {
+        pubkey: [u8; 48],
+        withdrawal_credentials: [u8; 32],
+        amount: u64,
+        signature: [u8; 96],
     }
 }
 
@@ -442,7 +441,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct Deposit {
         pub proof: FixedVector<[u8; 32], DepositProofLength>,
-        pub data: WireDepositData,
+        pub data: crate::DepositData,
     }
 }
 
@@ -1112,6 +1111,34 @@ mod tests {
         assert_eq!(back, header);
     }
 
+    /// remerkleable `DepositData` from the non-empty-ops fixture.
+    const SPEC_DEPOSIT_DATA_SSZ_HEX: &str = concat!(
+        "dededededededededededededededededededededededededededededededededededededededededededededededede",
+        "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+        "0040597307000000",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+    );
+    const SPEC_DEPOSIT_DATA_HTR_HEX: &str =
+        "85b8a34fb09ac7acf35e59aca082f742ca0d96abedd61c17cb9a3c6d8abaee5b";
+
+    #[test]
+    fn test_deposit_data_ssz09_and_ssz08_match_spec_bytes() {
+        let data = crate::DepositData {
+            pubkey: [0xde; 48],
+            withdrawal_credentials: [0xad; 32],
+            amount: 32_000_000_000,
+            signature: [0xbe; 96],
+        };
+        let expected = hex::decode(SPEC_DEPOSIT_DATA_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(data.tree_hash_root(), hex32(SPEC_DEPOSIT_DATA_HTR_HEX));
+        let back = <crate::DepositData as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, data);
+    }
+
     #[test]
     fn test_beacon_block_body_electra_htr_matches_external_vector() {
         let body = external_vector_electra_body();
@@ -1382,7 +1409,7 @@ mod tests {
         let proof_leaves: Vec<[u8; 32]> = (0..33).map(|i| [i as u8; 32]).collect();
         let deposit = Deposit {
             proof: FixedVector::from(proof_leaves),
-            data: WireDepositData {
+            data: crate::DepositData {
                 pubkey: [0xde; 48],
                 withdrawal_credentials: [0xad; 32],
                 amount: 32_000_000_000,
