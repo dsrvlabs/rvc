@@ -124,30 +124,20 @@ impl From<DecodeError> for BodySszError {
 // SSZ container Encode/Decode helper (ethereum_ssz 0.8 trait surface)
 // ---------------------------------------------------------------------------
 
-/// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
-/// a single field list (merkleization- and serialization-sensitive order).
+/// `ssz08::{Encode, Decode}` for an existing container (Path C decorate-macro).
 ///
 /// Field order is merkleization- and serialization-sensitive — keep in sync
-/// with the consensus-specs container. One list feeds both the type definition
-/// and the encoder so they cannot drift.
-macro_rules! ssz_container {
+/// with the consensus-specs container. Used both by [`ssz_container!`] (new
+/// types) and by `ssz_container! { impl ExistingType { … } }` (crate-root
+/// types that already carry `ssz` 0.9 + `TreeHash`).
+macro_rules! ssz08_codec_impls {
     (
-        $(#[$meta:meta])*
-        pub struct $ty:ident {
+        $ty:ty {
             $(
-                $(#[$field_meta:meta])*
-                pub $field:ident : $ftype:ty
+                $field:ident : $ftype:ty
             ),* $(,)?
         }
     ) => {
-        $(#[$meta])*
-        pub struct $ty {
-            $(
-                $(#[$field_meta])*
-                pub $field: $ftype,
-            )*
-        }
-
         impl Encode for $ty {
             fn is_ssz_fixed_len() -> bool {
                 $( <$ftype as Encode>::is_ssz_fixed_len() && )* true
@@ -205,6 +195,50 @@ macro_rules! ssz_container {
                 Ok(Self {
                     $( $field: decoder.decode_next()?, )*
                 })
+            }
+        }
+    };
+}
+
+/// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
+/// a single field list (merkleization- and serialization-sensitive order).
+///
+/// The `impl $ty { fields… }` arm decorates an existing struct (Path C).
+macro_rules! ssz_container {
+    (
+        $(#[$meta:meta])*
+        pub struct $ty:ident {
+            $(
+                $(#[$field_meta:meta])*
+                pub $field:ident : $ftype:ty
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        pub struct $ty {
+            $(
+                $(#[$field_meta])*
+                pub $field: $ftype,
+            )*
+        }
+
+        ssz08_codec_impls! {
+            $ty {
+                $($field: $ftype),*
+            }
+        }
+    };
+
+    (
+        impl $ty:ty {
+            $(
+                $field:ident : $ftype:ty
+            ),* $(,)?
+        }
+    ) => {
+        ssz08_codec_impls! {
+            $ty {
+                $($field: $ftype),*
             }
         }
     };
