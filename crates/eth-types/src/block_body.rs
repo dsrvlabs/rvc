@@ -29,7 +29,6 @@
 //!
 //! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
 //! | --- | --- | --- |
-//! | [`WireAttestationData`] | [`crate::AttestationData`] | same |
 //! | [`WireBeaconBlockHeader`] | [`crate::BeaconBlockHeader`] | same |
 //! | [`WireAttestation`] | [`crate::Attestation`] | same |
 //! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
@@ -339,13 +338,12 @@ ssz_container! {
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireAttestationData {
-        pub slot: u64,
-        pub index: u64,
-        pub beacon_block_root: [u8; 32],
-        pub source: crate::Checkpoint,
-        pub target: crate::Checkpoint,
+    impl crate::AttestationData {
+        slot: crate::Slot,
+        index: crate::CommitteeIndex,
+        beacon_block_root: crate::Root,
+        source: crate::Checkpoint,
+        target: crate::Checkpoint,
     }
 }
 
@@ -381,7 +379,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestation {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -400,7 +398,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct WireAttestation {
         pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -409,7 +407,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestationElectra {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -426,7 +424,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct WireAttestationElectra {
         pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
         pub committee_bits: BitVector<MaxCommitteesPerSlot>,
     }
@@ -1058,6 +1056,35 @@ mod tests {
         assert_eq!(checkpoint.tree_hash_root(), hex32(SPEC_CHECKPOINT_HTR_HEX));
         let back = <crate::Checkpoint as Decode>::from_ssz_bytes(&expected).unwrap();
         assert_eq!(back, checkpoint);
+    }
+
+    /// remerkleable `AttestationData` matching `aggregation.rs` Electra sample.
+    const SPEC_ATTESTATION_DATA_SSZ_HEX: &str = concat!(
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+    );
+    const SPEC_ATTESTATION_DATA_HTR_HEX: &str =
+        "3810cbc2daad89c727791c249ea17025b976d05c2fd41344285bc86ecd5105c6";
+
+    #[test]
+    fn test_attestation_data_ssz09_and_ssz08_match_spec_bytes() {
+        let data = crate::AttestationData {
+            slot: 100,
+            index: 0,
+            beacon_block_root: [1u8; 32],
+            source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
+            target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
+        };
+        let expected = hex::decode(SPEC_ATTESTATION_DATA_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(data.tree_hash_root(), hex32(SPEC_ATTESTATION_DATA_HTR_HEX));
+        let back = <crate::AttestationData as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, data);
     }
 
     #[test]
