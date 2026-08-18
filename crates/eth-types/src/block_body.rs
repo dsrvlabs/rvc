@@ -29,8 +29,8 @@
 //!
 //! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
 //! | --- | --- | --- |
-//! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
 //!
+
 //! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
 //! against `ethereum_ssz` 0.9 (or workspace `ssz` aligns with the stack
 //! `ssz_types` implements); see plan §5 / F80 full unification (deferred).
@@ -689,11 +689,95 @@ ssz_container! {
     }
 }
 
-ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireSignedVoluntaryExit {
-        pub message: crate::VoluntaryExit,
-        pub signature: [u8; 96],
+impl Encode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as Encode>::ssz_fixed_len() + <[u8; 96] as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <Self as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let sig =
+            ssz08_sig96(&self.signature).expect("SignedVoluntaryExit.signature must be 96 bytes");
+        let offset = <Self as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&self.message);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as Decode>::ssz_fixed_len() + <[u8; 96] as Decode>::ssz_fixed_len()
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<crate::VoluntaryExit>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            message: decoder.decode_next()?,
+            signature: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
+    }
+}
+
+impl ssz::Encode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <Self as ssz::Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let sig =
+            ssz08_sig96(&self.signature).expect("SignedVoluntaryExit.signature must be 96 bytes");
+        let offset = <Self as ssz::Encode>::ssz_fixed_len();
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+        encoder.append(&self.message);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl ssz::Decode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as ssz::Decode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Decode>::ssz_fixed_len()
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+        builder.register_type::<crate::VoluntaryExit>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            message: decoder.decode_next()?,
+            signature: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
     }
 }
 
@@ -835,7 +919,7 @@ ssz_container! {
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
         pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -867,7 +951,7 @@ ssz_container! {
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
         pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -907,7 +991,7 @@ ssz_container! {
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
         pub attestations: VariableList<crate::Attestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -939,7 +1023,7 @@ ssz_container! {
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
         pub attestations: VariableList<crate::Attestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -1389,6 +1473,42 @@ mod tests {
         assert_eq!(exit.tree_hash_root(), hex32(SPEC_VOLUNTARY_EXIT_HTR_HEX));
         let back = <crate::VoluntaryExit as Decode>::from_ssz_bytes(&expected).unwrap();
         assert_eq!(back, exit);
+    }
+
+    /// remerkleable `SignedVoluntaryExit` (exit above + signature `[0xaa;96]`).
+    const SPEC_SIGNED_VOLUNTARY_EXIT_SSZ_HEX: &str = concat!(
+        "64000000000000002a00000000000000",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    const SPEC_SIGNED_VOLUNTARY_EXIT_HTR_HEX: &str =
+        "e96f711d5a3078da1f80423c46f61362620bb20134c23f1d56fd3b50d74c10b8";
+    const KAT_SIGNED_VOLUNTARY_EXIT_LIST_ROOT_HEX: &str =
+        "eedb73e7adbabc2b1d6571e94a28ce97e43ec229e4a796ac81e6ed30466f7188";
+
+    #[test]
+    fn test_signed_voluntary_exit_ssz09_and_ssz08_match_spec_bytes() {
+        let signed = crate::SignedVoluntaryExit {
+            message: crate::VoluntaryExit { epoch: 100, validator_index: 42 },
+            signature: vec![0xaa; 96],
+        };
+        let expected = hex::decode(SPEC_SIGNED_VOLUNTARY_EXIT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&signed), expected);
+        assert_eq!(Encode::as_ssz_bytes(&signed), expected);
+        assert_eq!(signed.tree_hash_root(), hex32(SPEC_SIGNED_VOLUNTARY_EXIT_HTR_HEX));
+        assert_eq!(
+            <crate::SignedVoluntaryExit as Decode>::from_ssz_bytes(&expected).unwrap(),
+            signed
+        );
+        assert_eq!(
+            <crate::SignedVoluntaryExit as ssz::Decode>::from_ssz_bytes(&expected).unwrap(),
+            signed
+        );
+        let list =
+            VariableList::<crate::SignedVoluntaryExit, MaxVoluntaryExits>::from(vec![signed]);
+        assert_eq!(Encode::as_ssz_bytes(&list), expected);
+        assert_eq!(list.tree_hash_root(), hex32(KAT_SIGNED_VOLUNTARY_EXIT_LIST_ROOT_HEX));
     }
 
     /// remerkleable Electra `Attestation` matching `aggregation.rs` sample:
