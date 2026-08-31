@@ -7228,3 +7228,520 @@ def test_perf_schema_json_unchanged():
         )
         assert proc.stdout == "", args
 
+
+# ----- VP-3g: M-C SM2 ≤120-request budget + fixture roll-call -----
+
+# headers__head slot 3232 / finalized epoch 99 → default window [68, 99].
+_MC_FROM_EPOCH = 68
+_MC_TO_EPOCH = 99
+_MC_SPE = 32
+_MC_START_SLOT = (_MC_FROM_EPOCH + 1) * _MC_SPE  # 2208
+_MC_END_SLOT = (_MC_TO_EPOCH + 2) * _MC_SPE  # 3232
+_MC_SYNC_QUERY_EPOCH = _MC_FROM_EPOCH
+_MC_SYNC_STATE_ID = _MC_SYNC_QUERY_EPOCH * _MC_SPE  # 2176
+_MC_HEAD_EPOCH = 101
+_MC_PROBE_EPOCH = _MC_HEAD_EPOCH - 2  # 99
+_MC_SYNC_MEMBERSHIP_PATH = (
+    f"/eth/v1/beacon/states/{_MC_SYNC_STATE_ID}/sync_committees"
+    f"?epoch={_MC_SYNC_QUERY_EPOCH}"
+)
+
+# Architecture §4.1; empty duties → 0 proposal confirms.
+ARCHITECTURE_SCHEDULE = {
+    "selection": 2,
+    "bootstrap": 4,
+    "resolve": 1,
+    "probe": 2,
+    "rewards": 32,
+    "duties": 32,
+    "balances": 2,
+    "sync_membership": 1,
+}
+
+_MC_FIXTURE_FILES = (
+    "rewards_attestations__leak.json",
+    "rewards_attestations__ideal_filtered.json",
+    "states_validators__eb_zero.json",
+    "rewards_blocks__404_headers_200.json",
+    "probe__route_absent.json",
+    "probe__state_unavailable.json",
+    "states_validators__post_414.json",
+    "spec__spe8.json",
+    "duties_proposer__teku_503.json",
+    "duties_proposer__nimbus_400.json",
+    "duties_proposer__lodestar_500.json",
+    "sync_committee__lodestar_negative.json",
+    "states_validators__mid_window_activation.json",
+    "states_validators__unknown_pubkey.json",
+    "balances__diverged.json",
+    "rewards_attestations__404_all.json",
+    "states_validators__zero_active.json",
+)
+
+_P0_ACCEPTANCE = {
+    "P0-1": (
+        "test_pubkey_union_across_three_sources_in_input_order",
+        "test_short_pubkey_exits_2_naming_source_and_line",
+    ),
+    "P0-2": (
+        "test_beacon_nodes_beats_beacon_url_in_config",
+        "test_beacon_url_flag_beats_the_config_file_entirely",
+    ),
+    "P0-3": (
+        "test_default_window_is_66_to_97",
+        "test_allow_unfinalized_gives_67_to_98",
+        "test_to_epoch_99_exits_2_naming_max_safe_epoch_98",
+        "test_spe8_shifts_every_derived_slot",
+        "test_epochs_per_year_halves_at_six_second_slots",
+        "test_epochs_with_from_epoch_exits_2",
+    ),
+    "P0-4": (
+        "test_200_keys_produce_exactly_one_post",
+        "test_post_414_falls_back_to_four_chunked_gets",
+        "test_unknown_pubkey_is_null_index_unknown_status_and_run_continues",
+        "test_states_validators_rejects_empty_ids",
+        "test_post_404_and_405_also_trigger_the_get_fallback",
+        "test_no_method_reaches_the_validators_route_unfiltered",
+        "test_no_unfiltered_validators_call_in_the_whole_run",
+    ),
+    "P0-5": (
+        "test_fixture_a_gives_source_rate_075_and_head_rate_05",
+        "test_leak_epoch_credits_source_and_target",
+        "test_leak_epoch_head_is_none_not_false",
+        "test_one_post_per_epoch_regardless_of_validator_count",
+        "test_missed_attestations_predicate",
+        "test_request_count_independent_of_validator_count",
+    ),
+    "P0-6": (
+        "test_build_ideal_index_is_a_dict_keyed_by_effective_balance",
+        "test_missing_ideal_row_nulls_effectiveness_for_that_epoch_not_zero",
+        "test_effectiveness_matches_a_hand_computed_ratio",
+        "test_estimated_apr_matches_to_four_decimal_places",
+        "test_apr_halves_on_six_second_slots",
+        "test_effective_balance_changed_flag",
+    ),
+    "P0-7": (
+        "test_404_from_rewards_blocks_with_header_200_is_included_not_missed",
+        "test_teku_503_takes_the_unavailable_path",
+        "test_nimbus_400_takes_the_unavailable_path",
+        "test_lodestar_500_takes_the_unavailable_path",
+        "test_empty_intersection_gives_null_m8_with_no_degradation_and_exit_0",
+        "test_lodestar_negative_rows_for_non_members_are_filtered_by_the_computed_set",
+        "test_one_request_per_period_not_per_epoch",
+        "test_unavailable_duties_null_scheduled_and_missed_but_not_included",
+    ),
+    "P0-8": (
+        "test_snapshot_slots_are_3232_and_4256",
+        "test_balance_requests_go_to_snapshot_slots_3232_and_4256",
+        "test_diverged_delta_annotates_and_exits_0",
+        "test_end_slot_unreachable_reports_unavailable_not_a_wrong_slot",
+        "test_diverged_balance_does_not_degrade",
+        "test_snapshots_use_states_validators_not_validator_balances",
+    ),
+    "P0-9": (
+        "test_golden_table_matches_exactly",
+        "test_final_golden_table_matches",
+        "test_null_renders_em_dash_never_zero",
+        "test_rows_sorted_by_effectiveness_ascending",
+    ),
+    "P0-10": (
+        "test_json_stdout_is_exactly_one_document",
+        "test_json_validates_against_perf_schema",
+        "test_schema_version_is_1",
+    ),
+    "P0-11": (
+        "test_exit_0_on_a_fully_available_run",
+        "test_exit_2_on_a_usage_error",
+        "test_exit_3_on_a_leak_epoch",
+        "test_exit_5_when_no_beacon_is_reachable",
+        "test_degraded_ok_maps_3_to_0",
+    ),
+    "P0-12": (
+        "test_redact_emits_scheme_host_port_only",
+        "test_no_url_or_secret_in_any_retry_log_line",
+        "test_full_run_leaks_no_secret_in_stdout_or_stderr",
+        "test_transport_sets_read_timeout_on_the_socket_after_connect",
+        "test_no_beacon_url_or_secret_in_the_json_document",
+    ),
+    "P0-13": (
+        "test_probe_200_and_404_is_state_unavailable",
+        "test_probe_404_and_404_is_route_absent",
+        "test_probe_body_carries_a_resolved_eb_nonzero_index",
+        "test_probe_issues_exactly_two_requests",
+    ),
+    "P0-14": (
+        "test_network_is_blocked",
+        "test_socket_blocked",
+    ),
+}
+
+_MC_NULL_RULES = {
+    "M4-in-leak": (
+        "test_leak_epoch_head_is_none_not_false",
+        "test_exit_3_on_a_leak_epoch",
+    ),
+    "M8-not-in-committee": (
+        "test_empty_intersection_gives_null_m8_with_no_degradation_and_exit_0",
+        "test_not_in_committee_is_the_only_exception",
+    ),
+    "M1/M5-rewards-less": (
+        "test_rewards_less_run_nulls_m1_through_m6",
+    ),
+}
+
+
+def _mc_att_path(epoch: int) -> str:
+    return _REWARDS_TEMPLATE.format(epoch=epoch)
+
+
+def _mc_att_posts(calls):
+    return [
+        c[2]
+        for c in calls
+        if c[1] == "POST" and "/rewards/attestations/" in c[2]
+    ]
+
+
+def tally_request_phases(
+    calls,
+    *,
+    from_epoch=_MC_FROM_EPOCH,
+    to_epoch=_MC_TO_EPOCH,
+    probe_epoch=_MC_PROBE_EPOCH,
+):
+    """Per-phase counts from FakeTransport.calls, classified by path."""
+    counts = {
+        "selection": 0,
+        "bootstrap": 0,
+        "resolve": 0,
+        "probe": 0,
+        "rewards": 0,
+        "duties": 0,
+        "balances": 0,
+        "sync_membership": 0,
+        "proposal_confirms": 0,
+        "sync_scan": 0,
+        "other": 0,
+    }
+    window_att = {
+        _mc_att_path(epoch) for epoch in range(from_epoch, to_epoch + 1)
+    }
+    probe_att = _mc_att_path(probe_epoch)
+    att_left: dict[str, int] = {}
+    for _label, method, path, _body in calls:
+        if path in (_VERSION_TEMPLATE, _SYNCING_PATH):
+            counts["selection"] += 1
+        elif path in (
+            _SPEC_TEMPLATE,
+            _GENESIS_PATH,
+            _HEADER_HEAD_PATH,
+            _FINALITY_PATH,
+        ):
+            counts["bootstrap"] += 1
+        elif method == "POST" and path == _VALIDATORS_PATH:
+            counts["resolve"] += 1
+        elif method == "GET" and path == _BLOCKS_HEAD_PATH:
+            counts["probe"] += 1
+        elif method == "POST" and "/rewards/attestations/" in path:
+            att_left[path] = att_left.get(path, 0) + 1
+        elif method == "GET" and "/validator/duties/proposer/" in path:
+            counts["duties"] += 1
+        elif (
+            method == "POST"
+            and path.endswith("/validators")
+            and "/beacon/states/" in path
+            and path != _VALIDATORS_PATH
+        ):
+            counts["balances"] += 1
+        elif method == "GET" and "/sync_committees" in path:
+            counts["sync_membership"] += 1
+        elif method == "POST" and "/rewards/sync_committee/" in path:
+            counts["sync_scan"] += 1
+        elif method == "GET" and (
+            "/rewards/blocks/" in path or "/beacon/headers/" in path
+        ):
+            counts["proposal_confirms"] += 1
+        else:
+            counts["other"] += 1
+    for path, n in att_left.items():
+        remaining = n
+        if path in window_att and remaining:
+            counts["rewards"] += 1
+            remaining -= 1
+        if path == probe_att and remaining:
+            counts["probe"] += 1
+            remaining -= 1
+        counts["other"] += remaining
+    return counts
+
+
+def _mc_pubkeys(n: int) -> list[str]:
+    return [f"0x{i:096x}" for i in range(1, n + 1)]
+
+
+def _mc_validators_payload(pubkeys: list[str]) -> dict:
+    rows = []
+    for i, pk in enumerate(pubkeys, start=1):
+        rows.append(
+            {
+                "index": str(i),
+                "balance": "32001834000",
+                "status": "active_ongoing",
+                "validator": {
+                    "pubkey": pk,
+                    "withdrawal_credentials": "0x" + "00" * 32,
+                    "effective_balance": "32000000000",
+                    "slashed": False,
+                    "activation_eligibility_epoch": "0",
+                    "activation_epoch": "0",
+                    "exit_epoch": "18446744073709551615",
+                    "withdrawable_epoch": "18446744073709551615",
+                },
+            }
+        )
+    return {
+        "execution_optimistic": False,
+        "finalized": False,
+        "data": rows,
+    }
+
+
+def _mc_empty_sync_raw(vp):
+    payload = {
+        "execution_optimistic": False,
+        "finalized": True,
+        "data": {"validators": [], "validator_aggregates": []},
+    }
+    return _raw(vp, 200, json.dumps(payload).encode())
+
+
+def _mc_routes(vp, pubkeys, *, membership=False):
+    routes = _dry_run_routes(vp)
+    n = len(pubkeys)
+    validators = _raw(vp, 200, json.dumps(_mc_validators_payload(pubkeys)).encode())
+    att = _att_ok(vp, indices=range(1, n + 1))
+    duties = _raw(vp, 200, b'{"data": []}')
+    routes[("POST", _VALIDATORS_PATH)] = [validators]
+    routes[("GET", _BLOCKS_HEAD_PATH)] = [raw_response(vp, "rewards_blocks__ok")]
+    for epoch in range(_MC_FROM_EPOCH, _MC_TO_EPOCH + 1):
+        copies = 2 if epoch == _MC_PROBE_EPOCH else 1
+        routes[("POST", _mc_att_path(epoch))] = [att] * copies
+        routes[("GET", _PROPOSER_TEMPLATE.format(epoch=epoch))] = [duties]
+    routes[("POST", _validators_at(_MC_START_SLOT))] = [validators]
+    routes[("POST", _validators_at(_MC_END_SLOT))] = [validators]
+    if membership:
+        routes[("GET", _MC_SYNC_MEMBERSHIP_PATH)] = [
+            raw_response(vp, "state_sync_committees__intersect")
+        ]
+        scan = _raw(
+            vp,
+            200,
+            json.dumps(
+                {"data": [{"validator_index": "1", "reward": "48"}]}
+            ).encode(),
+        )
+        for slot in range(
+            _MC_FROM_EPOCH * _MC_SPE, (_MC_TO_EPOCH + 1) * _MC_SPE
+        ):
+            path = f"/eth/v1/beacon/rewards/sync_committee/{slot}"
+            routes[("POST", path)] = [scan]
+    else:
+        routes[("GET", _MC_SYNC_MEMBERSHIP_PATH)] = [_mc_empty_sync_raw(vp)]
+    return routes
+
+
+def _mc_argv(pubkeys_file: Path):
+    return [
+        "--pubkeys-file",
+        str(pubkeys_file),
+        "--beacon-url",
+        "https://bn.example:5052",
+        "--concurrency",
+        "1",
+        "--json",
+    ]
+
+
+def _run_mc_budget(vp, tmp_path, n_keys, *, membership=False):
+    keys = _mc_pubkeys(n_keys)
+    pubfile = tmp_path / f"keys_{n_keys}.txt"
+    pubfile.write_text("\n".join(keys) + "\n", encoding="utf-8")
+    transport = FakeTransport(_mc_routes(vp, keys, membership=membership))
+    code = vp.main(_mc_argv(pubfile), transport=transport)
+    return code, transport
+
+
+def _validators_ids(method, path, body):
+    if method == "GET":
+        return parse_qs(urlsplit(path).query).get("id", [])
+    if not body:
+        return []
+    raw = body.decode() if isinstance(body, (bytes, bytearray)) else body
+    payload = json.loads(raw)
+    if isinstance(payload, dict):
+        ids = payload.get("ids")
+        if isinstance(ids, list):
+            return ids
+        return []
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def test_request_budget_matches_the_architecture_schedule(vp, tmp_path, capsys):
+    expected = dict(ARCHITECTURE_SCHEDULE)
+    assert expected == {
+        "selection": 2,
+        "bootstrap": 4,
+        "resolve": 1,
+        "probe": 2,
+        "rewards": 32,
+        "duties": 32,
+        "balances": 2,
+        "sync_membership": 1,
+    }
+    assert sum(expected.values()) == 76
+    code, transport = _run_mc_budget(vp, tmp_path, 200)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    doc = json.loads(captured.out)
+    assert doc["window"]["from_epoch"] == _MC_FROM_EPOCH
+    assert doc["window"]["to_epoch"] == _MC_TO_EPOCH
+    assert doc["window"]["epochs"] == 32
+    tally = tally_request_phases(transport.calls)
+    core = {key: tally[key] for key in expected}
+    assert core == expected
+    assert tally["proposal_confirms"] == 0
+    assert tally["sync_scan"] == 0
+    assert tally["other"] == 0
+    assert len(transport.calls) == 76
+    probe_att = _mc_att_path(_MC_PROBE_EPOCH)
+    window_att = {
+        _mc_att_path(epoch)
+        for epoch in range(_MC_FROM_EPOCH, _MC_TO_EPOCH + 1)
+    }
+    att_paths = _mc_att_posts(transport.calls)
+    assert set(att_paths) == window_att
+    assert att_paths.count(probe_att) == 2
+    for path in window_att:
+        if path == probe_att:
+            continue
+        assert att_paths.count(path) == 1
+    assert any(
+        c[1] == "GET" and c[2] == _BLOCKS_HEAD_PATH for c in transport.calls
+    )
+
+
+def test_request_budget_under_120_for_200_keys_32_epochs(vp, tmp_path, capsys):
+    code, transport = _run_mc_budget(vp, tmp_path, 200)
+    capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    assert len(transport.calls) <= 120
+
+
+def test_request_count_independent_of_validator_count(vp, tmp_path, capsys):
+    code_200, transport_200 = _run_mc_budget(vp, tmp_path, 200)
+    capsys.readouterr()
+    code_2000, transport_2000 = _run_mc_budget(vp, tmp_path, 2000)
+    capsys.readouterr()
+    assert code_200 == code_2000 == vp.EXIT_OK == 0
+    assert len(transport_200.calls) == len(transport_2000.calls)
+    tally_200 = tally_request_phases(transport_200.calls)
+    tally_2000 = tally_request_phases(transport_2000.calls)
+    core = tuple(ARCHITECTURE_SCHEDULE)
+    assert {k: tally_200[k] for k in core} == {k: tally_2000[k] for k in core}
+    assert {k: tally_200[k] for k in core} == ARCHITECTURE_SCHEDULE
+    assert tally_200["other"] == tally_2000["other"] == 0
+    resolve_200 = [
+        c for c in transport_200.calls if c[1] == "POST" and c[2] == _VALIDATORS_PATH
+    ]
+    resolve_2000 = [
+        c
+        for c in transport_2000.calls
+        if c[1] == "POST" and c[2] == _VALIDATORS_PATH
+    ]
+    assert len(resolve_200) == len(resolve_2000) == 1
+    assert len(json.loads(resolve_200[0][3])["ids"]) == 200
+    assert len(json.loads(resolve_2000[0][3])["ids"]) == 2000
+    for calls in (transport_200.calls, transport_2000.calls):
+        gets = [
+            c
+            for c in calls
+            if c[1] == "GET" and c[2].split("?", 1)[0].endswith("/validators")
+        ]
+        assert gets == []
+
+
+def test_sync_membership_carve_out_is_reported_not_hidden(vp, tmp_path, capsys):
+    code, transport = _run_mc_budget(vp, tmp_path, 200, membership=True)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    n_calls = len(transport.calls)
+    assert n_calls > 120
+    tally = tally_request_phases(transport.calls)
+    scan_slots = _MC_SPE * 32
+    assert tally["sync_scan"] == scan_slots
+    assert tally["sync_membership"] == 1
+    core = {key: tally[key] for key in ARCHITECTURE_SCHEDULE}
+    assert core == ARCHITECTURE_SCHEDULE
+    assert tally["proposal_confirms"] == 0
+    extra = n_calls - 76
+    assert extra == scan_slots
+    assert "SM2 carve-out" in captured.err
+    assert str(scan_slots) in captured.err
+    assert extra > 0
+
+
+def test_fixture_roll_call():
+    assert len(_MC_FIXTURE_FILES) == 17
+    missing = [
+        name
+        for name in _MC_FIXTURE_FILES
+        if not (FIXTURES / name).is_file()
+    ]
+    assert missing == []
+    for name in _MC_FIXTURE_FILES:
+        path = FIXTURES / name
+        assert path.name == name
+
+
+def test_no_unfiltered_validators_call_in_the_whole_run(vp, tmp_path, capsys):
+    code, transport = _run_mc_budget(vp, tmp_path, 200)
+    capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    validator_calls = [
+        c
+        for c in transport.calls
+        if "/states/" in c[2] and c[2].split("?", 1)[0].endswith("/validators")
+    ]
+    assert validator_calls
+    for _label, method, path, body in validator_calls:
+        ids = _validators_ids(method, path, body)
+        assert ids, (method, path, body)
+
+
+def _assert_named_tests(present, mapping):
+    for req, names in mapping.items():
+        assert names, req
+        missing = [name for name in names if name not in present]
+        assert missing == [], f"{req} missing {missing}"
+
+
+def test_p0_acceptance_matrix():
+    assert list(_P0_ACCEPTANCE) == [f"P0-{i}" for i in range(1, 15)]
+    present = {
+        name
+        for name, obj in inspect.getmembers(
+            sys.modules[__name__], inspect.isfunction
+        )
+        if name.startswith("test_")
+    }
+    _assert_named_tests(present, _P0_ACCEPTANCE)
+    assert list(_MC_NULL_RULES) == [
+        "M4-in-leak",
+        "M8-not-in-committee",
+        "M1/M5-rewards-less",
+    ]
+    _assert_named_tests(present, _MC_NULL_RULES)
+
+
