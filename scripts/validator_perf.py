@@ -655,6 +655,7 @@ class BeaconClient:
         allow_promote: bool = True,
     ) -> object:
         path = template.format(**fmt) + extra
+        _await_slot(self._request_delay)
         ep = self._endpoint()
         shown = redact(ep)
         with self._lock:
@@ -666,7 +667,6 @@ class BeaconClient:
         try:
             for attempt in range(_MAX_ATTEMPTS):
                 self._log.info("%s %s via %s", method, template, redact(ep))
-                _await_slot(self._request_delay)
                 try:
                     raw = self._transport(ep, method, path, body)
                 except (

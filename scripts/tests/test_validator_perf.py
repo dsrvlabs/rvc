@@ -8539,6 +8539,234 @@ def test_breaching_rows_are_marked_in_table_and_json(vp, load):
     validate_schema(doc, _load_perf_schema())
 
 
+# ----- VP-4d: §6 --request-delay-ms + strictly-serial AC (P1-3) -----
+
+_PHASE_RANK = {
+    "selection": 0,
+    "bootstrap": 1,
+    "resolve": 2,
+    "probe": 3,
+    "rewards": 4,
+    "duties": 5,
+    "balances": 6,
+    "sync": 7,
+    "proposal_confirms": 8,
+    "sync_scan": 9,
+}
+
+
+def _vp4d_phase(method: str, path: str) -> str:
+    if path in (_VERSION_TEMPLATE, _SYNCING_PATH):
+        return "selection"
+    if path in (
+        _SPEC_TEMPLATE,
+        _GENESIS_PATH,
+        _HEADER_HEAD_PATH,
+        _FINALITY_PATH,
+    ):
+        return "bootstrap"
+    if method == "POST" and path == _VALIDATORS_PATH:
+        return "resolve"
+    if method == "GET" and path == _BLOCKS_HEAD_PATH:
+        return "probe"
+    if method == "POST" and "/rewards/attestations/" in path:
+        return "rewards"
+    if method == "GET" and "/validator/duties/proposer/" in path:
+        return "duties"
+    if (
+        method == "POST"
+        and "/beacon/states/" in path
+        and path.endswith("/validators")
+        and path != _VALIDATORS_PATH
+    ):
+        return "balances"
+    if "/sync_committees" in path:
+        return "sync"
+    if method == "GET" and (
+        "/rewards/blocks/" in path or "/beacon/headers/" in path
+    ):
+        return "proposal_confirms"
+    if method == "POST" and "/rewards/sync_committee/" in path:
+        return "sync_scan"
+    return "other"
+
+
+class _StartRecorder:
+    def __init__(self, inner, now):
+        self._inner = inner
+        self._now = now
+        self.starts: list[tuple[str, str, float]] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, ep, method, path, body):
+        with self._lock:
+            self.starts.append((method, path, self._now()))
+        return self._inner(ep, method, path, body)
+
+    def drop(self, ep):
+        self._inner.drop(ep)
+
+    def close(self):
+        self._inner.close()
+
+    @property
+    def calls(self):
+        return self._inner.calls
+
+
+def _install_virtual_clock(vp, monkeypatch, *, t0=10.0):
+    # Per-thread time so concurrent sleeps overlap; a global += would
+    # serialize per-worker delays and hide the 4×-rate bug.
+    local = threading.local()
+    vp._next_request_start = 0.0
+
+    def monotonic():
+        return getattr(local, "t", t0)
+
+    def sleep(seconds):
+        local.t = getattr(local, "t", t0) + seconds
+
+    monkeypatch.setattr(vp.time, "monotonic", monotonic)
+    monkeypatch.setattr(vp.time, "sleep", sleep)
+    return monotonic
+
+
+def _assert_min_gap(times, delay):
+    ordered = sorted(times)
+    assert len(ordered) >= 2
+    for earlier, later in zip(ordered, ordered[1:]):
+        assert later - earlier >= delay - 1e-9
+
+
+def test_default_concurrency_is_4(vp):
+    opts = vp.build_options(_minimal_opts_argv())
+    assert vp.DEFAULT_CONCURRENCY == 4
+    assert opts.concurrency == 4
+
+
+def test_no_test_sleeps():
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert re.search(r"time\.sleep\s*\(", source) is None
+
+
+def test_concurrency_1_issues_requests_strictly_serially(vp, tmp_path, capsys):
+    keys = _mc_pubkeys(1)
+    pubfile = tmp_path / "keys_serial.txt"
+    pubfile.write_text("\n".join(keys) + "\n", encoding="utf-8")
+    transport = FakeTransport(_mc_routes(vp, keys))
+    argv = [
+        "--pubkeys-file",
+        str(pubfile),
+        "--beacon-url",
+        "https://bn.example:5052",
+        "--concurrency",
+        "1",
+        "--json",
+    ]
+    code = vp.main(argv, transport=transport)
+    capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    phases = [_vp4d_phase(c[1], c[2]) for c in transport.calls]
+    assert "other" not in phases
+    ranks = [_PHASE_RANK[p] for p in phases]
+    assert ranks == sorted(ranks)
+    att_epochs = [
+        int(c[2].rsplit("/", 1)[-1])
+        for c in transport.calls
+        if c[1] == "POST" and "/rewards/attestations/" in c[2]
+    ]
+    assert att_epochs[0] == _MC_PROBE_EPOCH
+    assert att_epochs[1:] == list(
+        range(_MC_FROM_EPOCH, _MC_TO_EPOCH + 1)
+    )
+    duty_epochs = [
+        int(c[2].rsplit("/", 1)[-1])
+        for c in transport.calls
+        if c[1] == "GET" and "/validator/duties/proposer/" in c[2]
+    ]
+    assert duty_epochs == list(range(_MC_FROM_EPOCH, _MC_TO_EPOCH + 1))
+
+
+def test_request_delay_enforced_globally_not_per_worker(vp, monkeypatch):
+    now = _install_virtual_clock(vp, monkeypatch)
+    w = _att_window(vp, 100, 103)
+    assert w.epochs == 4
+    inner = FakeTransport(_att_routes(w, _att_ok(vp, indices=(1,))))
+    transport = _StartRecorder(inner, now)
+    client, _ = _client(vp, transport, request_delay=0.05)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        vp.collect_attestations(
+            client, w, [_active_ref(vp)], pool, vp.RequestBudget()
+        )
+    times = [t for _method, _path, t in transport.starts]
+    assert len(times) == 4
+    _assert_min_gap(times, 0.05)
+
+
+def test_delay_applies_across_every_phase(vp, monkeypatch, capsys):
+    now = _install_virtual_clock(vp, monkeypatch)
+    inner = FakeTransport(_full_run_routes(vp))
+    transport = _StartRecorder(inner, now)
+    code, _ = _run_full(
+        vp, "--json", "--request-delay-ms", "50", transport=transport
+    )
+    capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    times = [t for _method, _path, t in transport.starts]
+    _assert_min_gap(times, 0.05)
+    present = {_vp4d_phase(method, path) for method, path, _t in transport.starts}
+    for phase in ("rewards", "duties", "balances", "sync"):
+        assert phase in present
+
+
+def test_zero_delay_adds_no_measurable_overhead(vp, monkeypatch):
+    now = _install_virtual_clock(vp, monkeypatch)
+    slept = []
+    inner_sleep = vp.time.sleep
+
+    def sleep(seconds):
+        slept.append(seconds)
+        inner_sleep(seconds)
+
+    monkeypatch.setattr(vp.time, "sleep", sleep)
+    path = _VERSION_TEMPLATE
+
+    def ok():
+        return _raw(vp, 200)
+
+    transport = FakeTransport({("GET", path): [ok, ok, ok, ok]})
+    recorder = _StartRecorder(transport, now)
+    client, _ = _client(vp, recorder, request_delay=0.0)
+    for _ in range(4):
+        client._call("GET", path, {}, None)
+    times = [t for _method, _path, t in recorder.starts]
+    assert times == [10.0, 10.0, 10.0, 10.0]
+    assert slept == []
+    assert vp._next_request_start == 0.0
+
+
+def test_delay_does_not_stack_with_retry_backoff(vp, monkeypatch):
+    # Frozen clock: a stacked delay+backoff would appear as a second sleep.
+    clock = {"t": 10.0}
+    monkeypatch.setattr(vp.time, "monotonic", lambda: clock["t"])
+    slept = _no_sleep(monkeypatch, vp)
+    vp._next_request_start = 0.0
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport(
+        {
+            ("GET", path): [
+                _raw(vp, 429, headers={"Retry-After": "1"}),
+                _raw(vp, 200, b'{"data": true}'),
+            ]
+        }
+    )
+    client, _ = _client(vp, transport, request_delay=0.05)
+    got = client._call("GET", path, {}, None)
+    assert got == {"data": True}
+    assert len(transport.calls) == 2
+    assert slept == [1.0]
+
+
 # ----- VP-5c: §9 pubkey→index cache keyed by genesis root -----
 
 _MAINNET_GENESIS_ROOT = (
