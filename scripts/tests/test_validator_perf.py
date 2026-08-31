@@ -3902,3 +3902,391 @@ def test_slashed_validator_is_reported_with_its_status(vp, load):
     assert report.ref.slashed is True
     assert report.ref is ref
 
+
+# ----- VP-2f: §14 build_aggregate — EB-weighted APR, R9, slashed (RD-5) -----
+
+_RATE_FIELDS = (
+    "participation_rate",
+    "source_rate",
+    "target_rate",
+    "head_rate",
+    "attester_effectiveness",
+)
+
+
+def _n_outcomes(vp, n, **kw):
+    return [_mk_outcome(vp, epoch=100 + i, **kw) for i in range(n)]
+
+
+def _agg_window(vp, from_epoch=100, to_epoch=131):
+    return _att_window(vp, from_epoch, to_epoch)
+
+
+def _force_rates(report, rate, **extra):
+    fields = {name: rate for name in _RATE_FIELDS}
+    fields.update(extra)
+    return replace(report, **fields)
+
+
+def test_aggregate_apr_is_effective_balance_weighted(vp, load):
+    refs, _, _ = _resolve(vp, [PK1, PK2], name="states_validators__basic")
+    by_pk = {r.pubkey: r for r in refs}
+    ref32, ref2048 = by_pk[PK1], by_pk[PK2]
+    assert ref32.effective_balance_gwei == _EB_32
+    assert ref2048.effective_balance_gwei == _EB_2048
+    spec = _spec_from_fixture(vp, load)
+    window = _agg_window(vp)
+    assert window.epochs == 32
+    reward_32 = 1_000_000
+    reward_2048 = 1_000_000
+    r32 = vp.build_validator_report(
+        ref32,
+        _n_outcomes(vp, 1, flag_actual_gwei=reward_32, flag_ideal_gwei=reward_32),
+        _snap(vp, _EB_32),
+        spec,
+        window,
+    )
+    r2048 = vp.build_validator_report(
+        ref2048,
+        _n_outcomes(
+            vp, 1, flag_actual_gwei=reward_2048, flag_ideal_gwei=reward_2048
+        ),
+        _snap(vp, _EB_2048),
+        spec,
+        window,
+    )
+    eb32, _ = vp.effective_balance_for(r32.balance, r32.ref)
+    eb2048, _ = vp.effective_balance_for(r2048.balance, r2048.ref)
+    assert eb32 == _EB_32 and eb2048 == _EB_2048
+    sum_reward = r32.rewards_gwei["total"] + r2048.rewards_gwei["total"]
+    sum_eb = eb32 + eb2048
+    expected = sum_reward / sum_eb * spec.epochs_per_year / window.epochs
+    count_weighted = (r32.estimated_apr + r2048.estimated_apr) / 2
+    assert expected != pytest.approx(count_weighted)
+    agg = vp.build_aggregate([r32, r2048], spec)
+    assert round(agg["estimated_apr"], 12) == round(expected, 12)
+    assert agg["estimated_apr"] != pytest.approx(count_weighted)
+    assert agg["consensus_reward_gwei"] == sum_reward
+
+
+def test_rate_means_weighted_by_active_epochs(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    window = _agg_window(vp)
+    short = _force_rates(
+        _build_report(
+            vp,
+            load,
+            _active_ref(vp, index=1, pubkey=PK1),
+            _n_outcomes(vp, 4),
+            window=window,
+        ),
+        1.0,
+        active_epochs=4,
+    )
+    long = _force_rates(
+        _build_report(
+            vp,
+            load,
+            _active_ref(vp, index=2, pubkey=PK2),
+            _n_outcomes(vp, 32),
+            window=window,
+        ),
+        0.0,
+        active_epochs=32,
+    )
+    assert short.active_epochs / long.active_epochs == 1 / 8
+    expected = (4 * 1.0 + 32 * 0.0) / (4 + 32)
+    count_weighted = (1.0 + 0.0) / 2
+    assert expected != pytest.approx(count_weighted)
+    agg = vp.build_aggregate([short, long], spec)
+    for name in _RATE_FIELDS:
+        assert agg[name] == pytest.approx(expected), name
+        assert agg[name] != pytest.approx(count_weighted), name
+
+
+def test_mid_window_activation_does_not_dilute_the_aggregate(vp, load):
+    refs, _, _ = _resolve(
+        vp, [PK1], name="states_validators__mid_window_activation"
+    )
+    mid_ref = refs[0]
+    assert mid_ref.activation_epoch == 116
+    assert mid_ref.status == "pending_queued"
+    spec = _spec_from_fixture(vp, load)
+    window = _agg_window(vp)
+    n_mid = mid_ref.active_epochs_in(window)
+    assert n_mid == 16
+    assert n_mid != window.epochs
+    mid = vp.build_validator_report(
+        mid_ref,
+        [
+            _mk_outcome(
+                vp, epoch=116 + i, flag_actual_gwei=1000, flag_ideal_gwei=1000
+            )
+            for i in range(n_mid)
+        ],
+        _snap(vp, _EB_32),
+        spec,
+        window,
+    )
+    peer = vp.build_validator_report(
+        _active_ref(vp, index=2, pubkey=PK2),
+        _n_outcomes(
+            vp,
+            window.epochs,
+            source_credited=False,
+            target_credited=False,
+            head_credited=False,
+            missed=True,
+            flag_actual_gwei=0,
+            flag_ideal_gwei=1,
+        ),
+        _snap(vp, _EB_32),
+        spec,
+        window,
+        proposer_gwei=1_000_000,
+    )
+    assert mid.active_epochs == 16
+    assert peer.active_epochs == 32
+    assert mid.participation_rate == 1.0
+    assert peer.participation_rate == 0.0
+    expected = (16 * 1.0 + 32 * 0.0) / (16 + 32)
+    count_weighted = (1.0 + 0.0) / 2
+    assert expected != pytest.approx(count_weighted)
+    agg = vp.build_aggregate([mid, peer], spec)
+    for name in _RATE_FIELDS:
+        assert agg[name] == pytest.approx(expected), name
+        assert agg[name] != pytest.approx(count_weighted), name
+        assert agg[name] != pytest.approx(0.0), name
+        assert agg[name] != pytest.approx(1.0), name
+    inactive = vp.build_validator_report(
+        mid_ref, [], _snap(vp, _EB_32), spec, window
+    )
+    assert inactive.participation_rate is None
+    assert inactive.active_epochs == 0
+    inactive = replace(inactive, window_epochs=1)
+    zero = vp.build_aggregate([inactive, peer], spec)
+    assert zero["estimated_apr"] == pytest.approx(peer.estimated_apr)
+    inactive_eb, _ = vp.effective_balance_for(inactive.balance, inactive.ref)
+    peer_eb, _ = vp.effective_balance_for(peer.balance, peer.ref)
+    diluted = (
+        (inactive.rewards_gwei["total"] + peer.rewards_gwei["total"])
+        / (inactive_eb + peer_eb)
+        * spec.epochs_per_year
+        / peer.window_epochs
+    )
+    wrong_window = (
+        peer.rewards_gwei["total"]
+        / peer_eb
+        * spec.epochs_per_year
+        / inactive.window_epochs
+    )
+    assert zero["estimated_apr"] != pytest.approx(diluted)
+    assert zero["estimated_apr"] != pytest.approx(wrong_window)
+
+
+def test_slashed_excluded_from_weighted_means_but_counted_in_by_status(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    window = _agg_window(vp)
+    healthy = vp.build_validator_report(
+        _active_ref(vp, index=1, pubkey=PK1),
+        _n_outcomes(vp, 32, flag_actual_gwei=1_000_000, flag_ideal_gwei=1_000_000),
+        _snap(vp, _EB_32),
+        spec,
+        window,
+    )
+    slashed = vp.build_validator_report(
+        _active_ref(
+            vp, index=2, pubkey=PK2, status="active_slashed", slashed=True
+        ),
+        _n_outcomes(
+            vp,
+            32,
+            source_credited=False,
+            target_credited=False,
+            head_credited=False,
+            missed=True,
+            flag_actual_gwei=0,
+            flag_ideal_gwei=1,
+        ),
+        _snap(vp, _EB_2048),
+        spec,
+        window,
+    )
+    assert slashed.participation_rate == 0.0
+    assert slashed.ref.status.startswith("active_slashed")
+    assert slashed.missed_attestations == 32
+    poison = 99_000_000
+    slashed = replace(
+        slashed,
+        rewards_gwei={**slashed.rewards_gwei, "total": poison},
+    )
+    assert slashed.rewards_gwei["total"] != 0
+    agg = vp.build_aggregate([healthy, slashed], spec)
+    assert agg["validators"] == 2
+    assert agg["by_status"]["active_slashed"] == 1
+    assert agg["by_status"]["active_ongoing"] == 1
+    for name in _RATE_FIELDS:
+        assert agg[name] == pytest.approx(getattr(healthy, name)), name
+        assert agg[name] != pytest.approx(0.5), name
+    assert agg["missed_attestations"] == healthy.missed_attestations
+    assert agg["missed_attestations"] != slashed.missed_attestations
+    assert agg["consensus_reward_gwei"] == healthy.rewards_gwei["total"]
+    assert agg["consensus_reward_gwei"] != healthy.rewards_gwei["total"] + poison
+    eb, _ = vp.effective_balance_for(healthy.balance, healthy.ref)
+    expected_apr = (
+        healthy.rewards_gwei["total"]
+        / eb
+        * spec.epochs_per_year
+        / window.epochs
+    )
+    poisoned = (
+        (healthy.rewards_gwei["total"] + slashed.rewards_gwei["total"])
+        / (eb + _EB_2048)
+        * spec.epochs_per_year
+        / window.epochs
+    )
+    assert agg["estimated_apr"] == pytest.approx(expected_apr)
+    assert agg["estimated_apr"] != pytest.approx(poisoned)
+
+
+def test_unknown_pubkey_excluded_from_aggregates(vp, load):
+    refs, _, _ = _resolve(
+        vp, [PK1, PK4, PK2], name="states_validators__unknown_pubkey"
+    )
+    unknown_ref = next(r for r in refs if r.index is None)
+    assert unknown_ref.status == "unknown"
+    stub = vp._unknown_ref(PK4)
+    assert stub.index is None and stub.status == "unknown"
+    spec = _spec_from_fixture(vp, load)
+    window = _agg_window(vp)
+    known = vp.build_validator_report(
+        next(r for r in refs if r.pubkey == PK1),
+        _n_outcomes(vp, 32, flag_actual_gwei=500_000, flag_ideal_gwei=500_000),
+        _snap(vp, _EB_32),
+        spec,
+        window,
+    )
+    unknown_empty = vp.build_validator_report(
+        unknown_ref, [], _snap(vp, 0), spec, window
+    )
+    # Forced zeros / poison total would drag means and the sum if included (P0-4).
+    poison = 77_000_000
+    unknown = _force_rates(
+        unknown_empty,
+        0.0,
+        active_epochs=32,
+        missed_attestations=99,
+        estimated_apr=0.0,
+        rewards_gwei={**unknown_empty.rewards_gwei, "total": poison},
+    )
+    assert unknown.rewards_gwei["total"] != 0
+    agg = vp.build_aggregate([known, unknown], spec)
+    assert agg["validators"] == 2
+    assert agg["by_status"]["unknown"] == 1
+    for name in _RATE_FIELDS:
+        assert agg[name] == pytest.approx(getattr(known, name)), name
+        assert agg[name] != pytest.approx(0.5), name
+    assert agg["missed_attestations"] == known.missed_attestations
+    assert agg["missed_attestations"] != 99
+    eb, _ = vp.effective_balance_for(known.balance, known.ref)
+    expected_apr = (
+        known.rewards_gwei["total"] / eb * spec.epochs_per_year / window.epochs
+    )
+    assert agg["estimated_apr"] == pytest.approx(expected_apr)
+    assert agg["consensus_reward_gwei"] == known.rewards_gwei["total"]
+    assert agg["consensus_reward_gwei"] != known.rewards_gwei["total"] + poison
+
+
+def test_all_null_metric_aggregates_to_null_not_zero(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    empty_a = _build_report(
+        vp, load, _active_ref(vp, index=1, pubkey=PK1), []
+    )
+    empty_b = _build_report(
+        vp, load, _active_ref(vp, index=2, pubkey=PK2), []
+    )
+    agg = vp.build_aggregate([empty_a, empty_b], spec)
+    for name in (*_RATE_FIELDS, "estimated_apr", "missed_attestations"):
+        assert agg[name] is None, name
+        assert agg[name] != 0.0, name
+    leak = _mk_outcome(
+        vp,
+        leak=True,
+        head_credited=None,
+        flag_ideal_gwei=None,
+        source_credited=True,
+        target_credited=True,
+        missed=False,
+    )
+    leak_a = _build_report(
+        vp, load, _active_ref(vp, index=1, pubkey=PK1), [leak]
+    )
+    leak_b = _build_report(
+        vp, load, _active_ref(vp, index=2, pubkey=PK2), [leak]
+    )
+    assert leak_a.head_rate is None
+    assert leak_a.source_rate == 1.0
+    leak_agg = vp.build_aggregate([leak_a, leak_b], spec)
+    assert leak_agg["head_rate"] is None
+    assert leak_agg["head_rate"] != 0.0
+    assert leak_agg["source_rate"] == pytest.approx(1.0)
+    assert leak_agg["attester_effectiveness"] is None
+    assert leak_agg["attester_effectiveness"] != 0.0
+
+
+def test_by_status_counts_every_input_validator(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    reports = [
+        _build_report(
+            vp, load, _active_ref(vp, index=1, pubkey=PK1), []
+        ),
+        _build_report(
+            vp,
+            load,
+            _active_ref(vp, index=2, pubkey=PK2, status="active_ongoing"),
+            [],
+        ),
+        _build_report(
+            vp,
+            load,
+            _active_ref(
+                vp, index=3, pubkey=PK3, status="active_slashed", slashed=True
+            ),
+            [],
+        ),
+        _build_report(vp, load, vp._unknown_ref(PK4), []),
+        _build_report(
+            vp,
+            load,
+            _active_ref(
+                vp,
+                index=5,
+                pubkey="0x" + "55" * 48,
+                status="pending_queued",
+            ),
+            [],
+        ),
+        _build_report(
+            vp,
+            load,
+            _active_ref(
+                vp,
+                index=6,
+                pubkey="0x" + "66" * 48,
+                status="exited_unslashed",
+            ),
+            [],
+        ),
+    ]
+    agg = vp.build_aggregate(reports, spec)
+    assert agg["validators"] == len(reports)
+    assert sum(agg["by_status"].values()) == len(reports)
+    assert agg["by_status"] == {
+        "active_ongoing": 2,
+        "active_slashed": 1,
+        "unknown": 1,
+        "pending_queued": 1,
+        "exited_unslashed": 1,
+    }
+    assert agg["proposals"] == {"scheduled": 0, "included": 0, "missed": 0}
+

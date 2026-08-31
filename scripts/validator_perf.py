@@ -1504,6 +1504,17 @@ def _rate(numerator: float, denominator: float) -> float | None:
     return numerator / denominator
 
 
+def _weighted(
+    values: Sequence[float], weights: Sequence[float]
+) -> float | None:
+    acc = 0.0
+    total_w = 0.0
+    for value, weight in zip(values, weights):
+        acc += value * weight
+        total_w += weight
+    return _rate(acc, total_w)
+
+
 @dataclass(frozen=True)
 class ValidatorReport:
     ref: ValidatorRef
@@ -1610,6 +1621,68 @@ def build_validator_report(
         window_epochs=window_epochs,
         degradations=degs,
     )
+
+
+def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
+    by_status: dict[str, int] = {}
+    for report in reports:
+        status = report.ref.status
+        by_status[status] = by_status.get(status, 0) + 1
+    included = [
+        r
+        for r in reports
+        if r.ref.index is not None
+        and not r.ref.status.startswith("active_slashed")
+    ]
+
+    def mean(attr: str) -> float | None:
+        pairs = [
+            (getattr(r, attr), r.active_epochs)
+            for r in included
+            if getattr(r, attr) is not None
+        ]
+        return _weighted([v for v, _ in pairs], [w for _, w in pairs])
+
+    missed_parts = [
+        r.missed_attestations
+        for r in included
+        if r.missed_attestations is not None
+    ]
+    reward_parts = [
+        r.rewards_gwei["total"]
+        for r in included
+        if r.rewards_gwei.get("total") is not None
+    ]
+    # Rates weigh by active_epochs; APR weighs by EB (RD-5).
+    reward_sum = 0
+    eb_sum = 0
+    window_epochs = 0
+    for report in included:
+        if report.active_epochs == 0:
+            continue
+        eb, _ = effective_balance_for(report.balance, report.ref)
+        total = report.rewards_gwei.get("total")
+        if not eb or total is None:
+            continue
+        if eb_sum == 0:
+            window_epochs = report.window_epochs
+        reward_sum += total
+        eb_sum += eb
+    return {
+        "validators": len(reports),
+        "by_status": by_status,
+        "participation_rate": mean("participation_rate"),
+        "source_rate": mean("source_rate"),
+        "target_rate": mean("target_rate"),
+        "head_rate": mean("head_rate"),
+        "attester_effectiveness": mean("attester_effectiveness"),
+        "missed_attestations": sum(missed_parts) if missed_parts else None,
+        "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+        "consensus_reward_gwei": sum(reward_parts),
+        "estimated_apr": _rate(
+            reward_sum * spec.epochs_per_year, eb_sum * window_epochs
+        ),
+    }
 
 
 # ===== § 15. Reporting =====
