@@ -6,11 +6,13 @@
 """Estimate consensus-layer performance of a validator set from the Beacon API."""
 
 import argparse
+import base64
 import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TextIO
+from urllib.parse import unquote, urlsplit
 
 # ===== § 1. Header, constants, exit codes =====
 
@@ -105,6 +107,40 @@ def normalize_pubkey(raw: str, origin: str) -> str:
     if re.fullmatch(r"[0-9a-f]{96}", text) is None:
         raise UsageError(f"{origin}: pubkey must be 48-byte hex")
     return "0x" + text
+
+
+def parse_endpoint(url: str, label: str) -> "Endpoint":
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError as exc:
+        raise UsageError(f"invalid URL: {url!r}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise UsageError(f"unsupported URL scheme: {parsed.scheme!r}")
+    if ":" in host:
+        host = f"[{host}]"
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    base_path = parsed.path.rstrip("/")
+    auth_header = None
+    if parsed.username is not None or parsed.password is not None:
+        user = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        auth_header = f"Basic {token}"
+    return Endpoint(
+        label=label,
+        scheme=parsed.scheme,
+        host=host,
+        port=port,
+        base_path=base_path,
+        auth_header=auth_header,
+    )
+
+
+def redact(ep: "Endpoint") -> str:
+    return f"{ep.scheme}://{ep.host}:{ep.port}"
 
 
 # ===== § 4. CLI and configuration =====

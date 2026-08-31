@@ -6,11 +6,13 @@ Pytest prepends this directory, not scripts/, so the script is loaded by path.
 from __future__ import annotations
 
 import ast
+import base64
 import inspect
 import io
 import re
 import socket
 import sys
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -211,3 +213,70 @@ def test_faketransport_satisfies_the_transport_alias(vp):
     got = transport(ep, "GET", "/x", b"payload")
     assert got is body
     assert isinstance(got, vp.RawResponse)
+
+
+def test_redact_emits_scheme_host_port_only(vp):
+    ep = vp.parse_endpoint(
+        "https://user:secret@bn.example:5052/abc123SECRET/",
+        "bn0",
+    )
+    shown = vp.redact(ep)
+    assert shown == "https://bn.example:5052"
+    assert "secret" not in shown
+    assert "abc123SECRET" not in shown
+
+
+def test_parse_endpoint_percent_decodes_userinfo_before_base64(vp):
+    ep = vp.parse_endpoint("https://u:p%40ss@h:5052/", "bn0")
+    expected = "Basic " + base64.b64encode(b"u:p@ss").decode("ascii")
+    literal = "Basic " + base64.b64encode(b"u:p%40ss").decode("ascii")
+    assert ep.auth_header == expected
+    assert ep.auth_header != literal
+
+
+def test_parse_endpoint_readds_ipv6_brackets(vp):
+    ep = vp.parse_endpoint("http://[::1]:5052", "bn0")
+    assert ep.host == "[::1]"
+
+
+def test_parse_endpoint_keeps_base_path(vp):
+    ep = vp.parse_endpoint("https://h:5052/abc123SECRET/", "bn0")
+    assert ep.base_path == "/abc123SECRET"
+
+
+def test_parse_endpoint_defaults_port_by_scheme(vp):
+    assert vp.parse_endpoint("https://h", "bn0").port == 443
+    assert vp.parse_endpoint("http://h", "bn1").port == 80
+
+
+def test_parse_endpoint_rejects_unknown_scheme(vp):
+    with pytest.raises(vp.UsageError):
+        vp.parse_endpoint("ftp://h", "bn0")
+
+
+def test_parse_endpoint_malformed_netloc_raises_usage_error(vp):
+    url = "https://h:99999"
+    with pytest.raises(vp.UsageError) as ei:
+        vp.parse_endpoint(url, "bn0")
+    assert url in str(ei.value)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.parse_endpoint("https://h:abc", "bn1")
+    assert "https://h:abc" in str(ei.value)
+
+
+def test_parse_endpoint_absent_userinfo_has_no_auth(vp):
+    assert vp.parse_endpoint("https://h:5052", "bn0").auth_header is None
+
+
+def test_endpoint_label_is_positional(vp):
+    a = vp.parse_endpoint("http://same.example:5052", "bn0")
+    b = vp.parse_endpoint("http://same.example:5052", "bn1")
+    assert a.label == "bn0"
+    assert b.label == "bn1"
+    assert a.host == b.host == "same.example"
+
+
+def test_endpoint_is_frozen(vp):
+    ep = vp.parse_endpoint("http://h", "bn0")
+    with pytest.raises(FrozenInstanceError):
+        ep.base_path = "/abc123SECRET"
