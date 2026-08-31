@@ -1869,3 +1869,187 @@ def test_window_iterates_inclusively(vp, load):
     epochs = list(w)
     assert epochs == list(range(w.from_epoch, w.to_epoch + 1))
     assert len(epochs) == w.epochs == w.to_epoch - w.from_epoch + 1
+
+
+# ----- VP-1l: §9 resolve_validators + ValidatorRef -----
+
+_FAR_FUTURE_EPOCH = 2**64 - 1
+
+
+def _resolve(vp, pubkeys, *, name=None, payload=None, verbosity=1):
+    if name is not None:
+        resp = raw_response(vp, name)
+    else:
+        resp = _raw(vp, 200, json.dumps(payload).encode())
+    transport = FakeTransport({("POST", _VALIDATORS_PATH): [resp]})
+    client, buf = _client(vp, transport, verbosity=verbosity)
+    refs = vp.resolve_validators(client, pubkeys)
+    return refs, transport, buf
+
+
+def test_resolve_returns_index_status_eb_and_activation_window(vp):
+    refs, transport, _ = _resolve(
+        vp, [PK1, PK2, PK3], name="states_validators__basic"
+    )
+    assert len(refs) == 3
+    a, b, c = refs
+    assert a.pubkey == PK1
+    assert a.index == 1
+    assert a.status == "active_ongoing"
+    assert a.effective_balance_gwei == 32_000_000_000
+    assert a.activation_epoch == 0
+    assert a.exit_epoch == _FAR_FUTURE_EPOCH
+    assert a.slashed is False
+    assert a.rewards_eligible is True
+    assert b.pubkey == PK2
+    assert b.index == 2
+    assert b.status == "active_exiting"
+    assert b.effective_balance_gwei == 2_048_000_000_000
+    assert b.activation_epoch == 10
+    assert b.exit_epoch == 200
+    assert c.pubkey == PK3
+    assert c.index == 3
+    assert c.status == "pending_queued"
+    assert c.effective_balance_gwei == 32_000_000_000
+    assert c.activation_epoch == 500
+    assert c.exit_epoch == _FAR_FUTURE_EPOCH
+    assert len(transport.calls) == 1
+    assert transport.calls[0][1] == "POST"
+
+
+def test_unknown_pubkey_is_null_index_unknown_status_and_run_continues(vp):
+    refs, transport, _ = _resolve(
+        vp, [PK1, PK4, PK2], name="states_validators__unknown_pubkey"
+    )
+    assert [r.pubkey for r in refs] == [PK1, PK4, PK2]
+    assert refs[0].index == 1
+    assert refs[0].status == "active_ongoing"
+    assert refs[1].index is None
+    assert refs[1].status == "unknown"
+    assert refs[1].effective_balance_gwei is None
+    assert refs[1].activation_epoch is None
+    assert refs[1].exit_epoch is None
+    assert refs[1].rewards_eligible is False
+    assert refs[1].is_active_at(0) is False
+    assert refs[1].is_active_at(100) is False
+    assert refs[1].active_epochs_in([100, 131]) == 0
+    assert refs[2].index == 2
+    assert refs[2].status == "active_ongoing"
+    assert len(transport.calls) == 1
+
+
+def test_results_keyed_by_pubkey_not_position(vp, load):
+    payload = load("states_validators__basic")
+    by_pk = {row["validator"]["pubkey"]: row for row in payload["data"]}
+    # Neither request order nor reverse(request): zip would assign 2, 3, 1.
+    order = [PK2, PK3, PK1]
+    assert order != [PK1, PK2, PK3]
+    assert order != list(reversed([PK1, PK2, PK3]))
+    payload["data"] = [by_pk[pk] for pk in order]
+    refs, _, _ = _resolve(vp, [PK1, PK2, PK3], payload=payload)
+    assert [r.pubkey for r in refs] == [PK1, PK2, PK3]
+    assert {r.pubkey: r.index for r in refs} == {PK1: 1, PK2: 2, PK3: 3}
+
+
+def test_unrecognised_status_passes_through(vp, load):
+    payload = load("states_validators__basic")
+    for row in payload["data"]:
+        pk = row["validator"]["pubkey"]
+        if pk == PK1:
+            row["status"] = "active_weird"
+        elif pk == PK3:
+            row["status"] = ""
+    quiet, _, quiet_buf = _resolve(
+        vp, [PK1, PK2, PK3], payload=payload, verbosity=0
+    )
+    by_pk = {r.pubkey: r for r in quiet}
+    assert by_pk[PK1].status == "active_weird"
+    assert by_pk[PK2].status == "active_exiting"
+    assert by_pk[PK3].status == ""
+    assert by_pk[PK3].status != "unknown"
+    assert "active_weird" not in quiet_buf.getvalue()
+    _, _, verbose_buf = _resolve(
+        vp, [PK1, PK2, PK3], payload=payload, verbosity=1
+    )
+    text = verbose_buf.getvalue()
+    assert "active_weird" in text
+    assert PK1 in text
+
+
+def test_is_active_at_respects_activation_and_exit(vp):
+    refs, _, _ = _resolve(
+        vp, [PK1], name="states_validators__mid_window_activation"
+    )
+    ref = refs[0]
+    assert ref.activation_epoch == 116
+    assert ref.is_active_at(115) is False
+    assert ref.is_active_at(116) is True
+    assert ref.is_active_at(131) is True
+    assert ref.active_epochs_in([100, 131]) == 16
+    window = type("W", (), {"from_epoch": 100, "to_epoch": 131})()
+    assert ref.active_epochs_in(window) == 16
+    exiting = vp.ValidatorRef(
+        PK2, 2, "active_exiting", 32_000_000_000, 0, 110, False
+    )
+    assert exiting.is_active_at(109) is True
+    assert exiting.is_active_at(110) is False
+    assert exiting.active_epochs_in([100, 131]) == 10
+
+
+def test_rewards_eligible_false_for_eb_zero(vp):
+    payload = {
+        "data": [
+            {
+                "index": "1",
+                "balance": "0",
+                "status": "pending_initialized",
+                "validator": {
+                    "pubkey": PK1,
+                    "withdrawal_credentials": "0x" + "00" * 32,
+                    "effective_balance": "0",
+                    "slashed": False,
+                    "activation_eligibility_epoch": "0",
+                    "activation_epoch": str(_FAR_FUTURE_EPOCH),
+                    "exit_epoch": str(_FAR_FUTURE_EPOCH),
+                    "withdrawable_epoch": str(_FAR_FUTURE_EPOCH),
+                },
+            }
+        ]
+    }
+    refs, _, _ = _resolve(vp, [PK1], payload=payload)
+    assert refs[0].index == 1
+    assert refs[0].effective_balance_gwei == 0
+    assert refs[0].rewards_eligible is False
+    direct = vp.ValidatorRef(
+        PK1, 1, "active_ongoing", 0, 0, _FAR_FUTURE_EPOCH, False
+    )
+    assert direct.rewards_eligible is False
+
+
+def test_resolve_empty_pubkeys_makes_zero_calls(vp):
+    transport = FakeTransport({})
+    client, _ = _client(vp, transport)
+    assert vp.resolve_validators(client, []) == []
+    assert transport.calls == []
+
+
+def test_validator_ref_is_frozen(vp):
+    ref = vp.ValidatorRef(
+        PK1, 1, "active_ongoing", 32_000_000_000, 0, _FAR_FUTURE_EPOCH, False
+    )
+    with pytest.raises(FrozenInstanceError):
+        ref.index = 99
+
+
+def test_state_id_is_head(vp):
+    refs, transport, _ = _resolve(
+        vp, [PK1, PK2, PK3], name="states_validators__basic"
+    )
+    assert refs
+    assert len(transport.calls) == 1
+    _label, method, path, body = transport.calls[0]
+    assert method == "POST"
+    assert path == "/eth/v1/beacon/states/head/validators"
+    assert path == _VALIDATORS_PATH
+    assert re.search(r"/states/\d+/validators", path) is None
+    assert json.loads(body) == {"ids": [PK1, PK2, PK3]}

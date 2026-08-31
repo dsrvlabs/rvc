@@ -978,6 +978,102 @@ def resolve_window(
 
 # ===== § 9. Validator resolution =====
 
+_KNOWN_VALIDATOR_STATUSES = frozenset(
+    {
+        "pending_initialized",
+        "pending_queued",
+        "active_ongoing",
+        "active_exiting",
+        "active_slashed",
+        "exited_unslashed",
+        "exited_slashed",
+        "withdrawal_possible",
+        "withdrawal_done",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ValidatorRef:
+    pubkey: str
+    index: int | None
+    status: str
+    effective_balance_gwei: int | None
+    activation_epoch: int | None
+    exit_epoch: int | None
+    slashed: bool
+
+    def is_active_at(self, epoch: int) -> bool:
+        act, ex = self.activation_epoch, self.exit_epoch
+        return act is not None and ex is not None and act <= epoch < ex
+
+    def active_epochs_in(self, window) -> int:
+        start = getattr(window, "from_epoch", None)
+        end = getattr(window, "to_epoch", None)
+        if start is None or end is None:
+            start, end = window[0], window[1]
+        return sum(
+            1 for epoch in range(start, end + 1) if self.is_active_at(epoch)
+        )
+
+    @property
+    def rewards_eligible(self) -> bool:
+        eb = self.effective_balance_gwei
+        return self.index is not None and eb is not None and eb > 0
+
+
+def _unknown_ref(pubkey: str) -> ValidatorRef:
+    return ValidatorRef(pubkey, None, "unknown", None, None, None, False)
+
+
+def _ref_from_row(row: object, log: Log) -> ValidatorRef | None:
+    if not isinstance(row, dict):
+        return None
+    validator = row.get("validator")
+    if not isinstance(validator, dict):
+        return None
+    raw_pk = validator.get("pubkey")
+    if not isinstance(raw_pk, str):
+        return None
+    try:
+        pubkey = normalize_pubkey(raw_pk, "validator.pubkey")
+    except UsageError:
+        return None
+    status = row.get("status")
+    if not isinstance(status, str):
+        status = ""
+    if status not in _KNOWN_VALIDATOR_STATUSES:
+        log.info("unrecognised validator status %s for %s", status, pubkey)
+    return ValidatorRef(
+        pubkey=pubkey,
+        index=parse_uint(row.get("index"), "index"),
+        status=status,
+        effective_balance_gwei=parse_uint(
+            validator.get("effective_balance"), "effective_balance"
+        ),
+        activation_epoch=parse_uint(
+            validator.get("activation_epoch"), "activation_epoch"
+        ),
+        exit_epoch=parse_uint(validator.get("exit_epoch"), "exit_epoch"),
+        slashed=validator.get("slashed") is True,
+    )
+
+
+def resolve_validators(
+    client: BeaconClient, pubkeys: list[str]
+) -> list[ValidatorRef]:
+    keys = [normalize_pubkey(pk, "pubkey") for pk in pubkeys]
+    if not keys:
+        return []
+    # Unknown ids are dropped and order is unspecified; key by pubkey.
+    by_pk: dict[str, ValidatorRef] = {}
+    for row in client.states_validators("head", keys):
+        ref = _ref_from_row(row, client._log)
+        if ref is not None:
+            by_pk[ref.pubkey] = ref
+    return [by_pk.get(pk) or _unknown_ref(pk) for pk in keys]
+
+
 # ===== § 10. Attestation metrics — M1–M6 =====
 
 # ===== § 11. Proposals — M7 and M9's proposer component =====
