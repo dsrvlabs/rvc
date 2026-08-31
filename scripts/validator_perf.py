@@ -176,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force-unsafe-window", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--csv")
+    p.add_argument("--prometheus")
     p.add_argument("--concurrency", type=int)
     p.add_argument("--request-delay-ms", type=int)
     p.add_argument("--connect-timeout", type=float)
@@ -385,6 +386,7 @@ class Options:
     dry_run: bool
     json: bool
     csv: str | None
+    prometheus: str | None
     degraded_ok: bool
     fail_under: tuple[str, ...]
     liveness_check: bool
@@ -416,6 +418,7 @@ def build_options(argv: list[str] | None = None) -> Options:
         dry_run=args.dry_run,
         json=args.json,
         csv=args.csv,
+        prometheus=args.prometheus,
         degraded_ok=args.degraded_ok,
         fail_under=fail_under,
         liveness_check=args.liveness_check,
@@ -3056,6 +3059,146 @@ def render_csv(run: RunReport, path: str) -> None:
             writer.writerow({k: _csv_cell(row.get(k)) for k in fieldnames})
 
 
+_PROM_PREFIX = "rvc_validator_perf_"
+_PROM_VALIDATOR = (
+    ("participation_rate", "participation_rate", "gauge"),
+    ("source_rate", "source_rate", "gauge"),
+    ("target_rate", "target_rate", "gauge"),
+    ("head_rate", "head_rate", "gauge"),
+    ("attester_effectiveness", "attester_effectiveness", "gauge"),
+    ("missed_attestations", "missed_attestations_total", "gauge"),
+    ("proposals.included", "proposals_included_total", "gauge"),
+    ("proposals.scheduled", "proposals_scheduled_total", "gauge"),
+    ("sync.participation_rate", "sync_participation_rate", "gauge"),
+    ("rewards_gwei.total", "consensus_reward_gwei", "gauge"),
+    ("estimated_apr", "estimated_apr", "gauge"),
+)
+
+
+def _prom_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace('"', '\\"')
+    )
+
+
+def _prom_number(value: int | float) -> str:
+    if isinstance(value, float):
+        return format(value, ".15g")
+    return str(value)
+
+
+def _emit(name: str, value: object, labels: dict[str, str]) -> str | None:
+    # Prometheus has no null; omit the series, never emit 0 for None (G5).
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    inner = ",".join(
+        f'{key}="{_prom_escape(val)}"' for key, val in labels.items()
+    )
+    return f"{name}{{{inner}}} {_prom_number(value)}"
+
+
+def _validator_labels(ref: "ValidatorRef") -> dict[str, str]:
+    return {
+        "pubkey": _abbrev_pubkey(ref.pubkey),
+        "index": "" if ref.index is None else str(ref.index),
+        "status": ref.status,
+    }
+
+
+def _atomic_text_write(path: str, text: str, prefix: str) -> None:
+    dest = os.path.abspath(path)
+    directory = os.path.dirname(dest) or "."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)  # mkstemp is 0600; node_exporter must read dest
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def render_prometheus(
+    run: RunReport,
+    path: str,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    """Write a node_exporter textfile. None metrics are omitted, not zero."""
+    rows = [
+        (
+            _validator_labels(report.ref),
+            _flatten(_validator_json(report, run.window, run.threshold_breaches)),
+        )
+        for report in run.validators
+    ]
+    lines: list[str] = []
+
+    def _family(name: str, typ: str, samples: list[str]) -> None:
+        if not samples:
+            return
+        lines.append(f"# HELP {name} {name[len(_PROM_PREFIX):].replace('_', ' ')}")
+        lines.append(f"# TYPE {name} {typ}")
+        lines.extend(samples)
+
+    for field, suffix, typ in _PROM_VALIDATOR:
+        name = _PROM_PREFIX + suffix
+        samples = []
+        for labels, flat in rows:
+            line = _emit(name, flat.get(field), labels)
+            if line is not None:
+                samples.append(line)
+        _family(name, typ, samples)
+
+    degs = list(run.degradations) or [
+        d for report in run.validators for d in report.degradations
+    ]
+    counts: dict[str, int] = {}
+    for deg in degs:
+        counts[deg.reason] = counts.get(deg.reason, 0) + 1
+    deg_name = _PROM_PREFIX + "degradations_total"
+    deg_samples = []
+    for reason in sorted(counts):
+        line = _emit(deg_name, counts[reason], {"reason": reason})
+        if line is not None:
+            deg_samples.append(line)
+    _family(deg_name, "gauge", deg_samples)
+
+    now = clock() if clock is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise TypeError("generated_at clock must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    exit_name = _PROM_PREFIX + "run_exit_code"
+    _family(
+        exit_name,
+        "gauge",
+        [line for line in [_emit(exit_name, run.exit_code, {})] if line],
+    )
+    ts_name = _PROM_PREFIX + "run_generated_timestamp_seconds"
+    _family(
+        ts_name,
+        "gauge",
+        [
+            line
+            for line in [_emit(ts_name, int(now.timestamp()), {})]
+            if line
+        ],
+    )
+    # Random tmp name; dest+".tmp" is symlink-plantable.
+    _atomic_text_write(path, "\n".join(lines) + "\n", prefix="prom.")
+
+
 # ===== § 16. main =====
 
 
@@ -3245,6 +3388,8 @@ def main(
             render_table(run, sys.stdout)
         if opts.csv:
             render_csv(run, opts.csv)
+        if opts.prometheus:
+            render_prometheus(run, opts.prometheus)
         return code
     except UsageError as exc:
         log.error("%s", exc)

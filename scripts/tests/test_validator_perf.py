@@ -345,6 +345,7 @@ _DOCUMENTED_FLAGS = {
     "--force-unsafe-window",
     "--json",
     "--csv",
+    "--prometheus",
     "--concurrency",
     "--request-delay-ms",
     "--connect-timeout",
@@ -458,7 +459,6 @@ def test_parser_declares_every_documented_flag(vp):
     names = {opt for action in parser._actions for opt in action.option_strings}
     dests = {action.dest: list(action.option_strings) for action in parser._actions}
     assert _DOCUMENTED_FLAGS <= names
-    assert "--prometheus" not in names
     assert names - _DOCUMENTED_FLAGS <= {"-h", "--help"}
     assert dests["verbose"] == ["-v"]
     assert dests["quiet"] == ["-q"]
@@ -3272,6 +3272,7 @@ def test_main_body_has_no_metric_logic():
         "render_json",
         "render_table",
         "render_csv",
+        "render_prometheus",
         "_render_dry_run",
         "replace(",
         "ThreadPoolExecutor",
@@ -3296,6 +3297,7 @@ def test_main_body_has_no_metric_logic():
         "render_json",
         "render_table",
         "render_csv",
+        "render_prometheus",
     ]
     positions = [body.index(name) for name in order]
     assert positions == sorted(positions)
@@ -9591,5 +9593,213 @@ def test_csv_neutralizes_formula_injection(vp, load, tmp_path):
         _write_csv(vp, _table_run(vp, load, [numeric]), tmp_path)
     )
     assert rows[0]["rewards_gwei.inactivity"] == "-100"
+
+
+# ----- VP-5b: §15 Prometheus exposition + --prometheus flag (P2-2) -----
+
+_PROM_NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+_PROM_SAMPLE = re.compile(
+    r"^[a-zA-Z_:][a-zA-Z0-9_:]*\{"
+    r'(?:[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\]|\\.)*"'
+    r'(?:,[a-zA-Z_][a-zA-Z0-9_]*="(?:[^"\\]|\\.)*")*)?'
+    r"\} [+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$"
+)
+_PROM_TYPE = re.compile(
+    r"^# TYPE ([a-zA-Z_:][a-zA-Z0-9_:]*) "
+    r"(counter|gauge|untyped|histogram|summary)$"
+)
+
+
+def _write_prom(vp, run, tmp_path, name="out.prom", clock=None):
+    path = tmp_path / name
+    vp.render_prometheus(
+        run, str(path), clock=clock or (lambda: _PROM_NOW)
+    )
+    return path
+
+
+def test_null_metrics_are_omitted_not_zero(vp, load, tmp_path):
+    report = _table_report(
+        vp,
+        ref=_active_ref(vp, index=7, pubkey=PK1),
+        head_rate=None,
+        missed_attestations=0,
+    )
+    text = _write_prom(vp, _table_run(vp, load, [report]), tmp_path).read_text(
+        encoding="utf-8"
+    )
+    abbrev = vp._abbrev_pubkey(PK1)
+    assert vp._emit("rvc_validator_perf_head_rate", None, {"pubkey": abbrev}) is None
+    assert "rvc_validator_perf_head_rate" not in text
+    assert re.search(r"head_rate.*0$", text, re.M) is None
+    assert "rvc_validator_perf_missed_attestations_total{" in text
+    assert re.search(
+        r"rvc_validator_perf_missed_attestations_total\{[^}]*pubkey=\""
+        + re.escape(abbrev)
+        + r"\"[^}]*\} 0$",
+        text,
+        re.M,
+    )
+    zero = _table_report(
+        vp,
+        ref=_active_ref(vp, index=8, pubkey=PK2),
+        head_rate=0.0,
+    )
+    zero_text = _write_prom(
+        vp, _table_run(vp, load, [zero]), tmp_path, name="zero.prom"
+    ).read_text(encoding="utf-8")
+    assert "rvc_validator_perf_head_rate{" in zero_text
+    assert re.search(r"rvc_validator_perf_head_rate\{[^}]*\} 0(\.0)?$", zero_text, re.M)
+
+
+def test_exposition_parses(vp, load, tmp_path):
+    text = _write_prom(
+        vp, _table_run(vp, load, _golden_reports(vp)), tmp_path
+    ).read_text(encoding="utf-8")
+    typed = None
+    families: list[str] = []
+    for line in text.splitlines():
+        type_match = _PROM_TYPE.match(line)
+        if type_match:
+            typed = type_match.group(1)
+            families.append(typed)
+            continue
+        if not line or line.startswith("#"):
+            continue
+        assert _PROM_SAMPLE.match(line), line
+        name = line.split("{", 1)[0]
+        assert typed == name
+    assert families
+    assert len(families) == len(set(families))
+    for name in families:
+        if name.endswith("_total"):
+            assert f"# TYPE {name} gauge" in text
+        pos_type = text.index(f"# TYPE {name} ")
+        pos_sample = text.index(f"{name}{{")
+        assert pos_type < pos_sample
+
+
+def test_prometheus_golden_matches(vp, load, tmp_path):
+    text = _write_prom(
+        vp, _table_run(vp, load, _golden_reports(vp)), tmp_path
+    ).read_text(encoding="utf-8")
+    expected = (FIXTURES / "prometheus__golden.prom").read_text(encoding="utf-8")
+    assert text == expected
+
+
+def test_written_atomically_via_os_replace(vp, tmp_path, monkeypatch, capsys):
+    dest = tmp_path / "metrics.prom"
+    seen: list[tuple[str, str, bool, bool, int | None]] = []
+    real_replace = vp.os.replace
+
+    def spy(src, dst):
+        src_mode = os.stat(src).st_mode & 0o777 if os.path.exists(src) else None
+        seen.append(
+            (
+                str(src),
+                str(dst),
+                os.path.exists(src),
+                os.path.exists(dst),
+                src_mode,
+            )
+        )
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(vp.os, "replace", spy)
+    code, _transport = _run_full(vp, "--no-cache", "--prometheus", str(dest))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert dest.is_file()
+    hits = [item for item in seen if item[1] == str(dest)]
+    assert hits
+    src, dst, src_exists, dst_existed, src_mode = hits[0]
+    assert src_exists is True
+    assert dst == str(dest)
+    assert src != dst
+    assert dst_existed is False
+    assert not src.endswith(os.path.basename(dst) + ".tmp")
+    assert os.path.basename(src).startswith("prom.")
+    assert os.path.dirname(src) == os.path.dirname(dst)
+    assert src_mode == 0o644
+    assert dest.stat().st_mode & 0o777 == 0o644
+
+
+def test_pubkey_label_is_abbreviated(vp, load, tmp_path):
+    assert len(_PK_DOC) == 2 + 96
+    report = _table_report(vp, ref=_active_ref(vp, index=1234, pubkey=_PK_DOC))
+    text = _write_prom(vp, _table_run(vp, load, [report]), tmp_path).read_text(
+        encoding="utf-8"
+    )
+    assert _PK_DOC not in text
+    assert 'pubkey="0x9324…a6d3"' in text
+
+
+def test_no_beacon_url_or_secret_in_any_label(vp, load, tmp_path):
+    run = _json_run(vp, load, endpoints_used=[_SECRET_URL])
+    text = _write_prom(vp, run, tmp_path).read_text(encoding="utf-8")
+    assert vp._prom_escape('a\r\n"\\') == r'a\r\n\"\\'
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+    assert "user:" not in text
+    assert "http://" not in text
+    assert "https://" not in text
+    for line in text.splitlines():
+        if not line or line.startswith("#") or "{" not in line:
+            continue
+        labels = line.split("{", 1)[1].rsplit("}", 1)[0]
+        assert "bn.example" not in labels
+        assert "5052" not in labels
+        assert "/eth/" not in labels
+
+
+def test_degradations_total_emitted_per_reason(vp, load, tmp_path):
+    leak = vp.Degradation("head_rate", "epoch:100", "inactivity_leak", "leak")
+    leak2 = vp.Degradation("head_rate", "epoch:101", "inactivity_leak", "leak")
+    missing = vp.Degradation(
+        "attester_effectiveness", "epoch:102", "ideal_row_missing", ""
+    )
+    run = replace(
+        _table_run(vp, load, [_table_report(vp)]),
+        degradations=[leak, leak2, missing],
+    )
+    text = _write_prom(vp, run, tmp_path).read_text(encoding="utf-8")
+    assert "# TYPE rvc_validator_perf_degradations_total gauge" in text
+    assert re.search(
+        r'rvc_validator_perf_degradations_total\{reason="ideal_row_missing"\} 1$',
+        text,
+        re.M,
+    )
+    assert re.search(
+        r'rvc_validator_perf_degradations_total\{reason="inactivity_leak"\} 2$',
+        text,
+        re.M,
+    )
+    assert "rewards_api_unsupported" not in text
+    assert "state_unavailable" not in text
+
+
+def test_exit_code_and_generated_timestamp_emitted(vp, load, tmp_path):
+    run = replace(_table_run(vp, load, [_table_report(vp)]), exit_code=3)
+    text = _write_prom(vp, run, tmp_path).read_text(encoding="utf-8")
+    assert re.search(r"rvc_validator_perf_run_exit_code\{\} 3$", text, re.M)
+    ts = int(_PROM_NOW.timestamp())
+    assert re.search(
+        r"rvc_validator_perf_run_generated_timestamp_seconds\{\} "
+        + str(ts)
+        + r"$",
+        text,
+        re.M,
+    )
+
+
+def test_prometheus_flag_present_in_the_parser(vp):
+    parser = vp.build_parser()
+    names = {opt for action in parser._actions for opt in action.option_strings}
+    dests = {action.dest: action for action in parser._actions}
+    assert "--prometheus" in names
+    assert dests["prometheus"].option_strings == ["--prometheus"]
+    opts = vp.build_options(_minimal_opts_argv("--prometheus", "/tmp/out.prom"))
+    assert opts.prometheus == "/tmp/out.prom"
+    assert vp.build_options(_minimal_opts_argv()).prometheus is None
 
 
