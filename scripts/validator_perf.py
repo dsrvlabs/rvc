@@ -1434,12 +1434,82 @@ def _duties_for_epoch(
     return hits
 
 
+def _block_reward_fields(resp: object) -> tuple[int, int] | None:
+    if not isinstance(resp, dict):
+        return None
+    try:
+        return (
+            parse_uint(resp.get("proposer_index"), "proposer_index"),
+            parse_uint(resp.get("total"), "total"),
+        )
+    except UsageError:
+        return None
+
+
+def _header_proposer_index(data: object) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    header = data.get("header")
+    if not isinstance(header, dict):
+        return None
+    message = header.get("message")
+    if not isinstance(message, dict):
+        return None
+    try:
+        return parse_uint(message.get("proposer_index"), "proposer_index")
+    except UsageError:
+        return None
+
+
+def _reward_unreadable(epoch: int, slot: int) -> Degradation:
+    return Degradation(
+        "proposals",
+        f"epoch:{epoch}",
+        "block_reward_unavailable",
+        f"slot {slot}",
+    )
+
+
+def _confirm_inclusion(
+    client: BeaconClient,
+    slot: int,
+    validator_index: int,
+    epoch: int,
+    rewards_api: str,
+) -> tuple[bool | None, int | None, Degradation | None]:
+    if rewards_api != "route_absent":
+        try:
+            resp = client.rewards_block(slot)
+        except (BeaconStatus, BeaconTransport):
+            resp = None
+        fields = _block_reward_fields(resp)
+        if fields is not None:
+            proposer, total = fields
+            if proposer != validator_index:
+                return False, None, None
+            return True, total, None
+        # 404, {"data": null}, and unreadable 200 all look like None here.
+    try:
+        header = client.header(str(slot))
+    except (BeaconStatus, BeaconTransport):
+        return None, None, None
+    if header is None:
+        return False, None, None
+    proposer = _header_proposer_index(header)
+    if proposer is not None and proposer != validator_index:
+        return False, None, None
+    if rewards_api == "route_absent":
+        return True, None, None
+    return True, None, _reward_unreadable(epoch, slot)
+
+
 def collect_proposals(
     client: BeaconClient,
     w: Window,
     index_set: set[int],
     pool,
     budget,
+    rewards_api: str = "available",
 ) -> tuple[dict[int, list[ProposalOutcome]], list[Degradation], bool]:
     degs: list[Degradation] = []
     out: dict[int, list[ProposalOutcome]] = {idx: [] for idx in index_set}
@@ -1478,9 +1548,33 @@ def collect_proposals(
             continue
         for outcome in hits:
             out.setdefault(outcome.validator_index, []).append(outcome)
-    for series in out.values():
+
+    def fill(
+        outcome: ProposalOutcome,
+    ) -> tuple[ProposalOutcome, Degradation | None]:
+        included, reward, deg = _confirm_inclusion(
+            client,
+            outcome.slot,
+            outcome.validator_index,
+            outcome.epoch,
+            rewards_api,
+        )
+        return replace(outcome, included=included, reward_gwei=reward), deg
+
+    pending = [o for series in out.values() for o in series]
+    filled: dict[int, list[ProposalOutcome]] = {idx: [] for idx in out}
+    confirm_futs = {pool.submit(fill, o): o for o in pending}
+    for fut in as_completed(confirm_futs):
+        try:
+            outcome, deg = fut.result()
+        except (BeaconStatus, BeaconTransport):
+            outcome, deg = confirm_futs[fut], None
+        filled.setdefault(outcome.validator_index, []).append(outcome)
+        if deg is not None:
+            degs.append(deg)
+    for series in filled.values():
         series.sort(key=lambda o: o.slot)
-    return out, degs, available
+    return filled, degs, available
 
 
 # ===== § 12. Sync committee — M8 =====
@@ -1761,6 +1855,31 @@ class ValidatorReport:
     degradations: list[Degradation]
 
 
+def _proposal_counts(
+    outcomes: Sequence[ProposalOutcome], duties_available: bool
+) -> dict:
+    included = sum(1 for o in outcomes if o.included is True)
+    if not duties_available:
+        return {"scheduled": None, "included": included, "missed": None}
+    return {
+        "scheduled": len(outcomes),
+        "included": included,
+        "missed": sum(1 for o in outcomes if o.included is False),
+    }
+
+
+def _proposer_reward_gwei(outcomes: Sequence[ProposalOutcome]) -> int | None:
+    # Included-but-unreadable is null, never 0 (G5 / RD-8).
+    readable = 0
+    for outcome in outcomes:
+        if outcome.included is not True:
+            continue
+        if outcome.reward_gwei is None:
+            return None
+        readable += outcome.reward_gwei
+    return readable
+
+
 def build_validator_report(
     ref: ValidatorRef,
     outcomes: list[EpochOutcome],
@@ -1769,10 +1888,15 @@ def build_validator_report(
     window: Window,
     degradations: list[Degradation] | None = None,
     *,
-    proposer_gwei: int = 0,
+    proposer_gwei: int | None = None,
     sync_gwei: int = 0,
+    proposal_outcomes: Sequence[ProposalOutcome] | None = None,
+    duties_available: bool = True,
 ) -> ValidatorReport:
     degs = list(degradations or ())
+    props = list(proposal_outcomes or ())
+    if proposer_gwei is None:
+        proposer_gwei = _proposer_reward_gwei(props)
     # Unknown to the BN is state_unavailable (exit 3), not R9's known zero-active.
     if ref.index is None or ref.status == "unknown":
         degs.append(
@@ -1807,11 +1931,10 @@ def build_validator_report(
     target = sum(o.target_gwei for o in outcomes)
     head = sum(o.head_gwei for o in outcomes)
     total = (
-        sum(o.flag_actual_gwei for o in outcomes)
-        + inactivity
-        + proposer_gwei
-        + sync_gwei
+        sum(o.flag_actual_gwei for o in outcomes) + inactivity + sync_gwei
     )
+    if proposer_gwei is not None:
+        total += proposer_gwei
     eb, _changed = effective_balance_for(snap, ref)
     window_epochs = window.epochs
     # 0/EB annualizes to 0.0; an empty outcome list is null.
@@ -1838,7 +1961,7 @@ def build_validator_report(
         attester_effectiveness=effectiveness,
         effectiveness_method="reward_ratio",
         leak_epochs_excluded=sum(1 for o in outcomes if o.leak),
-        proposals={"scheduled": None, "included": 0, "missed": None},
+        proposals=_proposal_counts(props, duties_available),
         sync=None,
         balance=snap,
         rewards_gwei={
@@ -1902,6 +2025,24 @@ def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
             window_epochs = report.window_epochs
         reward_sum += total
         eb_sum += eb
+    scheduled = 0
+    prop_included = 0
+    prop_missed = 0
+    sched_null = False
+    missed_null = False
+    for report in reports:
+        if report.ref.index is None:
+            continue
+        row = report.proposals or {}
+        if row.get("scheduled") is None:
+            sched_null = True
+        else:
+            scheduled += row["scheduled"]
+        prop_included += row.get("included") or 0
+        if row.get("missed") is None:
+            missed_null = True
+        else:
+            prop_missed += row["missed"]
     return {
         "validators": len(reports),
         "by_status": by_status,
@@ -1911,7 +2052,11 @@ def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
         "head_rate": mean("head_rate"),
         "attester_effectiveness": mean("attester_effectiveness"),
         "missed_attestations": sum(missed_parts) if missed_parts else None,
-        "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+        "proposals": {
+            "scheduled": None if sched_null else scheduled,
+            "included": prop_included,
+            "missed": None if missed_null else prop_missed,
+        },
         "consensus_reward_gwei": sum(reward_parts),
         "estimated_apr": _rate(
             reward_sum * spec.epochs_per_year, eb_sum * window_epochs
@@ -2037,6 +2182,7 @@ def render_table(run: RunReport, out: TextIO) -> None:
             "inclusion distance is absent because it requires a full block scan",
             "0/0 proposals is normal at this key count — 200 keys over 32 epochs "
             "expect ≈0.19 proposals; proposals_expected is not implemented",
+            "an orphaned block is not canonical and reads as missed",
             "",
             "DEGRADED:",
         ]
@@ -2210,6 +2356,10 @@ def main(
         outcomes, att_degs = collect_attestations(
             client, window, refs, pool, budget
         )
+        index_set = {ref.index for ref in refs if ref.index is not None}
+        proposals, prop_degs, duties_available = collect_proposals(
+            client, window, index_set, pool, budget, ctx.rewards_api
+        )
         snaps, bal_degs = collect_balances(client, window, refs)
         empty_snap = BalanceSnapshot(None, None, None, None)
         reports: list[ValidatorReport] = []
@@ -2223,8 +2373,17 @@ def main(
             series = (
                 outcomes.get(ref.index, []) if ref.index is not None else []
             )
+            prop_series = (
+                proposals.get(ref.index, []) if ref.index is not None else []
+            )
             report = build_validator_report(
-                ref, series, snap, ctx.spec, window
+                ref,
+                series,
+                snap,
+                ctx.spec,
+                window,
+                proposal_outcomes=prop_series,
+                duties_available=duties_available,
             )
             reports.append(report)
             report_degs.extend(report.degradations)
@@ -2233,7 +2392,7 @@ def main(
             window,
             reports,
             build_aggregate(reports, ctx.spec),
-            att_degs + bal_degs + report_degs,
+            att_degs + prop_degs + bal_degs + report_degs,
             client.endpoints_used,
             EXIT_OK,
         )

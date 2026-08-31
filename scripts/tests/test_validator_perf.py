@@ -3250,6 +3250,7 @@ def test_main_body_has_no_metric_logic():
         "resolve_validators",
         "probe_rewards_api",
         "collect_attestations",
+        "collect_proposals",
         "collect_balances",
         "build_validator_report",
         "build_aggregate",
@@ -3271,6 +3272,7 @@ def test_main_body_has_no_metric_logic():
         "resolve_validators",
         "probe_rewards_api",
         "collect_attestations",
+        "collect_proposals",
         "collect_balances",
         "build_validator_report",
         "build_aggregate",
@@ -4340,7 +4342,7 @@ def _table_report(vp, ref=None, **kw):
         attester_effectiveness=1.0,
         effectiveness_method="reward_ratio",
         leak_epochs_excluded=0,
-        proposals={"scheduled": None, "included": 0, "missed": None},
+        proposals={"scheduled": 0, "included": 0, "missed": 0},
         sync=None,
         balance=vp.BalanceSnapshot(_EB_32, _EB_32, _EB_32, _EB_32),
         rewards_gwei=_rewards_gwei(0),
@@ -4904,6 +4906,9 @@ def _full_run_routes(
     routes[("POST", _validators_at((_FULL_TO + 2) * spe))] = [
         raw_response(vp, end)
     ]
+    routes[("GET", _PROPOSER_TEMPLATE.format(epoch=_FULL_FROM))] = [
+        _raw(vp, 200, b'{"data": []}')
+    ]
     return routes
 
 
@@ -5182,19 +5187,68 @@ def _duty_routes(w, response, *, fail_epoch=None, fail=None):
     return routes
 
 
-def _collect_prop(vp, w, index_set, routes, *, concurrency=4, budget=None, pool=None):
-    transport = FakeTransport(routes)
+def _blocks_path(slot):
+    return f"/eth/v1/beacon/rewards/blocks/{slot}"
+
+
+def _slot_header_path(slot):
+    return f"/eth/v1/beacon/headers/{slot}"
+
+
+def _inclusion_transport(vp, routes):
+    inner = FakeTransport(routes)
+
+    class _Transport:
+        def __init__(self):
+            self.calls = inner.calls
+            self.drops = inner.drops
+            self.closed = False
+            self.routes = inner.routes
+
+        def __call__(self, ep, method, path, body):
+            try:
+                return inner(ep, method, path, body)
+            except KeyError:
+                if method == "GET" and (
+                    "/eth/v1/beacon/rewards/blocks/" in path
+                    or "/eth/v1/beacon/headers/" in path
+                ):
+                    return _raw(vp, 404)
+                raise
+
+        def drop(self, ep):
+            inner.drop(ep)
+
+        def close(self):
+            inner.close()
+            self.closed = inner.closed
+
+    return _Transport()
+
+
+def _collect_prop(
+    vp,
+    w,
+    index_set,
+    routes,
+    *,
+    concurrency=4,
+    budget=None,
+    pool=None,
+    rewards_api="available",
+):
+    transport = _inclusion_transport(vp, routes)
     client, _ = _client(vp, transport)
     if budget is None:
         budget = vp.RequestBudget()
     if pool is not None:
         outcomes, degs, available = vp.collect_proposals(
-            client, w, index_set, pool, budget
+            client, w, index_set, pool, budget, rewards_api
         )
         return outcomes, degs, available, transport, budget
     with ThreadPoolExecutor(max_workers=concurrency) as owned:
         outcomes, degs, available = vp.collect_proposals(
-            client, w, index_set, owned, budget
+            client, w, index_set, owned, budget, rewards_api
         )
     return outcomes, degs, available, transport, budget
 
@@ -5218,8 +5272,10 @@ def test_scheduled_slots_intersected_with_our_index_set(vp, load):
     w = _att_window(vp, 100, 100)
     index_set = {1, 99}
     ok = raw_response(vp, "duties_proposer__ok")
+    routes = _duty_routes(w, ok)
+    routes[("GET", _blocks_path(3200))] = [raw_response(vp, "rewards_blocks__ok")]
     outcomes, degs, available, transport, _budget = _collect_prop(
-        vp, w, index_set, _duty_routes(w, ok)
+        vp, w, index_set, routes
     )
     assert available is True
     assert degs == []
@@ -5230,8 +5286,8 @@ def test_scheduled_slots_intersected_with_our_index_set(vp, load):
     o = ours[0]
     assert o.slot == 3200
     assert o.epoch == 100
-    assert o.included is None
-    assert o.reward_gwei is None
+    assert o.included is True
+    assert o.reward_gwei == 1_234_567
     assert 99 in outcomes
     assert outcomes[99] == []
     gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
@@ -5454,6 +5510,282 @@ def test_duties_dedup_cap_and_drop_slots_outside_epoch(vp):
     assert all(3200 <= slot < 3232 for slot in slots)
     assert len(slots) <= 32
     assert len(slots) == 32
+
+
+# ----- VP-3b: §11 inclusion — rewards/blocks → headers/{slot} confirm (RD-8) -----
+
+_ORPHANED_FOOTNOTE = (
+    "an orphaned block is not canonical and reads as missed"
+)
+
+
+def _blocks_calls(transport):
+    return [
+        c
+        for c in transport.calls
+        if c[1] == "GET" and "/eth/v1/beacon/rewards/blocks/" in c[2]
+    ]
+
+
+def _slot_header_calls(transport):
+    return [
+        c
+        for c in transport.calls
+        if c[1] == "GET" and "/eth/v1/beacon/headers/" in c[2]
+    ]
+
+
+def _duty_ok_routes(vp, w, *, slot=3200, blocks=None, headers=None):
+    routes = _duty_routes(w, raw_response(vp, "duties_proposer__ok"))
+    if blocks is not None:
+        routes[("GET", _blocks_path(slot))] = list(blocks)
+    if headers is not None:
+        routes[("GET", _slot_header_path(slot))] = list(headers)
+    return routes
+
+
+def test_404_from_rewards_blocks_with_header_200_is_included_not_missed(vp, load):
+    pair = load("rewards_blocks__404_headers_200")
+    assert pair["blocks"]["status"] == 404
+    assert pair["headers"]["status"] == 200
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp,
+        w,
+        blocks=[_raw_from_probe_leg(vp, pair["blocks"])],
+        headers=[_raw_from_probe_leg(vp, pair["headers"])],
+    )
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    o = outcomes[1][0]
+    assert o.included is True
+    assert o.included is not False
+    assert o.reward_gwei is None
+    assert any(
+        d.reason == "block_reward_unavailable" and d.scope == "epoch:100"
+        for d in degs
+    )
+    run = vp.RunReport(
+        _chain_ctx(vp, load),
+        w,
+        [],
+        {},
+        degs,
+        [],
+        vp.EXIT_OK,
+    )
+    assert vp.decide_exit_code(run, _window_opts(vp)) == vp.EXIT_DEGRADED == 3
+    assert _blocks_calls(transport)
+    assert _slot_header_calls(transport)
+    report = _build_report(
+        vp,
+        load,
+        _active_ref(vp),
+        [],
+        proposal_outcomes=outcomes[1],
+        degradations=degs,
+    )
+    assert report.proposals == {"scheduled": 1, "included": 1, "missed": 0}
+    assert report.rewards_gwei["proposer"] is None
+    assert report.rewards_gwei["proposer"] != 0
+
+
+def test_404_from_both_is_genuinely_missed_and_exits_0(vp, load):
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp,
+        w,
+        blocks=[_raw(vp, 404)],
+        headers=[raw_response(vp, "headers__slot_404", status=404)],
+    )
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    o = outcomes[1][0]
+    assert o.included is False
+    assert o.reward_gwei is None
+    assert not any(d.reason == "block_reward_unavailable" for d in degs)
+    run = vp.RunReport(
+        _chain_ctx(vp, load),
+        w,
+        [],
+        {},
+        degs,
+        [],
+        vp.EXIT_OK,
+    )
+    assert vp.decide_exit_code(run, _window_opts(vp)) == vp.EXIT_OK == 0
+
+
+def test_200_gives_included_and_the_proposer_reward(vp, load):
+    payload = load("rewards_blocks__ok")
+    total = int(payload["data"]["total"])
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp, w, blocks=[raw_response(vp, "rewards_blocks__ok")]
+    )
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    assert degs == []
+    o = outcomes[1][0]
+    assert o.included is True
+    assert o.reward_gwei == total
+    report = _build_report(
+        vp, load, _active_ref(vp), [], proposal_outcomes=outcomes[1]
+    )
+    assert report.rewards_gwei["proposer"] == total
+    assert report.rewards_gwei["total"] == total
+    assert report.proposals == {"scheduled": 1, "included": 1, "missed": 0}
+    assert not _slot_header_calls(transport)
+
+
+def test_data_null_is_treated_as_reward_unreadable_not_missed(vp, load):
+    payload = load("rewards_blocks__data_null")
+    assert payload["data"] is None
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp,
+        w,
+        blocks=[raw_response(vp, "rewards_blocks__data_null")],
+        headers=[raw_response(vp, "headers__slot_present")],
+    )
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    o = outcomes[1][0]
+    assert o.included is True
+    assert o.included is not False
+    assert o.reward_gwei is None
+    assert any(d.reason == "block_reward_unavailable" for d in degs)
+    report = _build_report(
+        vp,
+        load,
+        _active_ref(vp),
+        [],
+        proposal_outcomes=outcomes[1],
+        degradations=degs,
+    )
+    assert report.proposals["included"] == 1
+    assert report.rewards_gwei["proposer"] is None
+    assert report.rewards_gwei["proposer"] != 0
+
+
+def test_mismatched_proposer_index_is_not_ours(vp, load):
+    payload = load("rewards_blocks__ok")
+    payload["data"]["proposer_index"] = "99"
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp, w, blocks=[_raw(vp, 200, json.dumps(payload).encode())]
+    )
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    o = outcomes[1][0]
+    assert o.validator_index == 1
+    assert o.included is False
+    assert o.reward_gwei is None
+    assert degs == []
+    assert not _slot_header_calls(transport)
+
+
+def test_route_absent_uses_headers_alone(vp):
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp, w, headers=[raw_response(vp, "headers__slot_present")]
+    )
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes, rewards_api="route_absent"
+    )
+    assert available is True
+    assert _blocks_calls(transport) == []
+    assert _slot_header_calls(transport)
+    o = outcomes[1][0]
+    assert o.included is True
+    assert o.reward_gwei is None
+    assert not any(d.reason == "block_reward_unavailable" for d in degs)
+
+
+def test_no_headers_call_when_rewards_blocks_returns_200(vp):
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp, w, blocks=[raw_response(vp, "rewards_blocks__ok")]
+    )
+    _outcomes, _degs, _available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert _blocks_calls(transport)
+    assert _slot_header_calls(transport) == []
+
+
+def test_included_still_derived_when_duties_are_unavailable(vp, load):
+    w = _att_window(vp, 100, 101)
+    fail = _duty_error(vp, "duties_proposer__404", 404)
+    duty_101 = _raw(
+        vp,
+        200,
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "pubkey": PK1,
+                        "validator_index": "1",
+                        "slot": "3232",
+                    }
+                ]
+            }
+        ).encode(),
+    )
+    routes = _duty_routes(w, duty_101, fail_epoch=100, fail=fail)
+    routes[("GET", _blocks_path(3232))] = [
+        raw_response(vp, "rewards_blocks__ok")
+    ]
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is False
+    assert any(
+        d.reason == "proposer_duties_unavailable" and d.scope == "epoch:100"
+        for d in degs
+    )
+    ours = outcomes[1]
+    assert len(ours) == 1
+    assert ours[0].slot == 3232
+    assert ours[0].included is True
+    report = _build_report(
+        vp,
+        load,
+        _active_ref(vp),
+        [],
+        proposal_outcomes=ours,
+        duties_available=False,
+    )
+    assert report.proposals["scheduled"] is None
+    assert report.proposals["missed"] is None
+    assert report.proposals["included"] == 1
+
+
+def test_orphaned_block_reads_as_missed_and_is_documented(vp, load):
+    w = _att_window(vp, 100, 100)
+    routes = _duty_ok_routes(
+        vp,
+        w,
+        blocks=[_raw(vp, 404)],
+        headers=[raw_response(vp, "headers__slot_404", status=404)],
+    )
+    outcomes, degs, _available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert outcomes[1][0].included is False
+    assert not any(d.reason == "block_reward_unavailable" for d in degs)
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    assert _ORPHANED_FOOTNOTE in text
 
 
 # ----- VP-3c: §12 sync membership — one request per period, state_id inside (RD-12) -----

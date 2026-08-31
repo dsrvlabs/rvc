@@ -10,5 +10,6 @@ missed 16  incl/sched 0/0  consensus_reward_gwei 3000000  APR% 12.04
 
 inclusion distance is absent because it requires a full block scan
 0/0 proposals is normal at this key count — 200 keys over 32 epochs expect ≈0.19 proposals; proposals_expected is not implemented
+an orphaned block is not canonical and reads as missed
 
 DEGRADED:
