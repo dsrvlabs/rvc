@@ -14,6 +14,7 @@ import json
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -6382,4 +6383,303 @@ def test_all_404_with_membership_is_skipped_only_not_a_miss(vp, load):
     assert _sync_exit(vp, load, degs) == vp.EXIT_OK == 0
     assert len(_sync_scan_calls(transport)) == w.epochs * 32
     assert budget.flagged is True
+
+
+# ----- VP-3e: §13/§14 M9 balance-delta fallback + reward_source (P1-2, D13, SM4) -----
+
+_REWARD_COMPONENT_KEYS = (
+    "source",
+    "target",
+    "head",
+    "inactivity",
+    "proposer",
+    "sync",
+)
+
+
+def _rewards_less_routes(
+    vp, *, with_proposal=False, fail_balances=False, validators=None
+):
+    full_kw = {"fail_collect": True}
+    if validators is not None:
+        full_kw["validators"] = validators
+    routes = _full_run_routes(vp, **full_kw)
+    missing = raw_response(vp, "rewards_attestations__404_all", status=404)
+    routes[("POST", _DRY_RUN_ATT_PATH)] = [missing]
+    routes[("POST", _REWARDS_TEMPLATE.format(epoch=_FULL_FROM))] = [missing]
+    if fail_balances:
+        spe = 32
+        routes.update(_pruned_slot(vp, (_FULL_FROM + 1) * spe))
+        routes.update(_pruned_slot(vp, (_FULL_TO + 2) * spe))
+    if with_proposal:
+        slot = _FULL_FROM * 32
+        duties = json.loads(
+            (FIXTURES / "duties_proposer__ok.json").read_text()
+        )
+        duties["data"] = [
+            {**row, "slot": str(slot)}
+            for row in duties["data"]
+            if row["validator_index"] == "1"
+        ]
+        routes[("GET", _PROPOSER_TEMPLATE.format(epoch=_FULL_FROM))] = [
+            _raw(vp, 200, json.dumps(duties).encode())
+        ]
+        pair = json.loads(
+            (FIXTURES / "rewards_blocks__404_headers_200.json").read_text()
+        )
+        routes[("GET", _blocks_path(slot))] = [
+            _raw_from_probe_leg(vp, pair["blocks"])
+        ]
+        routes[("GET", _slot_header_path(slot))] = [
+            raw_response(vp, "headers__slot_present")
+        ]
+    return routes
+
+
+def _run_rewards_less(vp, capsys, *extra, pubkeys=None, **route_kw):
+    run_kw = {}
+    if pubkeys is not None:
+        run_kw["pubkeys"] = pubkeys
+    code, transport = _run_full(
+        vp,
+        "--json",
+        *extra,
+        routes=_rewards_less_routes(vp, **route_kw),
+        **run_kw,
+    )
+    doc, _captured = _stdout_json(capsys)
+    return code, transport, doc
+
+
+def test_rewards_less_run_nulls_m1_through_m6(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    row = doc["validators"][0]
+    for field in (
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "missed_attestations",
+        "attester_effectiveness",
+    ):
+        assert row[field] is None, field
+        assert row[field] != 0, field
+
+
+def test_rewards_less_run_still_derives_proposals_included(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(
+        vp, capsys, with_proposal=True
+    )
+    row = doc["validators"][0]
+    assert row["proposals"]["included"] == 1
+    assert row["proposals"]["included"] is not False
+
+
+def test_rewards_less_run_keeps_balance_figures(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    balance = doc["validators"][0]["balance"]
+    assert balance["start_gwei"] == 32_000_000_000
+    assert balance["end_gwei"] == 32_001_834_000
+    assert balance["delta_gwei"] == _CONSENSUS_REWARD_GWEI == 1_834_000
+
+
+def test_consensus_reward_equals_delta_gwei(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    row = doc["validators"][0]
+    delta = row["balance"]["delta_gwei"]
+    assert delta == _CONSENSUS_REWARD_GWEI
+    assert row["rewards_gwei"]["total"] == delta
+    assert doc["aggregate"]["consensus_reward_gwei"] == delta
+
+
+def test_reward_source_is_balance_delta(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    assert doc["validators"][0]["reward_source"] == "balance_delta"
+    assert doc["aggregate"]["reward_source"] == "balance_delta"
+
+
+def test_rewards_gwei_components_are_null_never_zero(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    components = doc["validators"][0]["rewards_gwei"]
+    for key in _REWARD_COMPONENT_KEYS:
+        assert components[key] is None, key
+        assert components[key] != 0, key
+    # G5: summing (component or 0) would report a silent 0 here.
+    silent_zero = sum(components[k] or 0 for k in _REWARD_COMPONENT_KEYS)
+    assert silent_zero == 0
+    assert components["total"] != silent_zero
+    assert components["total"] == _CONSENSUS_REWARD_GWEI
+
+
+def test_rewards_less_run_exits_3(vp, capsys):
+    code, _transport, doc = _run_rewards_less(vp, capsys)
+    assert code == vp.EXIT_DEGRADED == 3
+    assert doc["exit_code"] == 3
+
+
+def test_no_liveness_request_is_issued(vp, capsys):
+    _code, transport, _doc = _run_rewards_less(vp, capsys)
+    assert not any("liveness" in c[2] for c in transport.calls)
+
+
+def test_reconciliation_is_unavailable_in_balance_delta_mode(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    rec = doc["validators"][0]["balance"]["reconciliation"]
+    assert rec == "unavailable"
+    assert rec != "consistent"
+
+
+def test_apr_computed_and_labelled_balance_delta(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(vp, capsys)
+    row = doc["validators"][0]
+    eb = row["balance"]["effective_balance_gwei"]
+    delta = row["balance"]["delta_gwei"]
+    epochs_per_year = 82181.25
+    expected = delta / eb * epochs_per_year / doc["window"]["epochs"]
+    assert row["reward_source"] == "balance_delta"
+    assert row["estimated_apr"] is not None
+    assert row["estimated_apr"] == pytest.approx(expected)
+    assert doc["aggregate"]["reward_source"] == "balance_delta"
+    assert doc["aggregate"]["estimated_apr"] == pytest.approx(expected)
+
+
+def test_aggregate_reward_source_is_balance_delta_if_any_validator_used_it(
+    vp, load
+):
+    spec = _spec_from_fixture(vp, load)
+    api = _build_report(
+        vp, load, _active_ref(vp, index=1, pubkey=PK1), _n_outcomes(vp, 1)
+    )
+    delta = replace(
+        api,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        reward_source="balance_delta",
+    )
+    assert api.reward_source == "rewards_api"
+    mixed = vp.build_aggregate([api, delta], spec)
+    assert mixed["reward_source"] == "balance_delta"
+    all_api = vp.build_aggregate(
+        [api, replace(delta, reward_source="rewards_api")], spec
+    )
+    assert all_api["reward_source"] == "rewards_api"
+
+
+def test_both_unavailable_nulls_reward_source_and_apr(vp, capsys):
+    _code, _transport, doc = _run_rewards_less(
+        vp, capsys, fail_balances=True
+    )
+    row = doc["validators"][0]
+    assert row["reward_source"] is None
+    assert row["estimated_apr"] is None
+    assert row["rewards_gwei"]["total"] is None
+    assert doc["aggregate"]["reward_source"] is None
+    assert doc["aggregate"]["estimated_apr"] is None
+    assert doc["aggregate"]["consensus_reward_gwei"] is None
+
+
+def test_unknown_pubkey_on_rewards_less_run_is_not_rewards_api_zeros(
+    vp, capsys
+):
+    _code, _transport, doc = _run_rewards_less(
+        vp,
+        capsys,
+        validators="states_validators__unknown_pubkey",
+        pubkeys=(PK1, PK4),
+    )
+    unknown = next(v for v in doc["validators"] if v["pubkey"] == PK4)
+    assert unknown["index"] is None
+    assert unknown["status"] == "unknown"
+    for key in (*_REWARD_COMPONENT_KEYS, "total"):
+        assert unknown["rewards_gwei"][key] is None, key
+        assert unknown["rewards_gwei"][key] != 0, key
+    assert unknown["reward_source"] is None
+
+
+def test_route_absent_skips_collect_and_labels_unsupported(vp, capsys):
+    routes = _full_run_routes(vp)
+    pair = json.loads((FIXTURES / "probe__route_absent.json").read_text())
+    routes[("GET", _BLOCKS_HEAD_PATH)] = [
+        _raw_from_probe_leg(vp, pair["blocks"])
+    ]
+    routes[("POST", _DRY_RUN_ATT_PATH)] = [
+        _raw_from_probe_leg(vp, pair["attestations"])
+    ]
+    collect_path = _REWARDS_TEMPLATE.format(epoch=_FULL_FROM)
+    del routes[("POST", collect_path)]
+    code, transport = _run_full(vp, "--json", routes=routes)
+    doc, _captured = _stdout_json(capsys)
+    att_posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert [c[2] for c in att_posts] == [_DRY_RUN_ATT_PATH]
+    assert collect_path not in {c[2] for c in att_posts}
+    assert any(
+        d["reason"] == "rewards_api_unsupported" for d in doc["degradations"]
+    )
+    assert doc["validators"][0]["reward_source"] == "balance_delta"
+    assert code == vp.EXIT_DEGRADED == 3
+    assert doc["exit_code"] == 3
+
+
+def test_known_zero_active_stays_r9_when_attestation_degraded(vp, load):
+    window = _report_window(vp)
+    pending = _active_ref(
+        vp, index=3, pubkey=PK3, activation=500, status="pending_queued"
+    )
+    assert pending.active_epochs_in(window) == 0
+    leftover = _CONSENSUS_REWARD_GWEI
+    snap = vp.BalanceSnapshot(_EB_32, _EB_32 + leftover, _EB_32, _EB_32)
+    r9 = _build_report(
+        vp,
+        load,
+        pending,
+        [],
+        snap=snap,
+        window=window,
+        attestation_degraded=True,
+    )
+    assert r9.reward_source == "rewards_api"
+    for name in (
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "estimated_apr",
+    ):
+        assert getattr(r9, name) is None, name
+    assert r9.rewards_gwei["total"] != leftover
+    assert r9.rewards_gwei["total"] != snap.delta_gwei
+    active = _build_report(
+        vp,
+        load,
+        _active_ref(vp, index=1, pubkey=PK1),
+        [],
+        snap=snap,
+        window=window,
+        attestation_degraded=True,
+    )
+    assert active.reward_source == "balance_delta"
+    spec = _spec_from_fixture(vp, load)
+    agg = vp.build_aggregate([r9, active], spec)
+    assert agg["reward_source"] == "balance_delta"
+
+
+def test_perf_schema_json_unchanged():
+    repo = SCRIPT.resolve().parent.parent
+    path = "scripts/tests/perf_schema.json"
+    for args in (
+        ["git", "diff", "--", path],
+        ["git", "diff", "HEAD", "--", path],
+        ["git", "diff", "--cached", "--", path],
+    ):
+        proc = subprocess.run(
+            args,
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.stdout == "", args
 

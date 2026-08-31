@@ -1303,6 +1303,7 @@ def collect_attestations(
     refs: Sequence[ValidatorRef],
     pool,
     budget,
+    rewards_api: str = "available",
 ) -> tuple[dict[int, list[EpochOutcome]], list[Degradation]]:
     eligible = [ref for ref in refs if ref.rewards_eligible]
     ids = [str(ref.index) for ref in eligible]
@@ -1326,6 +1327,11 @@ def collect_attestations(
     }
     # POST [] is unfiltered on some clients.
     if not ids:
+        return out, degs
+    if rewards_api == "route_absent":
+        degs.append(
+            Degradation("attestation", "run", "rewards_api_unsupported", "")
+        )
         return out, degs
     log = getattr(client, "_log", None)
 
@@ -1907,6 +1913,60 @@ def reconcile_balance(
     return BalanceReconciliation(status, consensus_reward_gwei, EXIT_OK)
 
 
+def _use_rewards_api(
+    outcomes: Sequence[EpochOutcome],
+    ref: ValidatorRef,
+    window: Window,
+    attestation_degraded: bool,
+) -> bool:
+    if outcomes or not attestation_degraded:
+        return True
+    # Unknown is missing data, not R9 (known, zero active epochs).
+    if ref.index is None:
+        return False
+    return ref.active_epochs_in(window) == 0
+
+
+def _assemble_rewards(
+    outcomes: Sequence[EpochOutcome],
+    *,
+    delta_gwei: int | None,
+    proposer_gwei: int | None,
+    sync_gwei: int,
+    use_api: bool,
+) -> tuple[dict, int | None, str | None]:
+    if use_api:
+        inactivity = sum(o.inactivity_gwei for o in outcomes)
+        total = (
+            sum(o.flag_actual_gwei for o in outcomes) + inactivity + sync_gwei
+        )
+        if proposer_gwei is not None:
+            total += proposer_gwei
+        components = {
+            "source": sum(o.source_gwei for o in outcomes),
+            "target": sum(o.target_gwei for o in outcomes),
+            "head": sum(o.head_gwei for o in outcomes),
+            "inactivity": inactivity,
+            "proposer": proposer_gwei,
+            "sync": sync_gwei,
+            "total": total,
+        }
+        return components, total, "rewards_api"
+    # G5: no flag data must not become a silent 0.
+    total = delta_gwei
+    components = {
+        "source": None,
+        "target": None,
+        "head": None,
+        "inactivity": None,
+        "proposer": None,
+        "sync": None,
+        "total": total,
+    }
+    source = "balance_delta" if total is not None else None
+    return components, total, source
+
+
 # ===== § 14. Aggregation, APR, thresholds =====
 
 
@@ -1987,6 +2047,7 @@ def build_validator_report(
     proposal_outcomes: Sequence[ProposalOutcome] | None = None,
     duties_available: bool = True,
     sync: SyncOutcome | None = None,
+    attestation_degraded: bool = False,
 ) -> ValidatorReport:
     degs = list(degradations or ())
     props = list(proposal_outcomes or ())
@@ -2025,21 +2086,20 @@ def build_validator_report(
             )
     raw = _rate(m6_actual, m6_ideal)
     effectiveness = None if raw is None else max(0.0, min(1.0, raw))
-    inactivity = sum(o.inactivity_gwei for o in outcomes)
-    source = sum(o.source_gwei for o in outcomes)
-    target = sum(o.target_gwei for o in outcomes)
-    head = sum(o.head_gwei for o in outcomes)
-    total = (
-        sum(o.flag_actual_gwei for o in outcomes) + inactivity + sync_gwei
+    use_api = _use_rewards_api(outcomes, ref, window, attestation_degraded)
+    rewards_gwei, total, reward_source = _assemble_rewards(
+        outcomes,
+        delta_gwei=snap.delta_gwei,
+        proposer_gwei=proposer_gwei,
+        sync_gwei=sync_gwei,
+        use_api=use_api,
     )
-    if proposer_gwei is not None:
-        total += proposer_gwei
     eb, _changed = effective_balance_for(snap, ref)
     window_epochs = window.epochs
-    # 0/EB annualizes to 0.0; an empty outcome list is null.
+    # 0/EB annualizes to 0.0; an empty rewards-api series is null.
     apr = (
         None
-        if n_active == 0
+        if total is None or (use_api and n_active == 0)
         else _rate(total * spec.epochs_per_year, (eb or 0) * window_epochs)
     )
     return ValidatorReport(
@@ -2063,16 +2123,8 @@ def build_validator_report(
         proposals=_proposal_counts(props, duties_available),
         sync=sync,
         balance=snap,
-        rewards_gwei={
-            "source": source,
-            "target": target,
-            "head": head,
-            "inactivity": inactivity,
-            "proposer": proposer_gwei,
-            "sync": sync_gwei,
-            "total": total,
-        },
-        reward_source="rewards_api",
+        rewards_gwei=rewards_gwei,
+        reward_source=reward_source,
         estimated_apr=apr,
         window_epochs=window_epochs,
         degradations=degs,
@@ -2109,12 +2161,16 @@ def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
         for r in included
         if r.rewards_gwei.get("total") is not None
     ]
+    sources = [r.reward_source for r in included]
     # Rates weigh by active_epochs; APR weighs by EB (RD-5).
     reward_sum = 0
     eb_sum = 0
     window_epochs = 0
     for report in included:
-        if report.active_epochs == 0:
+        if (
+            report.active_epochs == 0
+            and report.reward_source != "balance_delta"
+        ):
             continue
         eb, _ = effective_balance_for(report.balance, report.ref)
         total = report.rewards_gwei.get("total")
@@ -2156,9 +2212,18 @@ def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
             "included": prop_included,
             "missed": None if missed_null else prop_missed,
         },
-        "consensus_reward_gwei": sum(reward_parts),
+        "consensus_reward_gwei": sum(reward_parts) if reward_parts else None,
         "estimated_apr": _rate(
             reward_sum * spec.epochs_per_year, eb_sum * window_epochs
+        ),
+        "reward_source": (
+            "balance_delta"
+            if any(s == "balance_delta" for s in sources)
+            else (
+                "rewards_api"
+                if sources and all(s == "rewards_api" for s in sources)
+                else None
+            )
         ),
     }
 
@@ -2331,6 +2396,9 @@ def _validator_json(report: ValidatorReport, window: Window) -> dict:
     snap = report.balance
     eb, changed = effective_balance_for(snap, report.ref)
     rec = reconcile_balance(snap.delta_gwei, report.rewards_gwei.get("total"))
+    # Fallback total is the delta; nothing independent remains to reconcile.
+    if report.reward_source != "rewards_api":
+        rec = replace(rec, reconciliation="unavailable")
     return {
         "pubkey": report.ref.pubkey,
         "index": report.ref.index,
@@ -2465,7 +2533,12 @@ def main(
             _render_dry_run(ctx, window, refs, log, endpoint)
             return EXIT_OK
         outcomes, att_degs = collect_attestations(
-            client, window, refs, pool, budget
+            client, window, refs, pool, budget, ctx.rewards_api
+        )
+        att_failed = any(
+            d.metric == "attestation"
+            and d.reason in ("rewards_api_unsupported", "state_unavailable")
+            for d in att_degs
         )
         index_set = {ref.index for ref in refs if ref.index is not None}
         proposals, prop_degs, duties_available = collect_proposals(
@@ -2504,6 +2577,7 @@ def main(
                 duties_available=duties_available,
                 sync_gwei=0 if sync_out is None else sync_out.reward_gwei,
                 sync=sync_out,
+                attestation_degraded=att_failed,
             )
             reports.append(report)
             report_degs.extend(report.degradations)
