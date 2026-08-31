@@ -54,6 +54,7 @@ class FakeTransport:
         self.routes = {key: list(queue) for key, queue in routes.items()}
         self.calls: list[tuple[str, str, str, object]] = []
         self.drops: list = []
+        self.closed = False
 
     def __call__(self, ep, method, path, body):
         self.calls.append((ep.label, method, path, body))
@@ -79,3 +80,6 @@ class FakeTransport:
 
     def drop(self, ep):
         self.drops.append(ep)
+
+    def close(self):
+        self.closed = True
