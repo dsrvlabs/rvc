@@ -19,6 +19,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Literal, TextIO
 from urllib.parse import unquote, urlencode, urlsplit
@@ -702,11 +703,14 @@ class BeaconClient:
         return rows
 
     def rewards_attestations(self, epoch: int, ids: Sequence[str]) -> dict:
+        id_list = list(ids)
+        if not id_list:
+            raise ValueError("ids must be non-empty")
         return self._unwrap_call(
             "POST",
             "/eth/v1/beacon/rewards/attestations/{epoch}",
             {"epoch": epoch},
-            json.dumps(list(ids)).encode(),
+            json.dumps(id_list).encode(),
             retry_500=True,
         )
 
@@ -1212,19 +1216,155 @@ def evaluate_epoch(
     return out
 
 
-# ===== § 11. Proposals — M7 and M9's proposer component =====
-
-# ===== § 12. Sync committee — M8 =====
-
-# ===== § 13. Balances and effective balance =====
-
-
 @dataclass(frozen=True)
 class Degradation:
     metric: str
     scope: str
     reason: str
     detail: str
+
+
+@dataclass
+class RequestBudget:
+    extra: int = 0
+    flagged: bool = False
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def add_extra(self, n: int = 2) -> None:
+        with self._lock:
+            self.extra += n
+            self.flagged = True
+
+
+_SPLIT_DEPTH = 2
+
+
+def _merge_attestation_rewards(parts: list[dict]) -> dict:
+    merged = dict(parts[0])
+    total: list = []
+    ideals: dict[int, dict] = {}
+    for part in parts:
+        total.extend(part.get("total_rewards") or [])
+        for row in part.get("ideal_rewards") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                eb = parse_int(row.get("effective_balance"), "effective_balance")
+            except UsageError:
+                continue
+            ideals[eb] = row
+    merged["total_rewards"] = total
+    merged["ideal_rewards"] = list(ideals.values())
+    return merged
+
+
+def _fetch_epoch_rewards(
+    client: BeaconClient, epoch: int, ids: list[str], budget, depth: int = 0
+):
+    try:
+        return client.rewards_attestations(epoch, ids)
+    except BeaconStatus as exc:
+        if exc.status != 500 or depth >= _SPLIT_DEPTH or len(ids) < 2:
+            raise
+        mid = len(ids) // 2
+        budget.add_extra(2)
+        parts: list[dict] = []
+        err: BaseException | None = None
+        for chunk in (ids[:mid], ids[mid:]):
+            try:
+                part = _fetch_epoch_rewards(
+                    client, epoch, chunk, budget, depth + 1
+                )
+            except BeaconStatus as child:
+                err = child
+                continue
+            if isinstance(part, dict):
+                parts.append(part)
+        # A mixed 500 must not look like a missing row with no degradation.
+        if err is not None:
+            raise err
+        if len(parts) != 2:
+            raise
+        return _merge_attestation_rewards(parts)
+
+
+def collect_attestations(
+    client: BeaconClient,
+    w: Window,
+    refs: Sequence[ValidatorRef],
+    pool,
+    budget,
+) -> tuple[dict[int, list[EpochOutcome]], list[Degradation]]:
+    eligible = [ref for ref in refs if ref.rewards_eligible]
+    ids = [str(ref.index) for ref in eligible]
+    eb_by_index = {
+        ref.index: ref.effective_balance_gwei
+        for ref in eligible
+        if ref.index is not None and ref.effective_balance_gwei is not None
+    }
+    degs = [
+        Degradation(
+            "attestation",
+            f"validator:{ref.index}",
+            "effective_balance_zero",
+            "",
+        )
+        for ref in refs
+        if ref.index is not None and not ref.rewards_eligible
+    ]
+    out: dict[int, list[EpochOutcome]] = {
+        ref.index: [] for ref in eligible if ref.index is not None
+    }
+    # POST [] is unfiltered on some clients.
+    if not ids:
+        return out, degs
+    log = getattr(client, "_log", None)
+
+    def worker(epoch: int) -> dict[int, EpochOutcome]:
+        resp = _fetch_epoch_rewards(client, epoch, ids, budget)
+        if not isinstance(resp, dict):
+            raise BeaconStatus(
+                204,
+                "/eth/v1/beacon/rewards/attestations/{epoch}",
+                client._endpoint().label,
+            )
+        return evaluate_epoch(epoch, resp, eligible, eb_by_index, log=log)
+
+    futs = {pool.submit(worker, epoch): epoch for epoch in w}
+    for fut in as_completed(futs):
+        epoch = futs[fut]
+        try:
+            reduced = fut.result()
+        except (BeaconStatus, BeaconTransport) as exc:
+            detail = (
+                f"HTTP {exc.status}"
+                if isinstance(exc, BeaconStatus)
+                else "transport"
+            )
+            degs.append(
+                Degradation(
+                    "attestation", f"epoch:{epoch}", "state_unavailable", detail
+                )
+            )
+            continue
+        for idx, outcome in reduced.items():
+            out.setdefault(idx, []).append(outcome)
+        if any(o.leak for o in reduced.values()):
+            degs.append(
+                Degradation("head_rate", f"epoch:{epoch}", "inactivity_leak", "")
+            )
+    for series in out.values():
+        series.sort(key=lambda o: o.epoch)
+    return out, degs
+
+
+# ===== § 11. Proposals — M7 and M9's proposer component =====
+
+# ===== § 12. Sync committee — M8 =====
+
+# ===== § 13. Balances and effective balance =====
 
 
 @dataclass(frozen=True)
@@ -1391,11 +1531,13 @@ def main(
 ) -> int:
     log = Log(0, sys.stderr)
     active = transport
+    pool = None
     try:
         opts = build_options(argv)
         log = Log(opts.verbosity, sys.stderr)
         if active is None:
             active = HttpTransport(opts.connect_timeout, opts.read_timeout)
+        pool = ThreadPoolExecutor(max_workers=opts.concurrency)
         client = BeaconClient(
             list(opts.endpoints),
             active,
@@ -1425,6 +1567,8 @@ def main(
         log.error("%s", exc)
         return EXIT_ERROR
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
         closer = getattr(active, "close", None)
         if callable(closer):
             closer()

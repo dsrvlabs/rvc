@@ -16,6 +16,7 @@ import socket
 import ssl
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -2639,6 +2640,410 @@ def test_head_positive_implies_source_and_target_nonnegative_sanity_logs_at_v_an
     assert quiet.getvalue() == ""
 
 
+# ----- VP-2c: §10 collect_attestations + D7 reduce + D6 EB-0 -----
+
+
+class _RecordingPool:
+    def __init__(self, inner):
+        self._inner = inner
+        self.results = []
+
+    def submit(self, fn, *args, **kwargs):
+        results = self.results
+
+        def wrapped(*a, **kw):
+            result = fn(*a, **kw)
+            results.append(result)
+            return result
+
+        return self._inner.submit(wrapped, *args, **kwargs)
+
+
+def _att_window(vp, from_epoch, to_epoch):
+    spe = 32
+    return vp.Window(
+        from_epoch,
+        to_epoch,
+        to_epoch + 2,
+        to_epoch,
+        True,
+        False,
+        (from_epoch + 1) * spe,
+        (to_epoch + 2) * spe,
+        True,
+    )
+
+
+def _att_ok(vp, indices=(1,)):
+    payload = {
+        "data": _att_resp([_flags(i, 9170, 14672, 1834) for i in indices])
+    }
+    return _raw(vp, 200, json.dumps(payload).encode())
+
+
+def _att_routes(w, response, *, fail_epoch=None, fail=None):
+    routes = {}
+    for epoch in w:
+        path = _REWARDS_TEMPLATE.format(epoch=epoch)
+        item = fail if fail_epoch is not None and epoch == fail_epoch else response
+        routes[("POST", path)] = list(item) if isinstance(item, list) else [item]
+    return routes
+
+
+def _collect_att(
+    vp, w, refs, routes, *, concurrency=4, budget=None, pool=None
+):
+    transport = FakeTransport(routes)
+    client, _ = _client(vp, transport)
+    if budget is None:
+        budget = vp.RequestBudget()
+    if pool is not None:
+        outcomes, degs = vp.collect_attestations(client, w, refs, pool, budget)
+        return outcomes, degs, transport, budget
+    with ThreadPoolExecutor(max_workers=concurrency) as owned:
+        outcomes, degs = vp.collect_attestations(client, w, refs, owned, budget)
+    return outcomes, degs, transport, budget
+
+
+def _many_refs(vp, n):
+    return [
+        _active_ref(vp, index=i, pubkey=f"0x{i:096x}") for i in range(1, n + 1)
+    ]
+
+
+def _walk_worker_result(obj):
+    seen: set[int] = set()
+    stack = [obj]
+    has_bytes = False
+    has_ideal = False
+    while stack:
+        cur = stack.pop()
+        ident = id(cur)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if isinstance(cur, (bytes, bytearray, memoryview)):
+            has_bytes = True
+            continue
+        if isinstance(cur, dict):
+            if "ideal_rewards" in cur:
+                has_ideal = True
+            stack.extend(cur.keys())
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple, set, frozenset)):
+            stack.extend(cur)
+        else:
+            inner = getattr(cur, "__dict__", None)
+            if inner is not None:
+                stack.append(inner)
+    return has_bytes, has_ideal
+
+
+def test_one_post_per_epoch_regardless_of_validator_count(vp):
+    w = _att_window(vp, 100, 131)
+    assert w.epochs == 32
+    refs = _many_refs(vp, 200)
+    ok = _att_ok(vp, indices=(1,))
+    outcomes, _degs, transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, ok)
+    )
+    posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert len(posts) == 32
+    assert {c[2] for c in posts} == {
+        _REWARDS_TEMPLATE.format(epoch=e) for e in w
+    }
+    for _label, _method, _path, body in posts:
+        payload = json.loads(body)
+        assert isinstance(payload, list)
+        assert not isinstance(payload, dict)
+        assert payload == [str(i) for i in range(1, 201)]
+        assert len(payload) == 200
+    assert 1 in outcomes
+
+
+def test_eb_zero_key_excluded_from_the_body_up_front(vp):
+    refs, _, _ = _resolve(vp, [PK1, PK2], name="states_validators__eb_zero")
+    assert refs[0].effective_balance_gwei == 0
+    assert refs[0].rewards_eligible is False
+    assert refs[1].rewards_eligible is True
+    w = _att_window(vp, 100, 100)
+    ok = _att_ok(vp, indices=(refs[1].index,))
+    _outcomes, _degs, transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, ok)
+    )
+    posts = [c for c in transport.calls if c[1] == "POST"]
+    assert posts
+    body = json.loads(posts[0][3])
+    assert isinstance(body, list)
+    assert str(refs[0].index) not in body
+    assert str(refs[1].index) in body
+    assert body == [str(refs[1].index)]
+
+
+def test_eb_zero_epoch_post_issued_once(vp):
+    refs, _, _ = _resolve(vp, [PK1, PK2], name="states_validators__eb_zero")
+    w = _att_window(vp, 100, 100)
+    ok = _att_ok(vp, indices=(refs[1].index,))
+    _outcomes, _degs, transport, budget = _collect_att(
+        vp, w, refs, _att_routes(w, ok)
+    )
+    posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert len(posts) == 1
+    assert posts[0][2] == _REWARDS_TEMPLATE.format(epoch=100)
+    assert budget.extra == 0
+    assert budget.flagged is False
+
+
+def test_eb_zero_key_reports_effective_balance_zero_reason(vp):
+    refs, _, _ = _resolve(vp, [PK1, PK2], name="states_validators__eb_zero")
+    w = _att_window(vp, 100, 100)
+    ok = _att_ok(vp, indices=(refs[1].index,))
+    outcomes, degs, _transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, ok)
+    )
+    assert refs[0].index not in outcomes
+    zero = [
+        d
+        for d in degs
+        if d.reason == "effective_balance_zero"
+        and d.scope == f"validator:{refs[0].index}"
+    ]
+    assert zero
+    assert all(d.reason == "effective_balance_zero" for d in zero)
+
+
+def test_worker_returns_epoch_outcomes_not_raw_bytes(vp):
+    w = _att_window(vp, 100, 100)
+    refs = [_active_ref(vp)]
+    ok = _att_ok(vp, indices=(1,))
+    transport = FakeTransport(_att_routes(w, ok))
+    client, _ = _client(vp, transport)
+    budget = vp.RequestBudget()
+    with ThreadPoolExecutor(max_workers=1) as inner:
+        pool = _RecordingPool(inner)
+        _outcomes, _degs = vp.collect_attestations(
+            client, w, refs, pool, budget
+        )
+    assert pool.results
+    src = inspect.getsource(vp.collect_attestations)
+    assert "as_completed" in src
+    for result in pool.results:
+        assert isinstance(result, dict)
+        assert all(isinstance(k, int) for k in result)
+        assert all(isinstance(v, vp.EpochOutcome) for v in result.values())
+        has_bytes, has_ideal = _walk_worker_result(result)
+        assert has_bytes is False
+        assert has_ideal is False
+
+
+def _prysm_att(vp, index, eb, *, source, target, head):
+    ideal = [
+        {
+            "effective_balance": str(eb),
+            "head": str(head),
+            "target": str(target),
+            "source": str(source),
+            "inclusion_delay": "0",
+            "inactivity": "0",
+        }
+    ]
+    payload = {
+        "data": _att_resp(
+            [_flags(index, source, target, head)], ideal=ideal
+        )
+    }
+    return _raw(vp, 200, json.dumps(payload).encode())
+
+
+def test_recovered_split_unions_disjoint_ideal_rows(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    refs = [
+        _active_ref(vp, index=1, eb=_EB_32, pubkey=PK1),
+        _active_ref(vp, index=2, eb=_EB_2048, pubkey=PK2),
+    ]
+    left = _prysm_att(vp, 1, _EB_32, source=9170, target=14672, head=1834)
+    right = _prysm_att(
+        vp, 2, _EB_2048, source=586880, target=939008, head=117376
+    )
+    path = _REWARDS_TEMPLATE.format(epoch=100)
+    routes = {
+        ("POST", path): [_raw(vp, 500), _raw(vp, 500), left, right]
+    }
+    outcomes, degs, transport, budget = _collect_att(vp, w, refs, routes)
+    bodies = [json.loads(c[3]) for c in transport.calls if c[1] == "POST"]
+    assert ["1", "2"] in bodies
+    assert ["1"] in bodies
+    assert ["2"] in bodies
+    assert 1 in outcomes and 2 in outcomes
+    assert outcomes[1][0].flag_ideal_gwei == 9170 + 14672 + 1834
+    assert outcomes[2][0].flag_ideal_gwei == 586880 + 939008 + 117376
+    assert outcomes[1][0].flag_ideal_gwei is not None
+    assert outcomes[2][0].flag_ideal_gwei is not None
+    assert not any(d.scope == "epoch:100" for d in degs)
+    assert budget.extra > 0
+    assert budget.flagged is True
+
+
+def test_mixed_split_failure_degrades_the_epoch(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    refs = [
+        _active_ref(vp, index=1, eb=_EB_32, pubkey=PK1),
+        _active_ref(vp, index=2, eb=_EB_2048, pubkey=PK2),
+    ]
+    left = _prysm_att(vp, 1, _EB_32, source=9170, target=14672, head=1834)
+    path = _REWARDS_TEMPLATE.format(epoch=100)
+    routes = {
+        ("POST", path): [
+            _raw(vp, 500),
+            _raw(vp, 500),
+            left,
+            _raw(vp, 500),
+            _raw(vp, 500),
+        ]
+    }
+    outcomes, degs, _transport, budget = _collect_att(vp, w, refs, routes)
+    assert all(not series for series in outcomes.values())
+    assert any(
+        d.scope == "epoch:100" and d.reason == "state_unavailable" for d in degs
+    )
+    assert budget.extra > 0
+    assert budget.flagged is True
+
+
+def test_collect_emits_inactivity_leak_degradation(vp):
+    w = _att_window(vp, 100, 100)
+    refs = [_active_ref(vp)]
+    leak = raw_response(vp, "rewards_attestations__leak")
+    outcomes, degs, _transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, leak)
+    )
+    assert 1 in outcomes
+    o = outcomes[1][0]
+    assert o.epoch == 100
+    assert o.leak is True
+    assert o.head_credited is None
+    assert any(
+        d.reason == "inactivity_leak" and d.scope == "epoch:100" for d in degs
+    )
+
+
+def test_batch_split_is_depth_capped_at_two(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    refs = _many_refs(vp, 8)
+    fail = [_raw(vp, 500) for _ in range(40)]
+    outcomes, degs, transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, fail)
+    )
+    posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    sizes = [len(json.loads(c[3])) for c in posts]
+    assert 8 in sizes
+    assert 4 in sizes
+    assert 2 in sizes
+    assert 1 not in sizes
+    assert len(posts) <= 14
+    assert any(d.scope == "epoch:100" for d in degs)
+    assert all(not series for series in outcomes.values())
+
+
+def test_split_requests_counted_outside_the_budget(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    refs = _many_refs(vp, 4)
+    fail = [_raw(vp, 500) for _ in range(40)]
+    _outcomes, _degs, transport, budget = _collect_att(
+        vp, w, refs, _att_routes(w, fail)
+    )
+    posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert len(posts) > 1
+    assert budget.extra > 0
+    assert budget.flagged is True
+
+
+def test_one_epoch_failure_degrades_only_that_epoch(vp):
+    w = _att_window(vp, 100, 131)
+    assert w.epochs == 32
+    refs = [_active_ref(vp)]
+    ok = _att_ok(vp, indices=(1,))
+    failed = 115
+    routes = _att_routes(w, ok, fail_epoch=failed, fail=_raw(vp, 404))
+    outcomes, degs, _transport, _budget = _collect_att(vp, w, refs, routes)
+    series = outcomes[1]
+    assert len(series) == 31
+    assert all(o.epoch != failed for o in series)
+    assert {o.epoch for o in series} == set(w) - {failed}
+    epoch_degs = [d for d in degs if d.scope.startswith("epoch:")]
+    assert len(epoch_degs) == 1
+    assert epoch_degs[0].scope == f"epoch:{failed}"
+
+
+def test_all_epochs_failing_gives_null_metrics_not_exit_1(vp):
+    w = _att_window(vp, 100, 103)
+    refs = [_active_ref(vp)]
+    fail = _raw(vp, 404)
+    outcomes, degs, _transport, _budget = _collect_att(
+        vp, w, refs, _att_routes(w, fail)
+    )
+    assert 1 in outcomes
+    assert outcomes[1] == []
+    assert all(not series for series in outcomes.values())
+    assert {d.scope for d in degs} == {f"epoch:{e}" for e in w}
+    assert vp.EXIT_ERROR == 1
+    assert vp.EXIT_DEGRADED == 3
+
+
+def test_concurrency_one_is_serial(vp):
+    opts = vp.build_options(_minimal_opts_argv("--concurrency", "1"))
+    assert opts.concurrency == 1
+    w = _att_window(vp, 100, 103)
+    refs = [_active_ref(vp)]
+    ok = _att_ok(vp, indices=(1,))
+    _outcomes, _degs, transport, _budget = _collect_att(
+        vp,
+        w,
+        refs,
+        _att_routes(w, ok),
+        concurrency=opts.concurrency,
+    )
+    posts = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert [c[2] for c in posts] == [
+        _REWARDS_TEMPLATE.format(epoch=e) for e in w
+    ]
+
+
+def test_all_eb_zero_issues_zero_rewards_posts(vp):
+    refs, _, _ = _resolve(vp, [PK1], name="states_validators__eb_zero")
+    refs = [r for r in refs if r.effective_balance_gwei == 0]
+    assert refs and refs[0].rewards_eligible is False
+    w = _att_window(vp, 100, 103)
+    _outcomes, degs, transport, _budget = _collect_att(vp, w, refs, {})
+    assert transport.calls == []
+    assert all(d.reason == "effective_balance_zero" for d in degs)
+    assert not any("rewards/attestations" in c[2] for c in transport.calls)
+
+
 # ----- VP-1n: §16 main + --dry-run + exits 0/2/5 -----
 
 # headers__head slot 3232 / spec__mainnet SPE 32 → head_epoch 101; probe uses 99.
@@ -2845,6 +3250,9 @@ def test_main_body_has_no_metric_logic():
         "probe_rewards_api",
         "_render_dry_run",
         "replace(",
+        "ThreadPoolExecutor",
+        "opts.concurrency",
+        "shutdown",
     ):
         assert name in body
     order = [
