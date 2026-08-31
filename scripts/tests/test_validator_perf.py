@@ -2274,6 +2274,153 @@ def test_probe_non_2xx_does_not_raise(vp, monkeypatch):
         assert verdict in ("available", "route_absent", "state_unavailable")
 
 
+# ----- VP-2a: §10 detect_leak + build_ideal_index -----
+
+_GWEI = 1_000_000_000
+_EB_31 = 31 * _GWEI
+_EB_32 = 32 * _GWEI
+_EB_2048 = 2048 * _GWEI
+
+
+def _ideal_rows(payload):
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        return data["ideal_rewards"]
+    return data
+
+
+def _flag_tuple(row):
+    return int(row["source"]), int(row["target"]), int(row["head"])
+
+
+def test_detect_leak_true_when_largest_eb_row_is_all_zero(vp, load):
+    rows = _ideal_rows(load("rewards_attestations__leak"))
+    largest = max(rows, key=lambda r: int(r["effective_balance"]))
+    assert _flag_tuple(largest) == (0, 0, 0)
+    assert _flag_tuple(rows[0]) != (0, 0, 0)
+    assert vp.detect_leak(rows) is True
+
+
+def test_detect_leak_false_when_largest_eb_row_is_nonzero(vp, load):
+    rows = _ideal_rows(load("rewards_attestations__basic"))
+    largest = max(rows, key=lambda r: int(r["effective_balance"]))
+    assert _flag_tuple(largest) != (0, 0, 0)
+    assert vp.detect_leak(rows) is False
+
+
+def test_detect_leak_uses_the_largest_eb_row_not_the_first(vp):
+    rows = [
+        {
+            "effective_balance": "32000000000",
+            "head": "0",
+            "target": "0",
+            "source": "0",
+            "inactivity": "0",
+        },
+        {
+            "effective_balance": "2048000000000",
+            "head": "117376",
+            "target": "939008",
+            "source": "586880",
+            "inactivity": "0",
+        },
+    ]
+    assert _flag_tuple(rows[0]) == (0, 0, 0)
+    assert int(rows[1]["effective_balance"]) > int(rows[0]["effective_balance"])
+    assert _flag_tuple(rows[1]) != (0, 0, 0)
+    assert vp.detect_leak(rows) is False
+
+
+def test_detect_leak_false_when_largest_eb_target_is_nonzero(vp):
+    rows = [
+        {
+            "effective_balance": "32000000000",
+            "head": "0",
+            "target": "0",
+            "source": "0",
+            "inactivity": "0",
+        },
+        {
+            "effective_balance": "2048000000000",
+            "head": "0",
+            "target": "14672",
+            "source": "0",
+            "inactivity": "0",
+        },
+    ]
+    assert _flag_tuple(rows[0]) == (0, 0, 0)
+    assert _flag_tuple(rows[1]) == (0, 14672, 0)
+    assert vp.detect_leak(rows) is False
+
+
+def test_detect_leak_false_on_empty_ideal_rows(vp):
+    assert vp.detect_leak([]) is False
+
+
+def test_build_ideal_index_is_a_dict_keyed_by_effective_balance(vp, load):
+    rows = _ideal_rows(load("rewards_attestations__ideal_filtered"))
+    wanted = next(r for r in rows if int(r["effective_balance"]) == _EB_31)
+    assert rows[0] is not wanted
+    index = vp.build_ideal_index(rows)
+    assert isinstance(index, dict)
+    assert index[_EB_31] == _flag_tuple(wanted)
+    positional = _flag_tuple(rows[0])
+    assert index[_EB_31] != positional
+
+
+def test_ideal_index_duplicate_eb_last_wins(vp):
+    rows = [
+        {
+            "effective_balance": "32000000000",
+            "head": "1",
+            "target": "2",
+            "source": "3",
+            "inactivity": "0",
+        },
+        {
+            "effective_balance": "32000000000",
+            "head": "10",
+            "target": "20",
+            "source": "30",
+            "inactivity": "0",
+        },
+    ]
+    index = vp.build_ideal_index(rows)
+    assert index[_EB_32] == (30, 20, 10)
+    assert len(index) == 1
+
+
+def test_ideal_index_missing_eb_returns_none_not_zero(vp, load):
+    rows = _ideal_rows(load("rewards_attestations__ideal_filtered"))
+    assert all(int(r["effective_balance"]) != _EB_32 for r in rows)
+    index = vp.build_ideal_index(rows)
+    assert index.get(_EB_32) is None
+    assert index.get(_EB_32) != (0, 0, 0)
+
+
+def test_ideal_index_handles_a_2048_row_table(vp):
+    rows = [
+        {
+            "effective_balance": str(eth * _GWEI),
+            "head": str(eth),
+            "target": str(eth * 2),
+            "source": str(eth * 3),
+            "inactivity": "0",
+        }
+        for eth in range(1, 2049)
+    ]
+    index = vp.build_ideal_index(rows)
+    assert len(index) == 2048
+    assert index[_EB_2048] == (2048 * 3, 2048 * 2, 2048)
+
+
+def test_ideal_index_not_cached_across_epochs(vp, load):
+    a = vp.build_ideal_index(_ideal_rows(load("rewards_attestations__basic")))
+    b = vp.build_ideal_index(_ideal_rows(load("rewards_attestations__ideal_filtered")))
+    assert a is not b
+    assert a != b
+
+
 # ----- VP-1n: §16 main + --dry-run + exits 0/2/5 -----
 
 # headers__head slot 3232 / spec__mainnet SPE 32 → head_epoch 101; probe uses 99.

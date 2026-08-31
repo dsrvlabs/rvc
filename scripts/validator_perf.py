@@ -1113,6 +1113,35 @@ def resolve_validators(
 
 # ===== § 10. Attestation metrics — M1–M6 =====
 
+
+def _ideal_row(row: dict) -> tuple[int, int, int, int]:
+    return (
+        parse_int(row.get("effective_balance"), "effective_balance"),
+        parse_int(row.get("source"), "source"),
+        parse_int(row.get("target"), "target"),
+        parse_int(row.get("head"), "head"),
+    )
+
+
+def detect_leak(ideal_rows: list[dict]) -> bool:
+    if not ideal_rows:
+        return False
+    _eb, source, target, head = max(
+        (_ideal_row(row) for row in ideal_rows), key=lambda t: t[0]
+    )
+    return source == target == head == 0
+
+
+def build_ideal_index(
+    ideal_rows: list[dict],
+) -> dict[int, tuple[int, int, int]]:
+    index: dict[int, tuple[int, int, int]] = {}
+    for row in ideal_rows:
+        eb, source, target, head = _ideal_row(row)
+        index[eb] = (source, target, head)
+    return index
+
+
 # ===== § 11. Proposals — M7 and M9's proposer component =====
 
 # ===== § 12. Sync committee — M8 =====
