@@ -18,10 +18,10 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TextIO
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 # ===== § 1. Header, constants, exit codes =====
 
@@ -546,10 +546,13 @@ class BeaconClient:
         self._transport = transport
         self._request_delay = request_delay
         self._log = log
+        self._lock = threading.Lock()
         self._current = 0
+        self._used: list[str] = []
 
     def _endpoint(self) -> Endpoint:
-        return self._endpoints[self._current]
+        with self._lock:
+            return self._endpoints[self._current]
 
     def _call(
         self,
@@ -559,9 +562,14 @@ class BeaconClient:
         body: bytes | None,
         *,
         retry_500: bool = False,
+        extra: str = "",
     ) -> object:
-        path = template.format(**fmt)
+        path = template.format(**fmt) + extra
         ep = self._endpoint()
+        shown = redact(ep)
+        with self._lock:
+            if shown not in self._used:
+                self._used.append(shown)
         label = ep.label
         last_exc: BaseException | None = None
         raw: RawResponse | None = None
@@ -607,6 +615,146 @@ class BeaconClient:
         if raw is None:
             raise BeaconTransport(template, label)
         raise BeaconStatus(raw.status, template, label)
+
+    def _unwrap_call(
+        self,
+        method: str,
+        template: str,
+        fmt: dict,
+        body: bytes | None = None,
+        *,
+        retry_500: bool = False,
+        none_on: tuple[int, ...] = (),
+    ) -> object:
+        try:
+            payload = self._call(method, template, fmt, body, retry_500=retry_500)
+        except BeaconStatus as exc:
+            if exc.status in none_on:
+                return None
+            raise
+        if isinstance(payload, dict) and "data" in payload:
+            return payload["data"]
+        return payload
+
+    def _as_list(self, payload: object, template: str) -> list:
+        if payload is None:
+            raise BeaconStatus(204, template, self._endpoint().label)
+        rows = (
+            payload["data"]
+            if isinstance(payload, dict) and "data" in payload
+            else payload
+        )
+        if not isinstance(rows, list):
+            raise BeaconStatus(200, template, self._endpoint().label)
+        return rows
+
+    def spec(self) -> dict:
+        return self._unwrap_call("GET", "/eth/v1/config/spec", {})
+
+    def genesis(self) -> dict:
+        return self._unwrap_call("GET", "/eth/v1/beacon/genesis", {})
+
+    def node_version(self) -> str:
+        data = self._unwrap_call("GET", "/eth/v1/node/version", {})
+        return data["version"] if isinstance(data, dict) else data
+
+    def syncing(self) -> dict:
+        return self._unwrap_call("GET", "/eth/v1/node/syncing", {})
+
+    def header(self, block_id: str) -> dict | None:
+        return self._unwrap_call(
+            "GET",
+            "/eth/v1/beacon/headers/{block_id}",
+            {"block_id": block_id},
+            none_on=(404,),
+        )
+
+    def finality_checkpoints(self, state_id: str) -> dict:
+        return self._unwrap_call(
+            "GET",
+            "/eth/v1/beacon/states/{state_id}/finality_checkpoints",
+            {"state_id": state_id},
+        )
+
+    def states_validators(self, state_id: str, ids: Sequence[str]) -> list:
+        if isinstance(ids, (str, bytes)):
+            raise TypeError("ids must be a sequence of id strings, not str or bytes")
+        id_list = list(ids)
+        if not id_list:
+            raise ValueError("ids must be non-empty")
+        template = "/eth/v1/beacon/states/{state_id}/validators"
+        fmt = {"state_id": state_id}
+        try:
+            payload = self._call(
+                "POST", template, fmt, json.dumps({"ids": id_list}).encode()
+            )
+        except BeaconStatus as exc:
+            if exc.status not in (404, 405, 414):
+                raise
+        else:
+            return self._as_list(payload, template)
+        rows: list = []
+        for offset in range(0, len(id_list), GET_ID_CHUNK):
+            chunk = id_list[offset : offset + GET_ID_CHUNK]
+            query = urlencode([("id", item) for item in chunk])
+            payload = self._call("GET", template, fmt, None, extra="?" + query)
+            rows.extend(self._as_list(payload, template))
+        return rows
+
+    def rewards_attestations(self, epoch: int, ids: Sequence[str]) -> dict:
+        return self._unwrap_call(
+            "POST",
+            "/eth/v1/beacon/rewards/attestations/{epoch}",
+            {"epoch": epoch},
+            json.dumps(list(ids)).encode(),
+            retry_500=True,
+        )
+
+    def rewards_block(self, slot: int) -> dict | None:
+        return self._unwrap_call(
+            "GET",
+            "/eth/v1/beacon/rewards/blocks/{slot}",
+            {"slot": slot},
+            retry_500=True,
+            none_on=(404,),
+        )
+
+    def rewards_sync_committee(self, slot: int, ids: Sequence[str]) -> list | None:
+        return self._unwrap_call(
+            "POST",
+            "/eth/v1/beacon/rewards/sync_committee/{slot}",
+            {"slot": slot},
+            json.dumps(list(ids)).encode(),
+            retry_500=True,
+        )
+
+    def proposer_duties(self, epoch: int) -> list:
+        return self._unwrap_call(
+            "GET",
+            "/eth/v1/validator/duties/proposer/{epoch}",
+            {"epoch": epoch},
+        )
+
+    def sync_committee(self, state_id: str, epoch: int) -> list:
+        data = self._unwrap_call(
+            "GET",
+            "/eth/v1/beacon/states/{state_id}/sync_committees?epoch={epoch}",
+            {"state_id": state_id, "epoch": epoch},
+        )
+        return data["validators"] if isinstance(data, dict) else data
+
+    def liveness(self, epoch: int, ids: Sequence[str]) -> list:
+        return self._unwrap_call(
+            "POST",
+            "/eth/v1/validator/liveness/{epoch}",
+            {"epoch": epoch},
+            json.dumps(list(ids)).encode(),
+        )
+
+    @property
+    def endpoints_used(self) -> list[str]:
+        with self._lock:
+            return list(self._used)
 
 
 # ===== § 7. Chain context and bootstrap =====

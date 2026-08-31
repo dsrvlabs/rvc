@@ -60,7 +60,15 @@ class FakeTransport:
         try:
             queue = self.routes[(method, path)]
         except KeyError:
-            raise KeyError(f"unscripted FakeTransport call: {method} {path}") from None
+            queue = None
+            # Exact (method, path) wins. Bare-path fallback is only GET
+            # .../validators?id= chunks (RD-1); other queried routes stay exact.
+            if method == "GET" and "?" in path:
+                bare = path.split("?", 1)[0]
+                if bare.endswith("/validators"):
+                    queue = self.routes.get((method, bare))
+            if queue is None:
+                raise KeyError(f"unscripted FakeTransport call: {method} {path}") from None
         if not queue:
             raise IndexError(f"no scripted responses left for {method} {path}")
         item = queue.pop(0)

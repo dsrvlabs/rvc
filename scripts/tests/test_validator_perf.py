@@ -10,6 +10,7 @@ import base64
 import http.client
 import inspect
 import io
+import json
 import re
 import socket
 import ssl
@@ -17,6 +18,7 @@ import sys
 import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pytest_socket import SocketBlockedError
@@ -208,6 +210,24 @@ def test_faketransport_raises_on_an_unscripted_call(vp):
     assert transport(ep, "GET", "/eth/v1/node/syncing", None).status == 200
     with pytest.raises(IndexError):
         transport(ep, "GET", "/eth/v1/node/syncing", None)
+
+
+def test_faketransport_query_strip_is_validators_get_only(vp):
+    ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    validators = vp.RawResponse(200, b"[]", False)
+    syncing = vp.RawResponse(200, b"{}", False)
+    transport = FakeTransport(
+        {
+            ("GET", "/eth/v1/beacon/states/head/validators"): [validators],
+            ("GET", "/eth/v1/node/syncing"): [syncing],
+        }
+    )
+    got = transport(
+        ep, "GET", "/eth/v1/beacon/states/head/validators?id=1&id=2", None
+    )
+    assert got is validators
+    with pytest.raises(KeyError, match="unscripted"):
+        transport(ep, "GET", "/eth/v1/node/syncing?lag=1", None)
 
 
 def test_faketransport_satisfies_the_transport_alias(vp):
@@ -1118,3 +1138,279 @@ def test_request_spacing_lock_enforces_minimum_gap(vp, monkeypatch):
     client._call("GET", path, {}, None)
     assert len(starts) == 2
     assert starts[1] - starts[0] >= 0.05
+
+
+# ----- VP-1i: §6 typed calls -----
+
+_VALIDATORS_PATH = "/eth/v1/beacon/states/head/validators"
+_PROPOSER_TEMPLATE = "/eth/v1/validator/duties/proposer/{epoch}"
+
+
+def _query_ids(path: str) -> list[str]:
+    return parse_qs(urlsplit(path).query).get("id", [])
+
+
+def _data_raw(vp, data, status=200):
+    return _raw(vp, status, json.dumps({"data": data}).encode())
+
+
+def test_states_validators_posts_an_object_not_an_array(vp):
+    ids = ["0x" + "ab" * 48, "0x" + "cd" * 48]
+    att_path = _REWARDS_TEMPLATE.format(epoch=4)
+    transport = FakeTransport(
+        {
+            ("POST", _VALIDATORS_PATH): [_data_raw(vp, [])],
+            ("POST", att_path): [_data_raw(vp, {})],
+        }
+    )
+    client, _ = _client(vp, transport)
+    client.states_validators("head", ids)
+    client.rewards_attestations(4, ids)
+    validators_body = json.loads(transport.calls[0][3])
+    rewards_body = json.loads(transport.calls[1][3])
+    assert validators_body == {"ids": ids}
+    assert isinstance(validators_body, dict)
+    assert not isinstance(validators_body, list)
+    assert rewards_body == ids
+    assert isinstance(rewards_body, list)
+
+
+def test_200_keys_produce_exactly_one_post(vp):
+    ids = [str(i) for i in range(200)]
+    transport = FakeTransport({("POST", _VALIDATORS_PATH): [_data_raw(vp, [])]})
+    client, _ = _client(vp, transport)
+    client.states_validators("head", ids)
+    assert len(transport.calls) == 1
+    assert transport.calls[0][1] == "POST"
+    assert transport.calls[0][2] == _VALIDATORS_PATH
+    assert json.loads(transport.calls[0][3]) == {"ids": ids}
+
+
+def test_post_414_falls_back_to_four_chunked_gets(vp):
+    ids = [str(i) for i in range(200)]
+    transport = FakeTransport(
+        {
+            ("POST", _VALIDATORS_PATH): [_raw(vp, 414)],
+            ("GET", _VALIDATORS_PATH): [_data_raw(vp, []) for _ in range(4)],
+        }
+    )
+    client, _ = _client(vp, transport)
+    client.states_validators("head", ids)
+    posts = [c for c in transport.calls if c[1] == "POST"]
+    gets = [c for c in transport.calls if c[1] == "GET"]
+    assert len(posts) == 1
+    assert posts[0][2] == _VALIDATORS_PATH
+    assert len(gets) == 4
+    seen = []
+    sizes = []
+    for _label, _method, path, _body in gets:
+        chunk = _query_ids(path)
+        assert len(chunk) <= vp.GET_ID_CHUNK
+        assert vp.GET_ID_CHUNK == 64
+        sizes.append(len(chunk))
+        seen.extend(chunk)
+    assert sizes == [64, 64, 64, 8]
+    assert seen == ids
+
+
+def test_post_404_and_405_also_trigger_the_get_fallback(vp):
+    ids = ["10", "11", "12"]
+    for status in (404, 405):
+        transport = FakeTransport(
+            {
+                ("POST", _VALIDATORS_PATH): [_raw(vp, status)],
+                ("GET", _VALIDATORS_PATH): [_data_raw(vp, [])],
+            }
+        )
+        client, _ = _client(vp, transport)
+        client.states_validators("head", ids)
+        assert [c[1] for c in transport.calls] == ["POST", "GET"]
+        assert transport.calls[0][2] == _VALIDATORS_PATH
+        assert _query_ids(transport.calls[1][2]) == ids
+
+
+def test_states_validators_rejects_empty_ids(vp):
+    transport = FakeTransport({})
+    client, _ = _client(vp, transport)
+    with pytest.raises(ValueError):
+        client.states_validators("head", [])
+    with pytest.raises(ValueError):
+        client.states_validators("head", iter([]))
+    with pytest.raises(TypeError):
+        client.states_validators("head", "0xabcd")
+    with pytest.raises(TypeError):
+        client.states_validators("head", b"0xabcd")
+    assert transport.calls == []
+
+
+def test_no_method_reaches_the_validators_route_unfiltered():
+    source = SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            chunk = ast.get_source_segment(source, node) or ""
+            if "/validators" in chunk:
+                found.append(node.name)
+    assert found == ["states_validators"]
+
+
+def test_header_returns_none_on_404(vp):
+    path = "/eth/v1/beacon/headers/123"
+    transport = FakeTransport({("GET", path): [_raw(vp, 404)]})
+    client, _ = _client(vp, transport)
+    assert client.header("123") is None
+    assert len(transport.calls) == 1
+
+
+def test_rewards_block_returns_none_on_404(vp):
+    path = "/eth/v1/beacon/rewards/blocks/123"
+    transport = FakeTransport({("GET", path): [_raw(vp, 404)]})
+    client, _ = _client(vp, transport)
+    assert client.rewards_block(123) is None
+    assert len(transport.calls) == 1
+
+
+def test_rewards_routes_pass_retry_500(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    att_path = _REWARDS_TEMPLATE.format(epoch=3)
+    transport = FakeTransport({("POST", att_path): [_raw(vp, 500), _raw(vp, 500)]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.rewards_attestations(3, ["1"])
+    assert ei.value.status == 500
+    assert len(transport.calls) == 2
+
+    duty_path = _PROPOSER_TEMPLATE.format(epoch=3)
+    transport = FakeTransport({("GET", duty_path): [_raw(vp, 500), _raw(vp, 500)]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.proposer_duties(3)
+    assert ei.value.status == 500
+    assert len(transport.calls) == 2
+
+    transport = FakeTransport(
+        {("GET", _SPEC_TEMPLATE): [_raw(vp, 400), _raw(vp, 200, b'{"data": {}}')]}
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.spec()
+    assert ei.value.status == 400
+    assert len(transport.calls) == 1
+
+    for name in (
+        "rewards_attestations",
+        "rewards_block",
+        "rewards_sync_committee",
+    ):
+        assert "retry_500=True" in inspect.getsource(getattr(vp.BeaconClient, name))
+    assert "retry_500=True" not in inspect.getsource(vp.BeaconClient.proposer_duties)
+    assert "retry_500=True" not in inspect.getsource(vp.BeaconClient.spec)
+
+
+def test_endpoints_used_records_redacted_strings_only(vp):
+    ep = vp.parse_endpoint(_SECRET_URL, "bn0")
+    transport = FakeTransport(
+        {("GET", _SPEC_TEMPLATE): [_data_raw(vp, {"SLOTS_PER_EPOCH": "32"})]}
+    )
+    client, _ = _client(vp, transport, ep=ep)
+    client.spec()
+    used = client.endpoints_used
+    assert used == ["https://bn.example:5052"]
+    blob = " ".join(used)
+    assert "secret" not in blob
+    assert "user:secret" not in blob
+    assert "abc123SECRET" not in blob
+    assert "/abc123SECRET" not in blob
+    used.append("leaked")
+    assert "leaked" not in client.endpoints_used
+
+
+def test_states_validators_post_204_raises_not_none(vp):
+    transport = FakeTransport({("POST", _VALIDATORS_PATH): [_raw(vp, 204, b"")]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.states_validators("head", ["1"])
+    assert ei.value.status == 204
+    assert [c[1] for c in transport.calls] == ["POST"]
+
+
+def test_states_validators_get_chunk_204_raises_not_empty_list(vp):
+    ids = [str(i) for i in range(65)]
+    transport = FakeTransport(
+        {
+            ("POST", _VALIDATORS_PATH): [_raw(vp, 414)],
+            ("GET", _VALIDATORS_PATH): [
+                _data_raw(vp, [{"index": "0"}]),
+                _raw(vp, 204, b""),
+            ],
+        }
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.states_validators("head", ids)
+    assert ei.value.status == 204
+    assert [c[1] for c in transport.calls] == ["POST", "GET", "GET"]
+
+
+def test_post_400_and_500_do_not_get_fallback(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    ids = ["1", "2"]
+    for status in (400, 500):
+        transport = FakeTransport(
+            {
+                ("POST", _VALIDATORS_PATH): [_raw(vp, status), _raw(vp, status)],
+                ("GET", _VALIDATORS_PATH): [_data_raw(vp, [])],
+            }
+        )
+        client, _ = _client(vp, transport)
+        with pytest.raises(vp.BeaconStatus) as ei:
+            client.states_validators("head", ids)
+        assert ei.value.status == status
+        assert all(c[1] == "POST" for c in transport.calls)
+        assert not any(c[1] == "GET" for c in transport.calls)
+
+
+def test_header_400_still_raises(vp):
+    path = "/eth/v1/beacon/headers/123"
+    transport = FakeTransport({("GET", path): [_raw(vp, 400)]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.header("123")
+    assert ei.value.status == 400
+    assert len(transport.calls) == 1
+
+
+def test_rewards_sync_committee_404_raises(vp):
+    path = "/eth/v1/beacon/rewards/sync_committee/5"
+    transport = FakeTransport({("POST", path): [_raw(vp, 404)]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client.rewards_sync_committee(5, ["1"])
+    assert ei.value.status == 404
+    assert len(transport.calls) == 1
+
+
+def test_current_stays_zero_on_500(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    transport = FakeTransport(
+        {("GET", _SPEC_TEMPLATE): [_raw(vp, 500), _raw(vp, 500)]}
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus):
+        client.spec()
+    assert client._current == 0
+
+
+def test_get_fallback_query_not_passed_through_str_format(vp):
+    ids = ["foo{bar}", "baz"]
+    transport = FakeTransport(
+        {
+            ("POST", _VALIDATORS_PATH): [_raw(vp, 414)],
+            ("GET", _VALIDATORS_PATH): [_data_raw(vp, [])],
+        }
+    )
+    client, _ = _client(vp, transport)
+    client.states_validators("head", ids)
+    assert [c[1] for c in transport.calls] == ["POST", "GET"]
+    assert _query_ids(transport.calls[1][2]) == ids
