@@ -2282,11 +2282,34 @@ _EB_32 = 32 * _GWEI
 _EB_2048 = 2048 * _GWEI
 
 
+def _rewards_body(payload):
+    env = payload[0] if isinstance(payload, list) else payload
+    if isinstance(env, dict) and "data" in env and "ideal_rewards" not in env:
+        return env["data"]
+    return env
+
+
 def _ideal_rows(payload):
-    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    data = _rewards_body(payload)
     if isinstance(data, dict):
         return data["ideal_rewards"]
     return data
+
+
+def _active_ref(
+    vp,
+    index=1,
+    eb=_EB_32,
+    activation=0,
+    exit_epoch=_FAR_FUTURE_EPOCH,
+    *,
+    pubkey=PK1,
+    status="active_ongoing",
+    slashed=False,
+):
+    return vp.ValidatorRef(
+        pubkey, index, status, eb, activation, exit_epoch, slashed
+    )
 
 
 def _flag_tuple(row):
@@ -2302,10 +2325,14 @@ def test_detect_leak_true_when_largest_eb_row_is_all_zero(vp, load):
 
 
 def test_detect_leak_false_when_largest_eb_row_is_nonzero(vp, load):
-    rows = _ideal_rows(load("rewards_attestations__basic"))
-    largest = max(rows, key=lambda r: int(r["effective_balance"]))
-    assert _flag_tuple(largest) != (0, 0, 0)
-    assert vp.detect_leak(rows) is False
+    payload = load("rewards_attestations__basic")
+    envelopes = payload if isinstance(payload, list) else [payload]
+    assert envelopes
+    for env in envelopes:
+        rows = _ideal_rows(env)
+        largest = max(rows, key=lambda r: int(r["effective_balance"]))
+        assert _flag_tuple(largest) != (0, 0, 0)
+        assert vp.detect_leak(rows) is False
 
 
 def test_detect_leak_uses_the_largest_eb_row_not_the_first(vp):
@@ -2419,6 +2446,197 @@ def test_ideal_index_not_cached_across_epochs(vp, load):
     b = vp.build_ideal_index(_ideal_rows(load("rewards_attestations__ideal_filtered")))
     assert a is not b
     assert a != b
+
+
+# ----- VP-2b: §10 evaluate_epoch — eligibility → leak → sign predicates -----
+
+
+def _eval_epoch(vp, epoch, resp, refs, eb_by_index, log=None):
+    kwargs = {}
+    if log is not None:
+        kwargs["log"] = log
+    return vp.evaluate_epoch(epoch, _rewards_body(resp), refs, eb_by_index, **kwargs)
+
+
+def test_leak_epoch_credits_source_and_target(vp, load):
+    # RD-2: credited flags pay 0 in a leak; >0 reports 0% for a correct vote.
+    resp = load("rewards_attestations__leak")
+    row = _rewards_body(resp)["total_rewards"][0]
+    assert _flag_tuple(row) == (0, 0, 0)
+    ref = _active_ref(vp, index=int(row["validator_index"]))
+    outcomes = _eval_epoch(vp, 100, resp, [ref], {ref.index: _EB_32})
+    o = outcomes[ref.index]
+    assert o.source_credited is True
+    assert o.target_credited is True
+    assert o.leak is True
+
+
+def test_leak_epoch_head_is_none_not_false(vp, load):
+    resp = load("rewards_attestations__leak")
+    ref = _active_ref(vp)
+    o = _eval_epoch(vp, 100, resp, [ref], {ref.index: _EB_32})[ref.index]
+    assert o.head_credited is None
+    assert o.head_credited is not False
+    assert o.leak is True
+
+
+def test_leak_epoch_has_no_ideal_denominator(vp, load):
+    resp = load("rewards_attestations__leak")
+    ref = _active_ref(vp)
+    o = _eval_epoch(vp, 100, resp, [ref], {ref.index: _EB_32})[ref.index]
+    assert o.flag_ideal_gwei is None
+    assert o.leak is True
+
+
+def _ideal_32():
+    return [
+        {
+            "effective_balance": str(_EB_32),
+            "head": "1834",
+            "target": "14672",
+            "source": "9170",
+            "inclusion_delay": "0",
+            "inactivity": "0",
+        }
+    ]
+
+
+def _att_resp(total, ideal=None):
+    return {
+        "ideal_rewards": _ideal_32() if ideal is None else ideal,
+        "total_rewards": total,
+    }
+
+
+def _flags(index, source, target, head, inactivity="0"):
+    return {
+        "validator_index": str(index),
+        "head": str(head),
+        "target": str(target),
+        "source": str(source),
+        "inactivity": str(inactivity),
+    }
+
+
+def test_fixture_a_gives_source_rate_075_and_head_rate_05(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    assert isinstance(envelopes, list) and len(envelopes) == 4
+    rows = [_rewards_body(env)["total_rewards"][0] for env in envelopes]
+    assert sum(int(r["source"]) == -100 for r in rows) == 1
+    assert sum(int(r["head"]) == 0 for r in rows) == 2
+    ref = _active_ref(vp)
+    outcomes = []
+    for i, env in enumerate(envelopes):
+        got = _eval_epoch(vp, 100 + i, env, [ref], {ref.index: _EB_32})
+        assert ref.index in got
+        outcomes.append(got[ref.index])
+        assert got[ref.index].leak is False
+    assert sum(o.source_credited for o in outcomes) / 4 == 0.75
+    assert sum(o.head_credited for o in outcomes) / 4 == 0.5
+
+
+def test_missed_attestations_predicate(vp):
+    ref = _active_ref(vp)
+    missed = _eval_epoch(
+        vp, 100, _att_resp([_flags(1, -1, -2, 0)]), [ref], {1: _EB_32}
+    )[1]
+    source_only = _eval_epoch(
+        vp, 100, _att_resp([_flags(1, -100, 0, 0)]), [ref], {1: _EB_32}
+    )[1]
+    assert missed.missed is True
+    assert missed.source_credited is False
+    assert missed.target_credited is False
+    assert source_only.missed is False
+    assert source_only.source_credited is False
+    assert source_only.target_credited is True
+
+
+def test_participation_credits_target_only_epoch(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    target_only = next(
+        env
+        for env in envelopes
+        if int(_rewards_body(env)["total_rewards"][0]["source"]) == -100
+    )
+    row = _rewards_body(target_only)["total_rewards"][0]
+    assert int(row["target"]) == 0
+    ref = _active_ref(vp)
+    o = _eval_epoch(vp, 101, target_only, [ref], {ref.index: _EB_32})[ref.index]
+    assert o.source_credited is False
+    assert o.target_credited is True
+    assert (o.source_credited or o.target_credited) is True
+    assert o.missed is False
+
+
+def test_ineligible_epoch_enters_no_denominator(vp):
+    refs, _, _ = _resolve(
+        vp, [PK1], name="states_validators__mid_window_activation"
+    )
+    ref = refs[0]
+    assert ref.activation_epoch == 116
+    assert ref.index == 42
+    resp = _att_resp([_flags(42, 0, 0, 0)])
+    pre = _eval_epoch(vp, 115, resp, [ref], {42: _EB_32})
+    assert 42 not in pre
+    assert pre == {}
+    on = _eval_epoch(vp, 116, resp, [ref], {42: _EB_32})
+    assert 42 in on
+    assert on[42].missed is False
+
+
+def test_zero_filled_row_outside_a_leak_for_an_inactive_validator_is_not_perfect(
+    vp,
+):
+    inactive = _active_ref(vp, activation=500)
+    assert inactive.is_active_at(100) is False
+    resp = _att_resp([_flags(1, 0, 0, 0)])
+    assert vp.detect_leak(resp["ideal_rewards"]) is False
+    outcomes = _eval_epoch(vp, 100, resp, [inactive], {1: _EB_32})
+    assert 1 not in outcomes
+    credited = _eval_epoch(vp, 100, resp, [_active_ref(vp)], {1: _EB_32})[1]
+    assert credited.source_credited is True
+    assert credited.target_credited is True
+
+
+def test_missing_row_yields_no_outcome_not_a_zero_outcome(vp):
+    ref = _active_ref(vp)
+    outcomes = _eval_epoch(vp, 100, _att_resp([]), [ref], {1: _EB_32})
+    assert 1 not in outcomes
+    assert outcomes.get(1) is None
+    assert outcomes == {}
+
+
+def test_missing_ideal_row_sets_flag_ideal_none(vp, load):
+    resp = load("rewards_attestations__ideal_filtered")
+    rows = _ideal_rows(resp)
+    assert all(int(r["effective_balance"]) != _EB_32 for r in rows)
+    ref = _active_ref(vp, eb=_EB_32)
+    o = _eval_epoch(vp, 100, resp, [ref], {ref.index: _EB_32})[ref.index]
+    assert o.flag_ideal_gwei is None
+    assert o.leak is False
+    assert o.source_credited is True
+
+
+def test_head_positive_implies_source_and_target_nonnegative_sanity_logs_at_v_and_keeps_the_row(
+    vp,
+):
+    ref = _active_ref(vp)
+    resp = _att_resp([_flags(1, -1, -1, 10)])
+    quiet = io.StringIO()
+    verbose = io.StringIO()
+    kept = _eval_epoch(
+        vp, 100, resp, [ref], {1: _EB_32}, log=vp.Log(1, verbose)
+    )
+    assert 1 in kept
+    o = kept[1]
+    assert o.head_credited is True
+    assert o.source_credited is False
+    assert o.target_credited is False
+    text = verbose.getvalue()
+    assert "head" in text
+    assert "100" in text
+    _eval_epoch(vp, 100, resp, [ref], {1: _EB_32}, log=vp.Log(0, quiet))
+    assert quiet.getvalue() == ""
 
 
 # ----- VP-1n: §16 main + --dry-run + exits 0/2/5 -----

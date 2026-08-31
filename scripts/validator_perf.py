@@ -1142,6 +1142,76 @@ def build_ideal_index(
     return index
 
 
+@dataclass(frozen=True)
+class EpochOutcome:
+    epoch: int
+    source_credited: bool
+    target_credited: bool
+    head_credited: bool | None
+    missed: bool
+    flag_actual_gwei: int
+    flag_ideal_gwei: int | None
+    inactivity_gwei: int
+    leak: bool
+
+
+def evaluate_epoch(
+    epoch: int,
+    resp: dict,
+    refs: list[ValidatorRef],
+    eb_by_index: dict[int, int],
+    log: Log | None = None,
+) -> dict[int, EpochOutcome]:
+    ideal_rows = resp.get("ideal_rewards") or []
+    leak = detect_leak(ideal_rows)
+    ideals = build_ideal_index(ideal_rows)
+    by_index: dict[int, dict] = {}
+    for row in resp.get("total_rewards") or []:
+        by_index[parse_int(row.get("validator_index"), "validator_index")] = row
+    out: dict[int, EpochOutcome] = {}
+    for ref in refs:
+        ineligible = not ref.is_active_at(epoch)
+        if ineligible:
+            continue
+        idx = ref.index
+        # Missing row is "not eligible", not a zero reward (clients disagree on fill).
+        missing_row = idx is None or idx not in by_index
+        if missing_row:
+            continue
+        row = by_index[idx]
+        source = parse_int(row.get("source"), "source")
+        target = parse_int(row.get("target"), "target")
+        head = parse_int(row.get("head"), "head")
+        inactivity = parse_int(row.get("inactivity"), "inactivity")
+        if head > 0 and (source < 0 or target < 0) and log is not None:
+            log.info(
+                "head > 0 implies source/target >= 0: epoch %s index %s source=%s target=%s",
+                epoch,
+                idx,
+                source,
+                target,
+            )
+        # Sign, not positivity: a credited leak flag pays 0. Head is None in a leak.
+        source_credited = source >= 0
+        target_credited = target >= 0
+        missed = source < 0 and target < 0
+        head_credited = None if leak else head > 0
+        flags = None if leak else ideals.get(eb_by_index.get(idx))
+        flag_ideal_gwei = None if flags is None else flags[0] + flags[1] + flags[2]
+        out[idx] = EpochOutcome(
+            epoch=epoch,
+            source_credited=source_credited,
+            target_credited=target_credited,
+            head_credited=head_credited,
+            missed=missed,
+            flag_actual_gwei=source + target + head,
+            flag_ideal_gwei=flag_ideal_gwei,
+            inactivity_gwei=inactivity,
+            leak=leak,
+        )
+    return out
+
+
 # ===== § 11. Proposals — M7 and M9's proposer component =====
 
 # ===== § 12. Sync committee — M8 =====
