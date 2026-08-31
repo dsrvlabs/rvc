@@ -326,6 +326,45 @@ def _verbosity(args: argparse.Namespace) -> int:
     return -1 if args.quiet else args.verbose
 
 
+THRESHOLD_METRICS = frozenset(
+    {
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "attester_effectiveness",
+        "sync_participation_rate",
+        "estimated_apr",
+    }
+)
+
+
+def parse_thresholds(raw: Sequence[str]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for item in raw:
+        if "=" not in item:
+            raise UsageError(
+                f"invalid --fail-under {item!r}: expected METRIC=VALUE"
+            )
+        name, value = item.split("=", 1)
+        if name not in THRESHOLD_METRICS:
+            raise UsageError(
+                f"unknown --fail-under metric {name!r}: {item!r}"
+            )
+        try:
+            parsed = float(value)
+        except ValueError:
+            raise UsageError(
+                f"invalid --fail-under {item!r}: value is not a float"
+            ) from None
+        if not math.isfinite(parsed):
+            raise UsageError(
+                f"invalid --fail-under {item!r}: value is not a finite float"
+            )
+        out[name] = parsed
+    return out
+
+
 @dataclass(frozen=True)
 class Options:
     pubkeys: tuple[str, ...]
@@ -352,6 +391,8 @@ class Options:
 def build_options(argv: list[str] | None = None) -> Options:
     args = build_parser().parse_args(argv)
     _validate_combinations(args)
+    fail_under = tuple(args.fail_under or [])
+    parse_thresholds(fail_under)
 
     def pick(value, default):
         return default if value is None else value
@@ -373,7 +414,7 @@ def build_options(argv: list[str] | None = None) -> Options:
         json=args.json,
         csv=args.csv,
         degraded_ok=args.degraded_ok,
-        fail_under=tuple(args.fail_under or []),
+        fail_under=fail_under,
         liveness_check=args.liveness_check,
         no_cache=args.no_cache,
     )
@@ -2315,12 +2356,65 @@ class RunReport:
     degradations: list[Degradation]
     endpoints_used: list[str]
     exit_code: int
+    threshold_breaches: list[str] = field(default_factory=list)
+
+
+def _breaches(value: float | None, threshold: float) -> bool:
+    # Decision 8: null already forced exit 3; it is not a threshold miss.
+    return value is not None and value < threshold
+
+
+def _threshold_scope(report: ValidatorReport) -> str:
+    if report.ref.index is not None:
+        return f"validator:{report.ref.index}"
+    return f"pubkey:{report.ref.pubkey}"
+
+
+def _threshold_value(source: ValidatorReport | dict, name: str) -> float | None:
+    if name == "sync_participation_rate":
+        if isinstance(source, dict):
+            return source.get(name)
+        sync = source.sync
+        return None if sync is None else sync.participation_rate
+    if isinstance(source, dict):
+        got = source.get(name)
+        if isinstance(got, (int, float)) and not isinstance(got, bool):
+            return float(got)
+        return None
+    return getattr(source, name, None)
+
+
+def _metrics_for_scope(breaches: Sequence[str], scope: str) -> list[str]:
+    names: list[str] = []
+    for item in breaches:
+        left, sep, name = item.rpartition(":")
+        if sep and left == scope:
+            names.append(name)
+    return names
+
+
+def evaluate_thresholds(
+    run: RunReport, thresholds: dict[str, float]
+) -> list[str]:
+    hits: list[str] = []
+    for report in run.validators:
+        scope = _threshold_scope(report)
+        for name, threshold in thresholds.items():
+            if _breaches(_threshold_value(report, name), threshold):
+                hits.append(f"{scope}:{name}")
+    for name, threshold in thresholds.items():
+        if _breaches(_threshold_value(run.aggregate, name), threshold):
+            hits.append(f"aggregate:{name}")
+    return hits
 
 
 def decide_exit_code(run: RunReport, opts: Options) -> int:
-    # D8: completed runs are 4 > 3 > 0; 4 is VP-4c. --degraded-ok maps 3 → 0 only.
-    code = EXIT_DEGRADED if run.degradations else EXIT_OK
-    return EXIT_OK if opts.degraded_ok and code == EXIT_DEGRADED else code
+    # D8: completed runs are 4 > 3 > 0. --degraded-ok maps 3 → 0 only.
+    if evaluate_thresholds(run, parse_thresholds(opts.fail_under)):
+        return EXIT_THRESHOLD
+    if run.degradations:
+        return EXIT_OK if opts.degraded_ok else EXIT_DEGRADED
+    return EXIT_OK
 
 
 # ===== § 15. Reporting =====
@@ -2348,8 +2442,9 @@ def _cell(value: object) -> str:
     return _EM_DASH if value is None else str(value)
 
 
-def _fmt_pct(rate: float | None) -> str:
-    return _cell(None) if rate is None else f"{rate * 100:.2f}"
+def _fmt_pct(rate: float | None, *, mark: bool = False) -> str:
+    text = _cell(None) if rate is None else f"{rate * 100:.2f}"
+    return f"{text}!" if mark else text
 
 
 def _fmt_eth(delta_gwei: int | None) -> str:
@@ -2373,23 +2468,35 @@ def _fmt_incl_sched(proposals: object) -> str:
     return f"{_cell(row.get('included'))}/{_cell(row.get('scheduled'))}"
 
 
-def _table_row(report: ValidatorReport) -> list[str]:
+def _table_row(report: ValidatorReport, marks: set[str] | None = None) -> list[str]:
+    marked = marks or set()
     sync = report.sync
+    pubkey = _abbrev_pubkey(report.ref.pubkey)
+    if marked:
+        pubkey += "!"
     return [
-        _abbrev_pubkey(report.ref.pubkey),
+        pubkey,
         _cell(report.ref.index),
         report.ref.status,
         str(report.active_epochs),
-        _fmt_pct(report.participation_rate),
-        _fmt_pct(report.source_rate),
-        _fmt_pct(report.target_rate),
-        _fmt_pct(report.head_rate),
+        _fmt_pct(
+            report.participation_rate, mark="participation_rate" in marked
+        ),
+        _fmt_pct(report.source_rate, mark="source_rate" in marked),
+        _fmt_pct(report.target_rate, mark="target_rate" in marked),
+        _fmt_pct(report.head_rate, mark="head_rate" in marked),
         _cell(report.missed_attestations),
         _fmt_incl_sched(report.proposals),
-        _fmt_pct(None if sync is None else sync.participation_rate),
+        _fmt_pct(
+            None if sync is None else sync.participation_rate,
+            mark="sync_participation_rate" in marked,
+        ),
         _fmt_eth(report.balance.delta_gwei),
-        _fmt_pct(report.attester_effectiveness),
-        _fmt_pct(report.estimated_apr),
+        _fmt_pct(
+            report.attester_effectiveness,
+            mark="attester_effectiveness" in marked,
+        ),
+        _fmt_pct(report.estimated_apr, mark="estimated_apr" in marked),
     ]
 
 
@@ -2403,12 +2510,30 @@ def render_table(run: RunReport, out: TextIO) -> None:
         run.validators,
         key=lambda r: (r.attester_effectiveness is None, r.attester_effectiveness),
     )
-    lines = _align_rows([list(_TABLE_HEADERS), *(_table_row(r) for r in ordered)])
+    by_scope: dict[str, set[str]] = {}
+    for item in run.threshold_breaches:
+        scope, sep, name = item.rpartition(":")
+        if sep:
+            by_scope.setdefault(scope, set()).add(name)
+    lines = _align_rows(
+        [
+            list(_TABLE_HEADERS),
+            *(
+                _table_row(r, by_scope.get(_threshold_scope(r), set()))
+                for r in ordered
+            ),
+        ]
+    )
     agg = run.aggregate
+    agg_marks = by_scope.get("aggregate", set())
     by_status = agg.get("by_status") or {}
     status_txt = ", ".join(f"{name}: {count}" for name, count in by_status.items())
     window = run.window
     proposals = agg.get("proposals") or {}
+
+    def agg_pct(name: str) -> str:
+        return _fmt_pct(agg.get(name), mark=name in agg_marks)
+
     lines.extend(
         [
             "",
@@ -2416,15 +2541,15 @@ def render_table(run: RunReport, out: TextIO) -> None:
             f"window: epochs {window.from_epoch}–{window.to_epoch} "
             f"({_slot_utc(run.ctx, window.start_slot)} – "
             f"{_slot_utc(run.ctx, window.end_slot)})",
-            f"part% {_fmt_pct(agg.get('participation_rate'))}  "
-            f"src% {_fmt_pct(agg.get('source_rate'))}  "
-            f"tgt% {_fmt_pct(agg.get('target_rate'))}  "
-            f"head% {_fmt_pct(agg.get('head_rate'))}  "
-            f"eff% {_fmt_pct(agg.get('attester_effectiveness'))}",
+            f"part% {agg_pct('participation_rate')}  "
+            f"src% {agg_pct('source_rate')}  "
+            f"tgt% {agg_pct('target_rate')}  "
+            f"head% {agg_pct('head_rate')}  "
+            f"eff% {agg_pct('attester_effectiveness')}",
             f"missed {_cell(agg.get('missed_attestations'))}  "
             f"incl/sched {_fmt_incl_sched(proposals)}  "
             f"consensus_reward_gwei {_cell(agg.get('consensus_reward_gwei'))}  "
-            f"APR% {_fmt_pct(agg.get('estimated_apr'))}",
+            f"APR% {agg_pct('estimated_apr')}",
             "",
             "inclusion distance is absent because it requires a full block scan",
             "0/0 proposals is normal at this key count — 200 keys over 32 epochs "
@@ -2481,7 +2606,11 @@ def _redact_endpoint_url(url: str) -> str:
     return redact(parse_endpoint(url, "json"))
 
 
-def _validator_json(report: ValidatorReport, window: Window) -> dict:
+def _validator_json(
+    report: ValidatorReport,
+    window: Window,
+    breaches: Sequence[str] = (),
+) -> dict:
     snap = report.balance
     eb, changed = effective_balance_for(snap, report.ref)
     rec = reconcile_balance(snap.delta_gwei, report.rewards_gwei.get("total"))
@@ -2517,6 +2646,9 @@ def _validator_json(report: ValidatorReport, window: Window) -> dict:
         "estimated_apr": report.estimated_apr,
         "reward_source": report.reward_source,
         "degradations": [_degradation_json(d) for d in report.degradations],
+        "threshold_breaches": _metrics_for_scope(
+            breaches, _threshold_scope(report)
+        ),
     }
 
 
@@ -2549,9 +2681,13 @@ def render_json(
             "rewards_api": run.ctx.rewards_api,
             "endpoints_used": used,
         },
-        "validators": [_validator_json(v, run.window) for v in run.validators],
+        "validators": [
+            _validator_json(v, run.window, run.threshold_breaches)
+            for v in run.validators
+        ],
         "aggregate": aggregate,
         "degradations": [_degradation_json(d) for d in run.degradations],
+        "threshold_breaches": list(run.threshold_breaches),
         "exit_code": run.exit_code,
     }
     return json.dumps(doc, default=_json_default)
@@ -2684,8 +2820,9 @@ def main(
             client.endpoints_used,
             EXIT_OK,
         )
+        breaches = evaluate_thresholds(run, parse_thresholds(opts.fail_under))
         code = decide_exit_code(run, opts)
-        run = replace(run, exit_code=code)
+        run = replace(run, threshold_breaches=breaches, exit_code=code)
         if opts.json:
             print(render_json(run))
         else:

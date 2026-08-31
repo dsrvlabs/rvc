@@ -4991,6 +4991,7 @@ _REASON_PRODUCERS = {
 }
 _G5_KIND_PREFIXES = (
     ("failover__", "declared"),
+    ("thresholds__", "rewards"),
     ("rewards_attestations__", "rewards"),
     ("states_validators__", "validators"),
     ("duties_proposer__", "duties"),
@@ -8063,4 +8064,303 @@ def test_one_promotion_attempt_per_endpoint(vp, load):
     assert nxt is endpoints[2]
     assert client._current == 2
 
+
+# ----- VP-4c: §4/§14 --fail-under allowlist + evaluate_thresholds + exit 4 -----
+
+_THRESHOLD_ALLOWLIST = (
+    "participation_rate",
+    "source_rate",
+    "target_rate",
+    "head_rate",
+    "attester_effectiveness",
+    "sync_participation_rate",
+    "estimated_apr",
+)
+
+
+def _fail_under_window_routes(vp, envelopes, from_epoch, to_epoch):
+    routes = _full_run_routes(vp)
+    spe = 32
+    empty_duties = _raw(vp, 200, b'{"data": []}')
+    for i, env in enumerate(envelopes):
+        epoch = from_epoch + i
+        routes[("POST", _REWARDS_TEMPLATE.format(epoch=epoch))] = [
+            _raw(vp, 200, json.dumps(env).encode())
+        ]
+        routes[("GET", _PROPOSER_TEMPLATE.format(epoch=epoch))] = [empty_duties]
+    routes[("POST", _validators_at((from_epoch + 1) * spe))] = [
+        raw_response(vp, "states_validators__snapshot_start")
+    ]
+    routes[("POST", _validators_at((to_epoch + 2) * spe))] = [
+        raw_response(vp, "states_validators__snapshot_end")
+    ]
+    sync_state = from_epoch * spe
+    routes[
+        (
+            "GET",
+            f"/eth/v1/beacon/states/{sync_state}/sync_committees"
+            f"?epoch={from_epoch}",
+        )
+    ] = [raw_response(vp, "state_sync_committees__empty")]
+    return routes
+
+
+def _run_with_thresholds(vp, load, reports, fail_under, *, degradations=None):
+    run = _table_run(vp, load, reports)
+    if degradations is not None:
+        run = replace(run, degradations=list(degradations))
+    hits = vp.evaluate_thresholds(run, vp.parse_thresholds(fail_under))
+    opts = _window_opts(vp, fail_under=tuple(fail_under))
+    code = vp.decide_exit_code(run, opts)
+    return replace(run, threshold_breaches=hits, exit_code=code), opts
+
+
+def test_allowlist_has_exactly_seven_names(vp):
+    assert vp.THRESHOLD_METRICS == frozenset(_THRESHOLD_ALLOWLIST)
+    assert len(vp.THRESHOLD_METRICS) == 7
+    for name in _THRESHOLD_ALLOWLIST:
+        assert vp.parse_thresholds([f"{name}=0.95"]) == {name: 0.95}
+
+
+def test_unknown_metric_name_exits_2(vp, capsys):
+    raw = "targt_rate=0.95"
+    code = vp.main(_minimal_opts_argv("--fail-under", raw))
+    assert code == vp.EXIT_USAGE == 2
+    err = capsys.readouterr().err
+    assert "targt_rate" in err
+    assert raw in err
+    with pytest.raises(vp.UsageError) as ei:
+        vp.parse_thresholds([raw])
+    assert "targt_rate" in str(ei.value)
+
+
+def test_malformed_pair_exits_2(vp, capsys):
+    for raw in (
+        "target_rate",
+        "target_rate=abc",
+        "target_rate=nan",
+        "target_rate=inf",
+        "target_rate=-inf",
+    ):
+        code = vp.main(_minimal_opts_argv("--fail-under", raw))
+        assert code == vp.EXIT_USAGE == 2
+        err = capsys.readouterr().err
+        assert raw in err
+        with pytest.raises(vp.UsageError) as ei:
+            vp.parse_thresholds([raw])
+        assert raw in str(ei.value)
+
+
+def test_repeated_fail_under_flags_all_apply(vp, load):
+    opts = vp.build_options(
+        _minimal_opts_argv(
+            "--fail-under",
+            "target_rate=0.95",
+            "--fail-under",
+            "source_rate=0.90",
+        )
+    )
+    assert opts.fail_under == ("target_rate=0.95", "source_rate=0.90")
+    parsed = vp.parse_thresholds(opts.fail_under)
+    assert parsed == {"target_rate": 0.95, "source_rate": 0.90}
+    report = _table_report(vp, source_rate=0.50, target_rate=0.50)
+    run, _opts = _run_with_thresholds(
+        vp, load, [report], opts.fail_under
+    )
+    assert any("source_rate" in item for item in run.threshold_breaches)
+    assert any("target_rate" in item for item in run.threshold_breaches)
+    assert run.exit_code == vp.EXIT_THRESHOLD == 4
+
+
+def test_target_rate_090_against_095_exits_4(vp, capsys, load):
+    envelopes = load("thresholds__target_090")
+    assert isinstance(envelopes, list) and len(envelopes) == 10
+    ref = _active_ref(vp)
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    assert len(outcomes) == 10
+    report = _build_report(
+        vp, load, ref, outcomes, window=_att_window(vp, 100, 109)
+    )
+    assert report.target_rate == pytest.approx(0.90)
+    assert report.target_rate < 0.95
+    run, _opts = _run_with_thresholds(
+        vp, load, [report], ("target_rate=0.95",)
+    )
+    assert run.exit_code == vp.EXIT_THRESHOLD == 4
+    from_epoch = _FULL_TO - len(envelopes) + 1
+    to_epoch = _FULL_TO
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        "--fail-under",
+        "target_rate=0.95",
+        "--from-epoch",
+        str(from_epoch),
+        "--to-epoch",
+        str(to_epoch),
+        routes=_fail_under_window_routes(
+            vp, envelopes, from_epoch, to_epoch
+        ),
+    )
+    assert code == vp.EXIT_THRESHOLD == 4
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 4
+    assert doc["validators"][0]["target_rate"] == pytest.approx(0.90)
+
+
+def test_null_metric_cannot_breach(vp, capsys):
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        "--fail-under",
+        "target_rate=0.95",
+        routes=_rewards_less_routes(vp),
+    )
+    assert code != vp.EXIT_ERROR
+    assert code != vp.EXIT_THRESHOLD
+    assert code == vp.EXIT_DEGRADED == 3
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 3
+    assert doc["validators"][0]["target_rate"] is None
+    assert not doc.get("threshold_breaches")
+
+
+def test_breach_plus_degradation_yields_4(vp, capsys, load):
+    report = _table_report(vp, target_rate=0.90)
+    deg = vp.Degradation("head_rate", "epoch:100", "inactivity_leak", "")
+    run, _opts = _run_with_thresholds(
+        vp,
+        load,
+        [report],
+        ("target_rate=0.95",),
+        degradations=[deg],
+    )
+    assert run.degradations
+    assert run.exit_code == vp.EXIT_THRESHOLD == 4
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        "--fail-under",
+        "target_rate=1.1",
+        rewards="rewards_attestations__leak",
+    )
+    assert code == vp.EXIT_THRESHOLD == 4
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 4
+    assert any(d["reason"] == "inactivity_leak" for d in doc["degradations"])
+
+
+def test_degraded_ok_does_not_touch_4(vp, capsys, load):
+    report = _table_report(vp, target_rate=0.90)
+    deg = vp.Degradation("head_rate", "epoch:100", "inactivity_leak", "")
+    run = _table_run(vp, load, [report])
+    run = replace(run, degradations=[deg])
+    opts = _window_opts(
+        vp, fail_under=("target_rate=0.95",), degraded_ok=True
+    )
+    assert vp.decide_exit_code(run, opts) == vp.EXIT_THRESHOLD == 4
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        "--degraded-ok",
+        "--fail-under",
+        "target_rate=1.1",
+        rewards="rewards_attestations__leak",
+    )
+    assert code == vp.EXIT_THRESHOLD == 4
+    assert code != vp.EXIT_OK
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 4
+
+
+def test_thresholds_evaluated_per_validator_and_on_the_aggregate(vp, load):
+    bad = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1),
+        target_rate=0.50,
+        attester_effectiveness=0.50,
+    )
+    good = _table_report(
+        vp,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        target_rate=1.00,
+        attester_effectiveness=1.00,
+    )
+    run = _table_run(vp, load, [bad, good])
+    assert run.aggregate["target_rate"] == pytest.approx(0.75)
+    per_validator = vp.evaluate_thresholds(run, {"target_rate": 0.60})
+    assert any(item.startswith("validator:1:") for item in per_validator)
+    assert not any(item.startswith("validator:2:") for item in per_validator)
+    assert not any(item.startswith("aggregate:") for item in per_validator)
+    both = vp.evaluate_thresholds(run, {"target_rate": 0.80})
+    assert any(item.startswith("validator:1:") for item in both)
+    assert not any(item.startswith("validator:2:") for item in both)
+    assert any(item.startswith("aggregate:") for item in both)
+
+
+def test_sync_participation_rate_fires_for_in_committee_only(vp, load):
+    member = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1),
+        sync=vp.SyncOutcome(True, 32, 16, 48),
+    )
+    assert member.sync is not None
+    assert member.sync.in_committee is True
+    assert member.sync.participation_rate == pytest.approx(0.5)
+    absent = _table_report(
+        vp,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        sync=None,
+    )
+    outsider = _table_report(
+        vp,
+        ref=_active_ref(vp, index=3, pubkey=PK3),
+        sync=vp.SyncOutcome(False, 0, 0, 0),
+    )
+    assert outsider.sync is not None
+    assert outsider.sync.in_committee is False
+    assert outsider.sync.participation_rate is None
+    run = _table_run(vp, load, [member, absent, outsider])
+    hits = vp.evaluate_thresholds(run, {"sync_participation_rate": 0.95})
+    assert "validator:1:sync_participation_rate" in hits
+    assert not any(item.startswith("validator:2:") for item in hits)
+    assert not any(item.startswith("validator:3:") for item in hits)
+    assert "aggregate:sync_participation_rate" not in hits
+
+
+def test_breaching_rows_are_marked_in_table_and_json(vp, load):
+    # 0.80 + 1.00 → aggregate 0.90, so the summary tgt% is also under 0.95.
+    bad = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1),
+        target_rate=0.80,
+        attester_effectiveness=0.50,
+    )
+    good = _table_report(
+        vp,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        target_rate=1.00,
+        attester_effectiveness=1.00,
+    )
+    run, _opts = _run_with_thresholds(
+        vp, load, [bad, good], ("target_rate=0.95",)
+    )
+    assert run.aggregate["target_rate"] == pytest.approx(0.90)
+    text = _render_table(vp, run)
+    header, rows = _table_header_and_rows(text)
+    tgt = header.index("tgt%")
+    by_pk = {row[0].rstrip("!"): row for row in rows}
+    assert by_pk["0x1111…1111"][tgt].endswith("!")
+    assert not by_pk["0x2222…2222"][tgt].endswith("!")
+    assert "!" in by_pk["0x1111…1111"][0]
+    summary = next(ln for ln in text.splitlines() if ln.startswith("part%"))
+    assert "tgt% 90.00!" in summary
+    doc = json.loads(vp.render_json(run))
+    assert "validator:1:target_rate" in doc["threshold_breaches"]
+    assert "aggregate:target_rate" in doc["threshold_breaches"]
+    assert "validator:2:target_rate" not in doc["threshold_breaches"]
+    by_json = {row["pubkey"]: row for row in doc["validators"]}
+    assert "target_rate" in by_json[PK1]["threshold_breaches"]
+    assert "target_rate" not in by_json[PK2]["threshold_breaches"]
+    validate_schema(doc, _load_perf_schema())
 
