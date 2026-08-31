@@ -19,7 +19,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, TextIO
 from urllib.parse import unquote, urlencode, urlsplit
 
@@ -1126,9 +1126,78 @@ def resolve_validators(
 # ===== § 16. main =====
 
 
-def main(argv: list[str] | None = None) -> int:
-    build_parser().parse_args(argv)
-    return EXIT_OK
+def _render_dry_run(
+    ctx: ChainContext,
+    window: Window,
+    refs: Sequence[ValidatorRef],
+    log: Log,
+    endpoint: str,
+) -> None:
+    print(
+        f"window: epochs {window.from_epoch}–{window.to_epoch} "
+        f"(slots {window.start_slot}, {window.end_slot})"
+    )
+    print(f"endpoint: {endpoint}")
+    print(f"rewards_api: {ctx.rewards_api}")
+    print(f"node version: {ctx.node_version}")
+    for ref in refs:
+        print(
+            f"{ref.pubkey} index={ref.index} status={ref.status} "
+            f"eb={ref.effective_balance_gwei} gwei"
+        )
+
+
+def _abort_log_line(exc: BaseException) -> str:
+    # Status + template only; never a URL (P0-12). Tuple str(BeaconStatus) is unreadable.
+    if isinstance(exc, BeaconStatus):
+        return f"HTTP {exc.status} {exc.template}"
+    if isinstance(exc, BeaconTransport) and exc.args:
+        return f"transport error {exc.args[0]}"
+    return str(exc)
+
+
+def main(
+    argv: list[str] | None = None, *, transport: Transport | None = None
+) -> int:
+    log = Log(0, sys.stderr)
+    active = transport
+    try:
+        opts = build_options(argv)
+        log = Log(opts.verbosity, sys.stderr)
+        if active is None:
+            active = HttpTransport(opts.connect_timeout, opts.read_timeout)
+        client = BeaconClient(
+            list(opts.endpoints),
+            active,
+            request_delay=opts.request_delay_ms / 1000.0,
+            log=log,
+        )
+        select_endpoint(client)
+        ctx = load_chain_context(client)
+        window = resolve_window(opts, ctx, log)
+        refs = resolve_validators(client, list(opts.pubkeys))
+        ids = [str(ref.index) for ref in refs if ref.rewards_eligible][:1]
+        ctx = replace(
+            ctx, rewards_api=probe_rewards_api(client, ctx.head_epoch, ids)
+        )
+        if opts.dry_run:
+            endpoint = client.endpoints_used[-1] if client.endpoints_used else ""
+            _render_dry_run(ctx, window, refs, log, endpoint)
+        return EXIT_OK
+    except UsageError as exc:
+        log.error("%s", exc)
+        return EXIT_USAGE
+    except (NoBeaconAvailable, BeaconStatus, BeaconTransport) as exc:
+        # Phase 0/1/2 wire failures abort the run (5), never degrade (3).
+        log.error("%s", _abort_log_line(exc))
+        return EXIT_NO_BEACON
+    except Exception as exc:
+        log.error("%s", exc)
+        return EXIT_ERROR
+    finally:
+        closer = getattr(active, "close", None)
+        if callable(closer):
+            closer()
 
 
 if __name__ == "__main__":

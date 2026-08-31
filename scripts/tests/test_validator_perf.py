@@ -2273,3 +2273,222 @@ def test_probe_non_2xx_does_not_raise(vp, monkeypatch):
         assert verdict == expected
         assert verdict in ("available", "route_absent", "state_unavailable")
 
+
+# ----- VP-1n: §16 main + --dry-run + exits 0/2/5 -----
+
+# headers__head slot 3232 / spec__mainnet SPE 32 → head_epoch 101; probe uses 99.
+_DRY_RUN_HEAD_EPOCH = 101
+_DRY_RUN_ATT_PATH = _REWARDS_TEMPLATE.format(epoch=_DRY_RUN_HEAD_EPOCH - 2)
+
+
+def _dry_run_argv(*extra, url="https://bn.example:5052"):
+    return [
+        "--validators-config",
+        str(FIXTURES / "validators__three_entries.toml"),
+        "--beacon-url",
+        url,
+        "--dry-run",
+        *extra,
+    ]
+
+
+def _dry_run_routes(vp, *, probe="probe__state_unavailable"):
+    pair = json.loads((FIXTURES / f"{probe}.json").read_text())
+    return {
+        ("GET", _VERSION_TEMPLATE): [raw_response(vp, "node_version__lighthouse")],
+        ("GET", _SYNCING_PATH): [raw_response(vp, "node_syncing__ready")],
+        ("GET", _SPEC_TEMPLATE): [raw_response(vp, "spec__mainnet")],
+        ("GET", _GENESIS_PATH): [raw_response(vp, "genesis__mainnet")],
+        ("GET", _HEADER_HEAD_PATH): [raw_response(vp, "headers__head")],
+        ("GET", _FINALITY_PATH): [
+            raw_response(vp, "finality_checkpoints__head")
+        ],
+        ("POST", _VALIDATORS_PATH): [raw_response(vp, "states_validators__basic")],
+        ("GET", _BLOCKS_HEAD_PATH): [_raw_from_probe_leg(vp, pair["blocks"])],
+        ("POST", _DRY_RUN_ATT_PATH): [
+            _raw_from_probe_leg(vp, pair["attestations"])
+        ],
+    }
+
+
+def _run_dry_run(vp, *, probe="probe__state_unavailable", extra=(), url=None):
+    transport = FakeTransport(_dry_run_routes(vp, probe=probe))
+    argv = _dry_run_argv(*extra, url=url or "https://bn.example:5052")
+    code = vp.main(argv, transport=transport)
+    return code, transport
+
+
+def test_dry_run_prints_window_endpoint_verdict_and_keys(vp, capsys):
+    code, transport = _run_dry_run(vp, probe="probe__state_unavailable")
+    assert code == 0
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
+    # table on stdout; diagnostics stay on stderr (silent at default verbosity)
+    assert err == ""
+    assert "window: epochs 68–99 (slots 2208, 3232)" in out
+    assert "https://bn.example:5052" in out
+    assert "state_unavailable" in out
+    assert "Lighthouse/v5.3.0-aa11a3b" in out
+    expected = (
+        (PK1, "1", "active_ongoing", "32000000000"),
+        (PK2, "2", "active_exiting", "2048000000000"),
+        (PK3, "3", "pending_queued", "32000000000"),
+    )
+    for pk, index, status, eb in expected:
+        matches = [ln for ln in out.splitlines() if pk in ln]
+        assert len(matches) == 1, pk
+        line = matches[0]
+        assert index in line
+        assert status in line
+        assert eb in line
+        assert line not in err
+    # architecture §7: probe body is the first rewards_eligible index only
+    att_posts = [
+        c for c in transport.calls if c[1] == "POST" and "rewards/attestations" in c[2]
+    ]
+    assert len(att_posts) == 1
+    assert json.loads(att_posts[0][3]) == ["1"]
+
+
+def test_dry_run_exits_0(vp, capsys):
+    code, transport = _run_dry_run(vp)
+    assert code == vp.EXIT_OK == 0
+    assert transport.calls
+    capsys.readouterr()
+
+
+def test_usage_error_exits_2(vp, capsys):
+    code = vp.main([])
+    assert code == vp.EXIT_USAGE == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "pubkey" in captured.err.lower()
+
+
+def test_no_beacon_exits_5(vp, capsys):
+    transport = FakeTransport(
+        {("GET", _VERSION_TEMPLATE): [_raw(vp, 404)]}
+    )
+    code = vp.main(_dry_run_argv(), transport=transport)
+    assert code == vp.EXIT_NO_BEACON == 5
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.out
+    assert "https://" not in captured.err
+    assert captured.err.strip() != ""
+
+
+def test_unexpected_exception_exits_1_without_traceback_on_stdout(vp, capsys):
+    transport = FakeTransport(
+        {("GET", _VERSION_TEMPLATE): [_boom(RuntimeError("boom"))]}
+    )
+    code = vp.main(_dry_run_argv(), transport=transport)
+    assert code == vp.EXIT_ERROR == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    assert "boom" in captured.err
+
+
+def test_bootstrap_failure_exits_5_not_3(vp, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    routes = _dry_run_routes(vp)
+    routes[("GET", _SPEC_TEMPLATE)] = [_raw(vp, 500), _raw(vp, 500)]
+    transport = FakeTransport(routes)
+    code = vp.main(_dry_run_argv(), transport=transport)
+    assert code == vp.EXIT_NO_BEACON == 5
+    assert code != vp.EXIT_DEGRADED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.out
+    assert "HTTP 500" in captured.err
+    assert _SPEC_TEMPLATE in captured.err
+    assert "(500," not in captured.err
+    assert "https://" not in captured.err
+
+
+def test_probe_404_does_not_exit_5(vp, capsys):
+    code, _transport = _run_dry_run(vp, probe="probe__route_absent")
+    assert code == vp.EXIT_OK == 0
+    captured = capsys.readouterr()
+    assert "route_absent" in captured.out
+    assert "route_absent" not in captured.err
+
+
+def test_dry_run_leaks_no_secret(vp, capsys):
+    code, _transport = _run_dry_run(
+        vp, extra=("-v",), url=_SECRET_URL
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+    assert "https://bn.example:5052" in captured.out
+    assert "window:" in captured.out
+    assert "via https://bn.example:5052" in captured.err
+    assert "GET" not in captured.out
+
+
+def test_transport_closed_on_every_path(vp, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    success = FakeTransport(_dry_run_routes(vp))
+    assert vp.main(_dry_run_argv(), transport=success) == 0
+    assert success.closed is True
+
+    boom = FakeTransport(
+        {("GET", _VERSION_TEMPLATE): [_boom(RuntimeError("boom"))]}
+    )
+    assert vp.main(_dry_run_argv(), transport=boom) == vp.EXIT_ERROR
+    assert boom.closed is True
+
+    usage = FakeTransport(_dry_run_routes(vp))
+    assert vp.main(_dry_run_argv("--to-epoch", "100"), transport=usage) == (
+        vp.EXIT_USAGE
+    )
+    assert usage.closed is True
+    capsys.readouterr()
+
+
+def test_main_body_has_no_metric_logic():
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r"# ===== § 16\. main =====(.*)$",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None
+    body = match.group(1)
+    for token in (
+        "participation",
+        "estimated_apr",
+        "flag_actual",
+        "flag_ideal",
+        "rewards_gwei",
+        "inactivity_gwei",
+        "consensus_reward",
+        "collect_attestations",
+        "evaluate_epoch",
+        "BALANCE_TOLERANCE",
+    ):
+        assert token not in body
+    for name in (
+        "build_options",
+        "select_endpoint",
+        "load_chain_context",
+        "resolve_window",
+        "resolve_validators",
+        "probe_rewards_api",
+        "_render_dry_run",
+        "replace(",
+    ):
+        assert name in body
+    order = [
+        "select_endpoint",
+        "load_chain_context",
+        "resolve_window",
+        "resolve_validators",
+        "probe_rewards_api",
+    ]
+    positions = [body.index(name) for name in order]
+    assert positions == sorted(positions)
+
