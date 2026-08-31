@@ -2290,7 +2290,13 @@ def _slot_utc(ctx: ChainContext, slot: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _fmt_incl_sched(proposals: object) -> str:
+    row = proposals if isinstance(proposals, dict) else {}
+    return f"{_cell(row.get('included'))}/{_cell(row.get('scheduled'))}"
+
+
 def _table_row(report: ValidatorReport) -> list[str]:
+    sync = report.sync
     return [
         _abbrev_pubkey(report.ref.pubkey),
         _cell(report.ref.index),
@@ -2301,8 +2307,8 @@ def _table_row(report: ValidatorReport) -> list[str]:
         _fmt_pct(report.target_rate),
         _fmt_pct(report.head_rate),
         _cell(report.missed_attestations),
-        _EM_DASH,  # Phase 2: incl/sched and sync% stay — (VP-3f fills them)
-        _EM_DASH,
+        _fmt_incl_sched(report.proposals),
+        _fmt_pct(None if sync is None else sync.participation_rate),
         _fmt_eth(report.balance.delta_gwei),
         _fmt_pct(report.attester_effectiveness),
         _fmt_pct(report.estimated_apr),
@@ -2338,8 +2344,7 @@ def render_table(run: RunReport, out: TextIO) -> None:
             f"head% {_fmt_pct(agg.get('head_rate'))}  "
             f"eff% {_fmt_pct(agg.get('attester_effectiveness'))}",
             f"missed {_cell(agg.get('missed_attestations'))}  "
-            f"incl/sched {_cell(proposals.get('included'))}/"
-            f"{_cell(proposals.get('scheduled'))}  "
+            f"incl/sched {_fmt_incl_sched(proposals)}  "
             f"consensus_reward_gwei {_cell(agg.get('consensus_reward_gwei'))}  "
             f"APR% {_fmt_pct(agg.get('estimated_apr'))}",
             "",
@@ -2351,6 +2356,12 @@ def render_table(run: RunReport, out: TextIO) -> None:
             "DEGRADED:",
         ]
     )
+    if run.degradations:
+        lines.extend(
+            _align_rows(
+                [[d.metric, d.reason, d.scope] for d in run.degradations]
+            )
+        )
     out.write("\n".join(lines) + "\n")
 
 

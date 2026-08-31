@@ -4431,6 +4431,7 @@ def _golden_reports(vp):
         attester_effectiveness=0.5,
         estimated_apr=0.02,
         rewards_gwei=_rewards_gwei(1_000_000),
+        proposals={"scheduled": 1, "included": 0, "missed": 1},
         balance=vp.BalanceSnapshot(_EB_32, _EB_32 + 1_834_000, _EB_32, _EB_32),
     )
     best = _table_report(
@@ -4439,6 +4440,8 @@ def _golden_reports(vp):
         attester_effectiveness=1.0,
         estimated_apr=0.0471,
         rewards_gwei=_rewards_gwei(2_000_000),
+        proposals={"scheduled": 1, "included": 1, "missed": 0},
+        sync=vp.SyncOutcome(True, 32, 16, 0),
         balance=vp.BalanceSnapshot(_EB_32, _EB_32 + 2_000_000, _EB_32, _EB_32),
     )
     empty = _table_report(
@@ -4454,6 +4457,7 @@ def _golden_reports(vp):
         estimated_apr=None,
         reward_source=None,
         rewards_gwei=_rewards_gwei(0),
+        proposals={"scheduled": 0, "included": 0, "missed": 0},
         balance=vp.BalanceSnapshot(None, None, None, None),
     )
     return [best, empty, worst]
@@ -4473,12 +4477,39 @@ def test_null_renders_em_dash_never_zero(vp, load):
     assert "0" not in cell
 
 
-# table__golden_phase2.txt is superseded on arrival (anti-churn b).
-# Phase 3 asserts table__golden.txt instead (real incl/sched and sync%).
+# table__golden_phase2.txt is superseded (anti-churn b).
+# Phase 3 asserts table__golden.txt (real incl/sched and sync%).
 def test_golden_table_matches_exactly(vp, load):
     text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
-    expected = (FIXTURES / "table__golden_phase2.txt").read_text(encoding="utf-8")
+    expected = (FIXTURES / "table__golden.txt").read_text(encoding="utf-8")
     assert text == expected
+
+
+def test_final_golden_table_matches(vp, load):
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    expected = (FIXTURES / "table__golden.txt").read_text(encoding="utf-8")
+    assert text == expected
+    header, rows = _table_header_and_rows(text)
+    incl = header.index("incl/sched")
+    sync = header.index("sync%")
+    assert any("/" in row[incl] and "—" not in row[incl] for row in rows)
+    assert any(row[sync] != "—" for row in rows)
+
+
+def test_phase2_golden_retired_not_silently_failing():
+    # table__golden_phase2.txt is superseded; do not assert against it.
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "table__golden_phase2.txt" in source
+    assert "superseded" in source
+    assert (FIXTURES / "table__golden_phase2.txt").is_file()
+    asserted = [
+        line
+        for line in source.splitlines()
+        if "table__golden_phase2.txt" in line
+        and "read_text" in line
+        and not line.lstrip().startswith("#")
+    ]
+    assert asserted == []
 
 
 def test_rows_sorted_by_effectiveness_ascending(vp, load):
@@ -4582,6 +4613,17 @@ def test_degraded_block_header_present_when_empty(vp, load):
     text = _render_table(vp, run)
     assert "DEGRADED:" in text
     assert text.split("DEGRADED:", 1)[1].strip() == ""
+
+
+def test_degraded_block_lists_metric_reason_and_scope(vp, load):
+    deg = vp.Degradation("head_rate", "epoch:100", "inactivity_leak", "leak")
+    run = replace(_table_run(vp, load, _golden_reports(vp)), degradations=[deg])
+    text = _render_table(vp, run)
+    body = text.split("DEGRADED:", 1)[1]
+    assert "head_rate" in body
+    assert "inactivity_leak" in body
+    assert "epoch:100" in body
+    assert body.strip() != ""
 
 
 # ----- VP-2h: §15 render_json + perf_schema.json + subset walker (D9) -----
@@ -4845,20 +4887,121 @@ def test_gwei_emitted_as_numbers_not_strings(vp, load):
 
 _FULL_FROM = 98
 _FULL_TO = 98
-_PHASE2_NULL_REASONS = frozenset(
+_G5_EXCEPTIONS = ("sync.participation_rate",)
+_R9_NULL_FIELDS = frozenset(
     {
-        "inactivity_leak",
-        "ideal_row_missing",
-        "effective_balance_zero",
-        "state_unavailable",
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "missed_attestations",
+        "attester_effectiveness",
+        "estimated_apr",
     }
 )
-_NULL_RATE_FIELDS = (
+_NULL_METRIC_FIELDS = (
+    "participation_rate",
     "source_rate",
     "target_rate",
     "head_rate",
+    "missed_attestations",
     "attester_effectiveness",
+    "estimated_apr",
+    "proposals.scheduled",
+    "proposals.missed",
+    "proposals.included",
+    "sync.participation_rate",
+    "balance.start_gwei",
+    "balance.end_gwei",
+    "balance.delta_gwei",
+    "rewards_gwei.source",
+    "rewards_gwei.target",
+    "rewards_gwei.head",
+    "rewards_gwei.inactivity",
+    "rewards_gwei.proposer",
+    "rewards_gwei.sync",
+    "rewards_gwei.total",
 )
+_SCOPE_RE = re.compile(r"^(?:run|validator:(?:unknown|\d+)|epoch:\d+)$")
+_M1_M6 = frozenset(
+    {
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "missed_attestations",
+        "attester_effectiveness",
+    }
+)
+_M9_FIELDS = frozenset(
+    {
+        "rewards_gwei.source",
+        "rewards_gwei.target",
+        "rewards_gwei.head",
+        "rewards_gwei.inactivity",
+        "rewards_gwei.proposer",
+        "rewards_gwei.sync",
+        "rewards_gwei.total",
+        "estimated_apr",
+    }
+)
+# Architecture §5: which null fields each reason may explain.
+_REASON_COVERS = {
+    "rewards_api_unsupported": _M1_M6 | _M9_FIELDS,
+    "state_unavailable": frozenset(_NULL_METRIC_FIELDS),
+    "inactivity_leak": frozenset({"head_rate", "attester_effectiveness"}),
+    "ideal_row_missing": frozenset({"attester_effectiveness"}),
+    "effective_balance_zero": _M1_M6 | frozenset({"estimated_apr"}),
+    "proposer_duties_unavailable": frozenset(
+        {"proposals.scheduled", "proposals.missed"}
+    ),
+    "block_reward_unavailable": frozenset({"rewards_gwei.proposer"}),
+    "sync_committees_unavailable": frozenset({"sync.participation_rate"}),
+    "endpoint_failover": _M1_M6,
+}
+_REASON_PRODUCERS = {
+    "rewards_api_unsupported": ("probe__route_absent",),
+    "state_unavailable": (
+        "probe__state_unavailable",
+        "rewards_attestations__404_all",
+    ),
+    "inactivity_leak": ("rewards_attestations__leak",),
+    "proposer_duties_unavailable": (
+        "duties_proposer__404",
+        "duties_proposer__teku_503",
+        "duties_proposer__nimbus_400",
+        "duties_proposer__lodestar_500",
+    ),
+    "block_reward_unavailable": ("rewards_blocks__404_headers_200",),
+    "ideal_row_missing": ("rewards_attestations__ideal_filtered",),
+    "effective_balance_zero": ("states_validators__eb_zero",),
+    "sync_committees_unavailable": (
+        "state_sync_committees__400_outside_period",
+    ),
+    "endpoint_failover": ("failover__midrun_promotion",),
+}
+_G5_KIND_PREFIXES = (
+    ("failover__", "declared"),
+    ("rewards_attestations__", "rewards"),
+    ("states_validators__", "validators"),
+    ("duties_proposer__", "duties"),
+    ("probe__", "probe"),
+    ("rewards_blocks__", "blocks"),
+    ("state_sync_committees__", "sync_membership"),
+    ("sync_committee__", "sync_scan"),
+    ("balances__", "balances"),
+    ("spec__", "bootstrap"),
+    ("genesis__", "bootstrap"),
+    ("headers__", "headers"),
+    ("node_syncing__", "syncing"),
+    ("node_version__", "bootstrap"),
+    ("finality_checkpoints__", "bootstrap"),
+)
+_G5_SKIP = {
+    "failover__midrun_promotion": "declared VP-4a; not exercised",
+    "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
+    "node_syncing__is_syncing": "selection abort exit 5; no report",
+}
 
 
 def _full_argv(*extra, url="https://bn.example:5052", pubkeys=(PK1,)):
@@ -4930,12 +5073,14 @@ def _run_full(
     routes=None,
     url="https://bn.example:5052",
     pubkeys=None,
+    transport=None,
     **route_kw,
 ):
     argv_kw: dict = {"url": url}
     if pubkeys is not None:
         argv_kw["pubkeys"] = pubkeys
-    transport = FakeTransport(routes or _full_run_routes(vp, **route_kw))
+    if transport is None:
+        transport = FakeTransport(routes or _full_run_routes(vp, **route_kw))
     code = vp.main(_full_argv(*extra, **argv_kw), transport=transport)
     return code, transport
 
@@ -5120,7 +5265,7 @@ def test_full_run_leaks_no_secret_in_stdout_or_stderr(vp, capsys):
     assert "https://bn.example:5052" in captured.err
 
 
-def _phase2_reasons_for_row(row, run_degs):
+def _reasons_for_row(row, run_degs):
     reasons = {d["reason"] for d in row.get("degradations") or []}
     index = row.get("index")
     unknown = index is None or row.get("status") == "unknown"
@@ -5138,46 +5283,446 @@ def _phase2_reasons_for_row(row, run_degs):
     return reasons
 
 
-def test_every_null_metric_has_a_matching_degradation_entry(vp, capsys):
-    scenarios = (
-        {"rewards": "rewards_attestations__leak"},
-        {"rewards": "rewards_attestations__ideal_filtered"},
-        {"validators": "states_validators__eb_zero"},
-        {"fail_collect": True},
-        {
-            "validators": "states_validators__unknown_pubkey",
-            "pubkeys": (PK4,),
-        },
-        {
-            "validators": "states_validators__unknown_pubkey",
-            "pubkeys": (PK1, PK4),
-        },
+def _json_fixture_stems():
+    return tuple(sorted(p.stem for p in FIXTURES.glob("*.json")))
+
+
+def _g5_kind(stem: str) -> str:
+    for prefix, kind in _G5_KIND_PREFIXES:
+        if stem.startswith(prefix):
+            return kind
+    raise AssertionError(f"unclassified fixture {stem}")
+
+
+def _duty_status(stem: str) -> int:
+    if stem.endswith("503"):
+        return 503
+    if stem.endswith("500"):
+        return 500
+    if stem.endswith("400"):
+        return 400
+    if stem.endswith("404"):
+        return 404
+    return 200
+
+
+def _queued_raw(vp, stem, status):
+    item = raw_response(vp, stem, status=status)
+    n = 3 if status == 503 else (2 if status == 500 else 1)
+    return [item] * n
+
+
+def _rewards_collect_raw(vp, stem):
+    payload = json.loads((FIXTURES / f"{stem}.json").read_text())
+    if stem.endswith("404_all"):
+        return raw_response(vp, stem, status=404)
+    if isinstance(payload, list):
+        payload = payload[0]
+    return _raw(vp, 200, json.dumps(payload).encode())
+
+
+def _schedule_our_proposal(vp, routes, *, blocks=None, headers=None):
+    slot = _FULL_FROM * 32
+    duties = json.loads((FIXTURES / "duties_proposer__ok.json").read_text())
+    duties["data"] = [
+        {**row, "slot": str(slot)}
+        for row in duties["data"]
+        if row["validator_index"] == "1"
+    ]
+    routes[("GET", _PROPOSER_TEMPLATE.format(epoch=_FULL_FROM))] = [
+        _raw(vp, 200, json.dumps(duties).encode())
+    ]
+    if blocks is not None:
+        routes[("GET", _blocks_path(slot))] = list(blocks)
+    if headers is not None:
+        routes[("GET", _slot_header_path(slot))] = list(headers)
+    return routes
+
+
+def _script_sync_scan(vp, routes, stem, status=200):
+    item = raw_response(vp, stem, status=status)
+    spe = 32
+    for slot in range(_FULL_FROM * spe, (_FULL_TO + 1) * spe):
+        path = f"/eth/v1/beacon/rewards/sync_committee/{slot}"
+        routes[("POST", path)] = [item]
+    return routes
+
+
+def _enable_sync_membership(vp, routes, stem, status=200):
+    spe = 32
+    path = (
+        f"/eth/v1/beacon/states/{_FULL_FROM * spe}/sync_committees"
+        f"?epoch={_FULL_FROM}"
     )
-    for kw in scenarios:
-        pubkeys = kw.get("pubkeys")
-        route_kw = {k: v for k, v in kw.items() if k != "pubkeys"}
-        extra = {} if pubkeys is None else {"pubkeys": pubkeys}
-        code, _transport = _run_full(vp, "--json", **extra, **route_kw)
-        assert code == vp.EXIT_DEGRADED == 3
-        doc, _captured = _stdout_json(capsys)
-        run_degs = list(doc["degradations"])
-        for row in doc["validators"]:
-            reasons = _phase2_reasons_for_row(row, run_degs)
-            unknown = row.get("index") is None or row.get("status") == "unknown"
-            # R9: a known validator with zero active epochs is a fact, not a deg.
-            r9 = (
-                not unknown
-                and row.get("active_epochs") == 0
-                and not (reasons & _PHASE2_NULL_REASONS)
+    routes[("GET", path)] = _queued_raw(vp, stem, status)
+    return routes
+
+
+def _g5_routes(vp, stem):
+    if stem in _G5_SKIP:
+        raise AssertionError(f"{stem} must pytest.skip, not overlay")
+    kind = _g5_kind(stem)
+    routes = _full_run_routes(vp)
+    if kind not in ("sync_membership", "sync_scan"):
+        # empty.json includes index 42; G5 must not treat that as membership.
+        spe = 32
+        path = (
+            f"/eth/v1/beacon/states/{_FULL_FROM * spe}/sync_committees"
+            f"?epoch={_FULL_FROM}"
+        )
+        routes[("GET", path)] = [
+            _raw(vp, 200, b'{"data": {"validators": []}}')
+        ]
+    collect = _REWARDS_TEMPLATE.format(epoch=_FULL_FROM)
+    overlaid = False
+    if kind == "rewards":
+        raw = _rewards_collect_raw(vp, stem)
+        routes[("POST", collect)] = [raw]
+        if stem.endswith("404_all"):
+            routes[("POST", _DRY_RUN_ATT_PATH)] = [raw]
+        overlaid = True
+    elif kind == "validators":
+        if stem == "states_validators__snapshot_start":
+            routes[("POST", _validators_at((_FULL_FROM + 1) * 32))] = [
+                raw_response(vp, stem)
+            ]
+        elif stem == "states_validators__snapshot_end":
+            routes[("POST", _validators_at((_FULL_TO + 2) * 32))] = [
+                raw_response(vp, stem)
+            ]
+        elif stem == "states_validators__post_414":
+            routes[("POST", _VALIDATORS_PATH)] = [
+                raw_response(vp, stem, status=414)
+            ]
+            routes[("GET", _VALIDATORS_PATH)] = [
+                raw_response(vp, "states_validators__basic")
+            ] * 4
+        else:
+            body = raw_response(vp, stem)
+            routes[("POST", _VALIDATORS_PATH)] = [body]
+            routes[("POST", _validators_at((_FULL_FROM + 1) * 32))] = [body]
+            routes[("POST", _validators_at((_FULL_TO + 2) * 32))] = [body]
+        overlaid = True
+    elif kind == "duties":
+        routes[("GET", _PROPOSER_TEMPLATE.format(epoch=_FULL_FROM))] = (
+            _queued_raw(vp, stem, _duty_status(stem))
+        )
+        overlaid = True
+    elif kind == "probe":
+        pair = json.loads((FIXTURES / f"{stem}.json").read_text())
+        routes[("GET", _BLOCKS_HEAD_PATH)] = [
+            _raw_from_probe_leg(vp, pair["blocks"])
+        ]
+        routes[("POST", _DRY_RUN_ATT_PATH)] = [
+            _raw_from_probe_leg(vp, pair["attestations"])
+        ]
+        if stem.endswith("route_absent"):
+            routes.pop(("POST", collect), None)
+        else:
+            routes[("POST", collect)] = [_raw(vp, 404)]
+        overlaid = True
+    elif kind == "blocks":
+        if stem.endswith("404_headers_200"):
+            pair = json.loads((FIXTURES / f"{stem}.json").read_text())
+            _schedule_our_proposal(
+                vp,
+                routes,
+                blocks=[_raw_from_probe_leg(vp, pair["blocks"])],
+                headers=[_raw_from_probe_leg(vp, pair["headers"])],
             )
-            for field in _NULL_RATE_FIELDS:
-                if row.get(field) is None and not r9:
-                    assert reasons & _PHASE2_NULL_REASONS, (
-                        kw,
-                        field,
-                        row.get("pubkey"),
-                        reasons,
-                    )
+        elif stem.endswith("data_null"):
+            _schedule_our_proposal(
+                vp,
+                routes,
+                blocks=[raw_response(vp, stem)],
+                headers=[raw_response(vp, "headers__slot_present")],
+            )
+        else:
+            _schedule_our_proposal(
+                vp, routes, blocks=[raw_response(vp, stem)]
+            )
+        overlaid = True
+    elif kind == "sync_membership":
+        status = 400 if "400" in stem else 200
+        _enable_sync_membership(vp, routes, stem, status)
+        if stem.endswith("intersect"):
+            _script_sync_scan(
+                vp, routes, "sync_committee__lodestar_negative"
+            )
+        overlaid = True
+    elif kind == "sync_scan":
+        _enable_sync_membership(
+            vp, routes, "state_sync_committees__intersect"
+        )
+        status = 404 if "skipped" in stem else 200
+        _script_sync_scan(vp, routes, stem, status=status)
+        overlaid = True
+    elif kind == "balances":
+        routes[("POST", _validators_at((_FULL_TO + 2) * 32))] = [
+            raw_response(vp, stem)
+        ]
+        overlaid = True
+    elif kind == "headers":
+        if stem.endswith("head"):
+            routes[("GET", _HEADER_HEAD_PATH)] = [raw_response(vp, stem)]
+        elif stem.endswith("slot_present"):
+            _schedule_our_proposal(
+                vp,
+                routes,
+                blocks=[_raw(vp, 404)],
+                headers=[raw_response(vp, stem)],
+            )
+        elif stem.endswith("slot_404"):
+            _schedule_our_proposal(
+                vp,
+                routes,
+                blocks=[_raw(vp, 404)],
+                headers=[raw_response(vp, stem, status=404)],
+            )
+        else:
+            raise AssertionError(f"headers fixture {stem} has no overlay")
+        overlaid = True
+    elif kind == "syncing":
+        routes[("GET", _SYNCING_PATH)] = [raw_response(vp, stem)]
+        overlaid = True
+    elif kind == "bootstrap":
+        mapping = {
+            "spec__mainnet": ("GET", _SPEC_TEMPLATE),
+            "genesis__mainnet": ("GET", _GENESIS_PATH),
+            "node_version__lighthouse": ("GET", _VERSION_TEMPLATE),
+            "finality_checkpoints__head": ("GET", _FINALITY_PATH),
+        }
+        if stem not in mapping:
+            raise AssertionError(f"bootstrap fixture {stem} has no overlay")
+        routes[mapping[stem]] = [raw_response(vp, stem)]
+        overlaid = True
+    if not overlaid:
+        raise AssertionError(f"{stem} classified {kind} but did not overlay")
+    return routes
+
+
+def _g5_pubkeys(stem):
+    if stem == "states_validators__unknown_pubkey":
+        return (PK4,)
+    return None
+
+
+def _lenient_full_transport(vp, routes):
+    inner = FakeTransport(routes)
+
+    class _Transport:
+        def __init__(self):
+            self.calls = inner.calls
+            self.drops = inner.drops
+            self.closed = False
+            self.routes = inner.routes
+
+        def __call__(self, ep, method, path, body):
+            try:
+                return inner(ep, method, path, body)
+            except KeyError:
+                if method == "GET" and "/eth/v1/beacon/rewards/blocks/" in path:
+                    if not path.endswith("/head"):
+                        return _raw(vp, 404)
+                if method == "GET" and "/eth/v1/beacon/headers/" in path:
+                    if not path.endswith("/head"):
+                        return _raw(vp, 404)
+                if (
+                    method == "POST"
+                    and "/eth/v1/beacon/rewards/sync_committee/" in path
+                ):
+                    return _raw(vp, 404)
+                raise
+
+        def drop(self, ep):
+            inner.drop(ep)
+
+        def close(self):
+            inner.close()
+            self.closed = inner.closed
+
+    return _Transport()
+
+
+def _g5_doc(vp, capsys, monkeypatch, stem):
+    _no_sleep(monkeypatch, vp)
+    routes = _g5_routes(vp, stem)
+    transport = _lenient_full_transport(vp, routes)
+    pubkeys = _g5_pubkeys(stem)
+    extra = {} if pubkeys is None else {"pubkeys": pubkeys}
+    _run_full(vp, "--json", transport=transport, **extra)
+    captured = capsys.readouterr()
+    out = captured.out.strip()
+    assert out, f"{stem} produced no JSON report"
+    return json.loads(out)
+
+
+def _lookup_metric(row, path):
+    cur = row
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _not_in_committee(row):
+    sync = row.get("sync")
+    if not isinstance(sync, dict):
+        return True
+    return sync.get("in_committee") is not True
+
+
+def _is_r9_known_zero_active(row):
+    unknown = row.get("index") is None or row.get("status") == "unknown"
+    if unknown or row.get("active_epochs") != 0:
+        return False
+    status = row.get("status") or ""
+    # EB-0 / rewards-less still report active_* with empty outcomes.
+    return not status.startswith("active_")
+
+
+def _is_all_skipped_sync(row):
+    # All-404 scan: in committee, zero eligible slots. Fact, like R9, not A7.
+    sync = row.get("sync")
+    if not isinstance(sync, dict):
+        return False
+    return (
+        sync.get("in_committee") is True
+        and sync.get("participation_rate") is None
+        and (sync.get("slots_eligible") or 0) == 0
+    )
+
+
+def _matching_reasons(field, reasons):
+    return frozenset(
+        r for r in reasons if field in _REASON_COVERS.get(r, ())
+    )
+
+
+def _assert_g5_doc(stem, doc):
+    run_degs = list(doc["degradations"])
+    for row in doc["validators"]:
+        reasons = _reasons_for_row(row, run_degs)
+        r9 = _is_r9_known_zero_active(row)
+        for field in _NULL_METRIC_FIELDS:
+            value = _lookup_metric(row, field)
+            if value is not None:
+                continue
+            if field in _G5_EXCEPTIONS and _not_in_committee(row):
+                continue
+            if r9 and field in _R9_NULL_FIELDS:
+                continue
+            if field == "sync.participation_rate" and _is_all_skipped_sync(
+                row
+            ):
+                continue
+            covered = _matching_reasons(field, reasons)
+            assert covered, (stem, field, row.get("pubkey"), reasons)
+
+
+@pytest.mark.parametrize("stem", _json_fixture_stems())
+def test_every_null_metric_has_a_matching_degradation_entry(
+    vp, capsys, monkeypatch, stem
+):
+    skip = _G5_SKIP.get(stem)
+    if skip:
+        pytest.skip(skip)
+    doc = _g5_doc(vp, capsys, monkeypatch, stem)
+    _assert_g5_doc(stem, doc)
+
+
+def test_not_in_committee_is_the_only_exception():
+    assert _G5_EXCEPTIONS == ("sync.participation_rate",)
+    assert len(_G5_EXCEPTIONS) == 1
+    src = inspect.getsource(_assert_g5_doc)
+    assert "_G5_EXCEPTIONS" in src
+    assert "_not_in_committee" in src
+    assert "_is_all_skipped_sync" in src
+    assert "_is_all_skipped_sync" not in str(_G5_EXCEPTIONS)
+
+
+def _failing_snapshot_doc(vp, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    routes = _full_run_routes(vp)
+    routes.update(_pruned_slot(vp, (_FULL_FROM + 1) * 32))
+    routes.update(_pruned_slot(vp, (_FULL_TO + 2) * 32))
+    _run_full(vp, "--json", routes=routes)
+    doc, _captured = _stdout_json(capsys)
+    return doc
+
+
+def _doc_reasons(doc):
+    got = {d["reason"] for d in doc["degradations"]}
+    for row in doc["validators"]:
+        got.update(d["reason"] for d in row.get("degradations") or [])
+    return got
+
+
+def test_every_reason_in_the_closed_enum_is_produced_by_a_fixture(
+    vp, capsys, monkeypatch
+):
+    assert list(_REASON_PRODUCERS) == list(_REASON_ENUM)
+    missing = []
+    for reason, names in _REASON_PRODUCERS.items():
+        for name in names:
+            assert (FIXTURES / f"{name}.json").is_file(), name
+            if reason == "endpoint_failover":
+                continue
+            produced = _doc_reasons(_g5_doc(vp, capsys, monkeypatch, name))
+            if reason not in produced:
+                missing.append((reason, name, produced))
+    snap = _failing_snapshot_doc(vp, capsys, monkeypatch)
+    if "state_unavailable" not in _doc_reasons(snap):
+        missing.append(
+            ("state_unavailable", "failing_balance_snapshot", _doc_reasons(snap))
+        )
+    assert missing == []
+
+
+def test_zero_active_validator_reports_null_rates_no_degradation_exit_0(
+    vp, capsys
+):
+    code, _transport = _run_full(
+        vp, "--json", validators="states_validators__zero_active"
+    )
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 0
+    assert doc["degradations"] == []
+    assert len(doc["validators"]) == 1
+    row = doc["validators"][0]
+    assert row["index"] is not None
+    assert row["status"] != "unknown"
+    assert row["active_epochs"] == 0
+    assert row["degradations"] == []
+    for field in _R9_NULL_FIELDS:
+        assert row[field] is None, field
+        assert row[field] != 0, field
+    assert row["balance"]["effective_balance_gwei"] not in (None, 0)
+
+
+def test_scope_values_are_run_validator_or_epoch(vp, capsys, monkeypatch):
+    prefixes = set()
+    for reason, names in _REASON_PRODUCERS.items():
+        if reason == "endpoint_failover":
+            continue
+        for name in names:
+            doc = _g5_doc(vp, capsys, monkeypatch, name)
+            for d in list(doc["degradations"]) + [
+                deg
+                for row in doc["validators"]
+                for deg in row.get("degradations") or []
+            ]:
+                scope = d["scope"]
+                assert _SCOPE_RE.fullmatch(scope), (name, d)
+                prefixes.add(scope.split(":", 1)[0])
+    snap = _failing_snapshot_doc(vp, capsys, monkeypatch)
+    for d in snap["degradations"]:
+        assert _SCOPE_RE.fullmatch(d["scope"]), d
+        prefixes.add(d["scope"].split(":", 1)[0])
+    assert prefixes <= {"run", "validator", "epoch"}
+    assert {"run", "validator", "epoch"} <= prefixes
 
 
 # ----- VP-3a: §11 proposer duties — four failure codes (RD-3, P0-7) -----
