@@ -3252,6 +3252,7 @@ def test_main_body_has_no_metric_logic():
         "collect_attestations",
         "collect_proposals",
         "collect_balances",
+        "collect_sync",
         "build_validator_report",
         "build_aggregate",
         "decide_exit_code",
@@ -3274,6 +3275,7 @@ def test_main_body_has_no_metric_logic():
         "collect_attestations",
         "collect_proposals",
         "collect_balances",
+        "collect_sync",
         "build_validator_report",
         "build_aggregate",
         "decide_exit_code",
@@ -4909,6 +4911,15 @@ def _full_run_routes(
     routes[("GET", _PROPOSER_TEMPLATE.format(epoch=_FULL_FROM))] = [
         _raw(vp, 200, b'{"data": []}')
     ]
+    # A7: empty membership so full-run tests do not pay the SM2 scan.
+    sync_state = _FULL_FROM * spe
+    routes[
+        (
+            "GET",
+            f"/eth/v1/beacon/states/{sync_state}/sync_committees"
+            f"?epoch={_FULL_FROM}",
+        )
+    ] = [raw_response(vp, "state_sync_committees__empty")]
     return routes
 
 
@@ -5793,26 +5804,56 @@ def test_orphaned_block_reads_as_missed_and_is_documented(vp, load):
 _SYNC_MEMBERSHIP_RE = re.compile(
     r"/eth/v1/beacon/states/([^/]+)/sync_committees\?epoch=(\d+)$"
 )
+_SYNC_REWARDS_RE = re.compile(r"/eth/v1/beacon/rewards/sync_committee/(\d+)$")
+
+
+class _Scan404:
+    status = 404
+    body = b'{"code":404,"message":"Block not found"}'
+    truncated = False
+    headers: dict = {}
 
 
 class _SyncMembershipTransport:
-    """Serves membership GETs; rewards/sync_committee stays unscripted."""
+    """Serves membership GETs; scan POSTs default to skipped-slot 404."""
 
-    def __init__(self, membership_resp, *, head_resp=None):
+    def __init__(
+        self,
+        membership_resp,
+        *,
+        head_resp=None,
+        scan_resp=None,
+        scan_by_slot=None,
+        membership_by_epoch=None,
+    ):
         self.membership_resp = membership_resp
         self.head_resp = head_resp
+        self.scan_resp = scan_resp
+        self.scan_by_slot = scan_by_slot or {}
+        self.membership_by_epoch = membership_by_epoch or {}
         self.calls: list[tuple[str, str, str, object]] = []
         self.drops: list = []
         self.closed = False
 
     def __call__(self, ep, method, path, body):
         self.calls.append((ep.label, method, path, body))
-        if "rewards/sync_committee" in path:
-            raise KeyError(f"unscripted FakeTransport call: {method} {path}")
+        match = _SYNC_REWARDS_RE.search(path)
+        if match:
+            slot = int(match.group(1))
+            item = self.scan_by_slot.get(slot, self.scan_resp)
+            if item is None:
+                item = _Scan404()
+            if callable(item):
+                item = item(slot)
+            return item
         if "/sync_committees" not in path:
             raise KeyError(f"unscripted FakeTransport call: {method} {path}")
         if self.head_resp is not None and "/states/head/" in path:
             return self.head_resp
+        if self.membership_by_epoch:
+            _state_id, epoch = _parse_sync_membership_path(path)
+            if epoch in self.membership_by_epoch:
+                return self.membership_by_epoch[epoch]
         return self.membership_resp
 
     def drop(self, ep):
@@ -6068,4 +6109,277 @@ def test_sync_committees_failure_degrades_and_exits_3(vp, load):
     assert all(o.participation_rate is None for o in outcomes.values())
     assert _sync_exit(vp, load, degs) == vp.EXIT_DEGRADED == 3
     assert vp.EXIT_ERROR == 1
+
+
+# ----- VP-3d: §12 per-slot scan — membership-set filter, skipped-slot 404 (M8) -----
+
+
+def _sync_scan_slots(transport):
+    slots = []
+    for _label, _method, path, _body in _sync_scan_calls(transport):
+        match = _SYNC_REWARDS_RE.search(path)
+        assert match is not None, path
+        slots.append(int(match.group(1)))
+    return slots
+
+
+def _sync_epoch_slots(w, spe=32):
+    return range(w.from_epoch * spe, (w.to_epoch + 1) * spe)
+
+
+def _sync_scan_transport(vp, load, *, scan_resp, scan_by_slot=None, index_set=(1, 2)):
+    w = _att_window(vp, 100, 100)
+    ctx = _chain_ctx(vp, load, head_epoch=110)
+    membership = raw_response(vp, "state_sync_committees__intersect")
+    transport = _SyncMembershipTransport(
+        membership, scan_resp=scan_resp, scan_by_slot=scan_by_slot
+    )
+    outcomes, degs, transport, budget = _collect_sync(
+        vp, w, ctx, set(index_set), transport
+    )
+    return w, outcomes, degs, transport, budget
+
+
+def _lodestar_scan(vp, load):
+    return raw_response(vp, "sync_committee__lodestar_negative")
+
+
+def _dropping_scan(vp, load):
+    env = load("sync_committee__lodestar_negative")
+    rows = [
+        row
+        for row in env["data"]
+        if str(row["validator_index"]) != "2"
+    ]
+    return _raw(vp, 200, json.dumps({**env, "data": rows}).encode())
+
+
+def _member_miss_scan(vp):
+    payload = {
+        "execution_optimistic": False,
+        "finalized": True,
+        "data": [{"validator_index": "1", "reward": "-16"}],
+    }
+    return _raw(vp, 200, json.dumps(payload).encode())
+
+
+def test_lodestar_negative_rows_for_non_members_are_filtered_by_the_computed_set(
+    vp, load
+):
+    env = load("sync_committee__lodestar_negative")
+    by_idx = {
+        int(row["validator_index"]): int(row["reward"]) for row in env["data"]
+    }
+    assert by_idx[1] > 0
+    assert by_idx[2] < 0
+    w, outcomes, degs, transport, _budget = _sync_scan_transport(
+        vp, load, scan_resp=_lodestar_scan(vp, load)
+    )
+    assert degs == []
+    member, other = outcomes[1], outcomes[2]
+    assert member.in_committee is True
+    assert other.in_committee is False
+    assert other.slots_eligible == 0
+    assert other.slots_signed == 0
+    assert other.participation_rate is None
+    assert member.slots_eligible == len(_sync_epoch_slots(w))
+    assert member.slots_signed == member.slots_eligible
+    assert member.participation_rate == 1.0
+    for _label, _method, _path, body in _sync_scan_calls(transport):
+        assert json.loads(body) == ["1"]
+        assert "2" not in json.loads(body)
+
+
+def test_dropping_clients_and_lodestar_produce_the_same_m8(vp, load):
+    _w, lodestar, degs_l, _t1, _b1 = _sync_scan_transport(
+        vp, load, scan_resp=_lodestar_scan(vp, load)
+    )
+    _w, dropping, degs_d, _t2, _b2 = _sync_scan_transport(
+        vp, load, scan_resp=_dropping_scan(vp, load)
+    )
+    assert degs_l == [] and degs_d == []
+    for idx in (1, 2):
+        a, b = lodestar[idx], dropping[idx]
+        assert a.in_committee == b.in_committee
+        assert a.slots_eligible == b.slots_eligible
+        assert a.slots_signed == b.slots_signed
+        assert a.participation_rate == b.participation_rate
+        assert a.reward_gwei == b.reward_gwei
+    assert lodestar[1].participation_rate == dropping[1].participation_rate
+    assert lodestar[2].in_committee is False
+    assert dropping[2].in_committee is False
+
+
+def test_skipped_slot_404_excluded_from_the_denominator_not_a_miss(vp, load):
+    body = load("sync_committee__skipped_slot_404")
+    assert body["code"] == 404
+    w = _att_window(vp, 100, 100)
+    skipped = raw_response(vp, "sync_committee__skipped_slot_404", status=404)
+    signed = _dropping_scan(vp, load)
+    first_slot = w.from_epoch * 32
+    w, outcomes, degs, transport, _budget = _sync_scan_transport(
+        vp,
+        load,
+        scan_resp=signed,
+        scan_by_slot={first_slot: skipped},
+        index_set=(1,),
+    )
+    n_slots = len(_sync_epoch_slots(w))
+    member = outcomes[1]
+    assert degs == []
+    assert member.in_committee is True
+    assert member.slots_eligible == n_slots - 1
+    assert member.slots_signed == n_slots - 1
+    assert member.slots_eligible != n_slots
+    assert member.participation_rate == 1.0
+    assert _sync_exit(vp, load, degs) == vp.EXIT_OK == 0
+    assert any(
+        c[2].endswith(f"/sync_committee/{first_slot}")
+        for c in _sync_scan_calls(transport)
+    )
+
+
+def test_negative_reward_for_a_member_is_a_miss(vp, load):
+    w, outcomes, degs, _transport, _budget = _sync_scan_transport(
+        vp, load, scan_resp=_member_miss_scan(vp), index_set=(1,)
+    )
+    member = outcomes[1]
+    n_slots = len(_sync_epoch_slots(w))
+    assert degs == []
+    assert member.in_committee is True
+    assert member.slots_eligible == n_slots
+    assert member.slots_signed == 0
+    assert member.participation_rate == 0.0
+    assert member.reward_gwei < 0
+
+
+def test_scan_covers_every_slot_in_the_window(vp, load):
+    w, _outcomes, degs, transport, _budget = _sync_scan_transport(
+        vp, load, scan_resp=_lodestar_scan(vp, load), index_set=(1,)
+    )
+    assert degs == []
+    slots = _sync_scan_slots(transport)
+    expected = list(_sync_epoch_slots(w))
+    assert sorted(slots) == expected
+    assert len(slots) == w.epochs * 32
+    assert expected[0] == w.from_epoch * 32
+    assert expected[0] != w.start_slot
+    assert w.start_slot not in slots
+    assert len(_sync_membership_calls(transport)) == 1
+
+
+def test_scan_cost_is_reported_and_flagged_as_the_sm2_carve_out(vp, load):
+    w, _outcomes, degs, transport, budget = _sync_scan_transport(
+        vp, load, scan_resp=_lodestar_scan(vp, load), index_set=(1,)
+    )
+    assert degs == []
+    n = len(_sync_epoch_slots(w))
+    assert n > 0
+    assert budget.extra == n
+    assert budget.extra == len(_sync_scan_calls(transport))
+    assert budget.flagged is True
+    src = inspect.getsource(vp.collect_sync)
+    assert "add_extra" in src
+    assert "SM2" in src
+
+
+def test_sync_reward_feeds_m9(vp, load):
+    ref = _active_ref(vp)
+    att = [_mk_outcome(vp, flag_actual_gwei=10, flag_ideal_gwei=10)]
+    without = _build_report(vp, load, ref, att)
+    sync = vp.SyncOutcome(True, 4, 4, 96)
+    with_sync = _build_report(vp, load, ref, att, sync=sync)
+    assert with_sync.rewards_gwei["sync"] == 96
+    assert with_sync.sync is sync
+    assert with_sync.rewards_gwei["total"] == without.rewards_gwei["total"] + 96
+    assert without.rewards_gwei["sync"] == 0
+    w, outcomes, _degs, _transport, _budget = _sync_scan_transport(
+        vp, load, scan_resp=_dropping_scan(vp, load), index_set=(1,)
+    )
+    scanned = outcomes[1]
+    assert scanned.reward_gwei == 48 * scanned.slots_signed
+    fed = _build_report(vp, load, ref, att, sync=scanned)
+    assert fed.rewards_gwei["sync"] == scanned.reward_gwei
+    assert fed.rewards_gwei["total"] == without.rewards_gwei["total"] + scanned.reward_gwei
+
+
+def test_no_scan_without_membership(vp, load):
+    w = _att_window(vp, 100, 100)
+    ctx = _chain_ctx(vp, load, head_epoch=110)
+    empty = raw_response(vp, "state_sync_committees__empty")
+    outcomes, degs, transport, budget = _collect_sync(
+        vp, w, ctx, {1, 2}, _SyncMembershipTransport(empty)
+    )
+    assert degs == []
+    assert _sync_scan_calls(transport) == []
+    assert budget.extra == 0
+    assert budget.flagged is False
+    assert all(not o.in_committee for o in outcomes.values())
+    src = inspect.getsource(vp.collect_sync)
+    assert "rewards_sync_committee" in src
+
+
+def test_members_are_scored_per_period_not_the_window_union(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    n = spec.epochs_per_sync_committee_period
+    spe = spec.slots_per_epoch
+    w = _att_window(vp, 240, 271)
+    assert w.epochs == 32
+    assert 240 // n != 271 // n
+    ctx = _chain_ctx(vp, load, head_epoch=280)
+    period0 = raw_response(vp, "state_sync_committees__intersect")
+    period1 = raw_response(vp, "state_sync_committees__empty")
+    signed = _dropping_scan(vp, load)
+    off_period = _member_miss_scan(vp)
+    period1_first = n * spe
+
+    def scan(slot):
+        return signed if slot < period1_first else off_period
+
+    transport = _SyncMembershipTransport(
+        period1,
+        scan_resp=scan,
+        membership_by_epoch={240: period0, 256: period1},
+    )
+    outcomes, degs, transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, transport
+    )
+    member = outcomes[1]
+    period0_slots = (n - w.from_epoch) * spe
+    assert degs == []
+    assert member.in_committee is True
+    assert member.slots_eligible == period0_slots
+    assert member.slots_signed == period0_slots
+    assert member.participation_rate == 1.0
+    assert member.participation_rate != 0.5
+    assert member.slots_eligible != w.epochs * spe
+    slots = sorted(_sync_scan_slots(transport))
+    assert slots[0] == w.from_epoch * spe
+    assert slots[0] != w.start_slot
+    assert slots[-1] == (w.to_epoch + 1) * spe - 1
+    assert slots[-1] != w.end_slot - 1
+
+
+def test_all_404_with_membership_is_skipped_only_not_a_miss(vp, load):
+    w = _att_window(vp, 100, 100)
+    ctx = _chain_ctx(vp, load, head_epoch=110)
+    membership = raw_response(vp, "state_sync_committees__intersect")
+    skipped = raw_response(vp, "sync_committee__skipped_slot_404", status=404)
+    outcomes, degs, transport, budget = _collect_sync(
+        vp,
+        w,
+        ctx,
+        {1},
+        _SyncMembershipTransport(membership, scan_resp=skipped),
+    )
+    member = outcomes[1]
+    assert degs == []
+    assert member.in_committee is True
+    assert member.slots_eligible == 0
+    assert member.slots_signed == 0
+    assert member.reward_gwei == 0
+    assert member.participation_rate is None
+    assert _sync_exit(vp, load, degs) == vp.EXIT_OK == 0
+    assert len(_sync_scan_calls(transport)) == w.epochs * 32
+    assert budget.flagged is True
 

@@ -1633,6 +1633,35 @@ def _empty_sync(indices: set[int]) -> dict[int, SyncOutcome]:
     return {idx: blank for idx in indices}
 
 
+def _classify_sync_row(reward: int | None) -> str:
+    if reward is None:
+        return "skipped"
+    if reward > 0:
+        return "signed"
+    return "missed"
+
+
+def _sync_reward_row(row: object) -> tuple[int, int] | None:
+    if not isinstance(row, dict):
+        return None
+    try:
+        idx = parse_uint(row.get("validator_index"), "validator_index")
+        reward = parse_int(row.get("reward"), "reward")
+    except UsageError:
+        return None
+    return idx, reward
+
+
+def _sync_period_of_slot(slot: int, spec: Spec) -> int:
+    return (slot // spec.slots_per_epoch) // spec.epochs_per_sync_committee_period
+
+
+def _sync_scan_slots(w: Window, spec: Spec) -> range:
+    # M8 is [from_epoch, to_epoch]; start_slot/end_slot are RD-4 snapshots.
+    spe = spec.slots_per_epoch
+    return range(w.from_epoch * spe, (w.to_epoch + 1) * spe)
+
+
 def collect_sync(
     client: BeaconClient,
     w: Window,
@@ -1646,7 +1675,7 @@ def collect_sync(
         return {}, []
     spec = ctx.spec
     degs: list[Degradation] = []
-    members: set[int] = set()
+    members_by_period: dict[int, set[int]] = {}
 
     def worker(period: int) -> set[int]:
         epoch = _sync_query_epoch(w, spec, period)
@@ -1661,7 +1690,7 @@ def collect_sync(
     for fut in as_completed(futs):
         period = futs[fut]
         try:
-            members.update(fut.result())
+            members_by_period[period] = fut.result()
         except (BeaconStatus, BeaconTransport) as exc:
             epoch = _sync_query_epoch(w, spec, period)
             if isinstance(exc, BeaconStatus) and exc.status == 400:
@@ -1683,8 +1712,73 @@ def collect_sync(
             )
     if degs:
         return _empty_sync(indices), degs
+    members = set().union(*members_by_period.values()) if members_by_period else set()
+    if not members:
+        return {
+            idx: SyncOutcome(False, 0, 0, 0) for idx in indices
+        }, []
+
+    slots = _sync_scan_slots(w, spec)
+    n_slots = len(slots)
+    if n_slots > 0:
+        # SM2 carve-out: per-slot scan is the documented exception to the 120 bound.
+        budget.add_extra(n_slots)
+        log = getattr(client, "_log", None)
+        if log is not None:
+            log.warn(
+                "sync committee scan issued %s extra requests (SM2 carve-out)",
+                n_slots,
+            )
+
+    def scan_slot(slot: int):
+        period = _sync_period_of_slot(slot, spec)
+        slot_members = members_by_period.get(period) or set()
+        ids = [str(i) for i in sorted(slot_members or members)]
+        try:
+            return client.rewards_sync_committee(slot, ids)
+        except BeaconStatus as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    eligible = {idx: 0 for idx in members}
+    signed = {idx: 0 for idx in members}
+    reward = {idx: 0 for idx in members}
+    scan_futs = {pool.submit(scan_slot, slot): slot for slot in slots}
+    for fut in as_completed(scan_futs):
+        slot = scan_futs[fut]
+        rows = fut.result()
+        # Eligible set is this slot's period, not the window union.
+        slot_members = members_by_period.get(_sync_period_of_slot(slot, spec)) or set()
+        if not slot_members or rows is None or not isinstance(rows, list):
+            continue
+        by_idx: dict[int, int] = {}
+        for row in rows:
+            parsed = _sync_reward_row(row)
+            if parsed is None:
+                continue
+            idx, rew = parsed
+            if idx in slot_members:
+                by_idx[idx] = rew
+        for idx in slot_members:
+            if idx not in by_idx:
+                eligible[idx] += 1
+                continue
+            kind = _classify_sync_row(by_idx[idx])
+            if kind == "skipped":
+                continue
+            eligible[idx] += 1
+            if kind == "signed":
+                signed[idx] += 1
+            reward[idx] += by_idx[idx]
     return {
-        idx: SyncOutcome(idx in members, 0, 0, 0) for idx in indices
+        idx: SyncOutcome(
+            idx in members,
+            eligible.get(idx, 0),
+            signed.get(idx, 0),
+            reward.get(idx, 0),
+        )
+        for idx in indices
     }, []
 
 
@@ -1846,7 +1940,7 @@ class ValidatorReport:
     effectiveness_method: str
     leak_epochs_excluded: int
     proposals: dict
-    sync: object | None
+    sync: SyncOutcome | None
     balance: BalanceSnapshot
     rewards_gwei: dict
     reward_source: str | None
@@ -1892,11 +1986,16 @@ def build_validator_report(
     sync_gwei: int = 0,
     proposal_outcomes: Sequence[ProposalOutcome] | None = None,
     duties_available: bool = True,
+    sync: SyncOutcome | None = None,
 ) -> ValidatorReport:
     degs = list(degradations or ())
     props = list(proposal_outcomes or ())
     if proposer_gwei is None:
         proposer_gwei = _proposer_reward_gwei(props)
+    if sync is not None and sync.in_committee:
+        sync_gwei = sync.reward_gwei
+    else:
+        sync = None
     # Unknown to the BN is state_unavailable (exit 3), not R9's known zero-active.
     if ref.index is None or ref.status == "unknown":
         degs.append(
@@ -1962,7 +2061,7 @@ def build_validator_report(
         effectiveness_method="reward_ratio",
         leak_epochs_excluded=sum(1 for o in outcomes if o.leak),
         proposals=_proposal_counts(props, duties_available),
-        sync=None,
+        sync=sync,
         balance=snap,
         rewards_gwei={
             "source": source,
@@ -2195,6 +2294,18 @@ def _json_default(obj: object) -> object:
     raise TypeError(f"{type(obj).__name__} is not JSON serializable")
 
 
+def _sync_json(sync: object) -> dict | None:
+    if not isinstance(sync, SyncOutcome) or not sync.in_committee:
+        return None
+    return {
+        "in_committee": True,
+        "participation_rate": sync.participation_rate,
+        "slots_eligible": sync.slots_eligible,
+        "slots_signed": sync.slots_signed,
+        "reward_gwei": sync.reward_gwei,
+    }
+
+
 def _degradation_json(d: Degradation) -> dict[str, str]:
     return {
         "metric": d.metric,
@@ -2234,7 +2345,7 @@ def _validator_json(report: ValidatorReport, window: Window) -> dict:
         "effectiveness_method": report.effectiveness_method,
         "leak_epochs_excluded": report.leak_epochs_excluded,
         "proposals": report.proposals,
-        "sync": report.sync,
+        "sync": _sync_json(report.sync),
         "balance": {
             "start_gwei": snap.start_gwei,
             "end_gwei": snap.end_gwei,
@@ -2361,6 +2472,10 @@ def main(
             client, window, index_set, pool, budget, ctx.rewards_api
         )
         snaps, bal_degs = collect_balances(client, window, refs)
+        index_set = {ref.index for ref in refs if ref.index is not None}
+        sync_map, sync_degs = collect_sync(
+            client, window, ctx, index_set, pool, budget
+        )
         empty_snap = BalanceSnapshot(None, None, None, None)
         reports: list[ValidatorReport] = []
         report_degs: list[Degradation] = []
@@ -2376,6 +2491,9 @@ def main(
             prop_series = (
                 proposals.get(ref.index, []) if ref.index is not None else []
             )
+            sync_out = (
+                sync_map.get(ref.index) if ref.index is not None else None
+            )
             report = build_validator_report(
                 ref,
                 series,
@@ -2384,6 +2502,8 @@ def main(
                 window,
                 proposal_outcomes=prop_series,
                 duties_available=duties_available,
+                sync_gwei=0 if sync_out is None else sync_out.reward_gwei,
+                sync=sync_out,
             )
             reports.append(report)
             report_degs.extend(report.degradations)
@@ -2392,7 +2512,7 @@ def main(
             window,
             reports,
             build_aggregate(reports, ctx.spec),
-            att_degs + prop_degs + bal_degs + report_degs,
+            att_degs + prop_degs + bal_degs + sync_degs + report_degs,
             client.endpoints_used,
             EXIT_OK,
         )
