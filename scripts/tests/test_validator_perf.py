@@ -2639,3 +2639,309 @@ def test_main_body_has_no_metric_logic():
     positions = [body.index(name) for name in order]
     assert positions == sorted(positions)
 
+
+# ----- VP-2d: §13 balance snapshots (D5, P0-8, A8) -----
+
+_ETH_GWEI = 1_000_000_000
+_EB_32 = 32_000_000_000
+_EB_2048 = 2_048_000_000_000
+_CONSENSUS_REWARD_GWEI = 1_834_000
+
+
+def _validators_at(slot: int) -> str:
+    return f"/eth/v1/beacon/states/{slot}/validators"
+
+
+def _p08_window(vp, load, **kw):
+    ctx = _chain_ctx(
+        vp, load, head_epoch=133, finalized_epoch=131, **kw
+    )
+    return vp.resolve_window(
+        _window_opts(vp, from_epoch=100, to_epoch=131), ctx
+    )
+
+
+def _snap_ref(vp, index, pubkey, eb, status="active_ongoing", act=0, ex=None):
+    return vp.ValidatorRef(
+        pubkey, index, status, eb, act, _FAR_FUTURE_EPOCH if ex is None else ex, False
+    )
+
+
+def _p08_refs(vp):
+    return [
+        _snap_ref(vp, 1, PK1, _EB_32),
+        _snap_ref(vp, 2, PK2, _EB_2048, "active_exiting", 10, 200),
+        _snap_ref(vp, 3, PK3, _EB_32, "pending_queued", 500),
+    ]
+
+
+def _collect_snaps(vp, w, refs, routes):
+    transport = FakeTransport(routes)
+    client, _ = _client(vp, transport)
+    snaps, degs = vp.collect_balances(client, w, refs)
+    return snaps, degs, transport
+
+
+def _slot_routes(vp, w, start_name, end_name=None):
+    routes = {
+        ("POST", _validators_at(w.start_slot)): [
+            raw_response(vp, start_name)
+        ]
+    }
+    if end_name is not None:
+        routes[("POST", _validators_at(w.end_slot))] = [
+            raw_response(vp, end_name)
+        ]
+    return routes
+
+
+def test_balance_requests_go_to_snapshot_slots_3232_and_4256(vp, load):
+    # VP-1k already owns test_snapshot_slots_are_3232_and_4256 for Window math.
+    w = _p08_window(vp, load)
+    assert (w.start_slot, w.end_slot) == (3232, 4256)
+    unknown = vp.ValidatorRef(PK4, None, "unknown", None, None, None, False)
+    refs = _p08_refs(vp) + [unknown]
+    snaps, _degs, transport = _collect_snaps(
+        vp,
+        w,
+        refs,
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "states_validators__snapshot_end"
+        ),
+    )
+    paths = [c[2] for c in transport.calls]
+    assert _validators_at(3232) in paths
+    assert _validators_at(4256) in paths
+    for _label, method, path, body in transport.calls:
+        assert method == "POST"
+        payload = json.loads(body)
+        assert payload == {"ids": ["1", "2", "3"]}
+        assert PK4 not in payload["ids"]
+        assert "None" not in payload["ids"]
+    assert 1 in snaps and 2 in snaps and 3 in snaps
+
+
+def test_snapshots_use_states_validators_not_validator_balances(vp, load):
+    # D5: ValidatorBalanceResponse has no effective_balance.
+    w = _p08_window(vp, load)
+    _snaps, _degs, transport = _collect_snaps(
+        vp,
+        w,
+        _p08_refs(vp),
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "states_validators__snapshot_end"
+        ),
+    )
+    assert transport.calls
+    for _label, _method, path, _body in transport.calls:
+        assert path.endswith("/validators")
+        assert "/validator_balances" not in path
+        assert not path.endswith("/validator_balances")
+
+
+def test_exactly_two_snapshot_requests(vp, load):
+    w = _p08_window(vp, load)
+    many = [
+        _snap_ref(vp, i, f"0x{i:096x}", _EB_32) for i in range(1, 51)
+    ]
+    _snaps, _degs, transport = _collect_snaps(
+        vp,
+        w,
+        many,
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "states_validators__snapshot_end"
+        ),
+    )
+    assert len(transport.calls) == 2
+    assert {c[2] for c in transport.calls} == {
+        _validators_at(w.start_slot),
+        _validators_at(w.end_slot),
+    }
+
+
+def test_effective_balance_changed_flag(vp):
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    changed_snap = vp.BalanceSnapshot(
+        start_gwei=_EB_32,
+        end_gwei=31_000_000_000,
+        eb_start_gwei=_EB_32,
+        eb_end_gwei=31_000_000_000,
+    )
+    eb, changed = vp.effective_balance_for(changed_snap, ref)
+    assert changed is True
+    assert eb == 31_000_000_000
+    same = vp.BalanceSnapshot(_EB_32, _EB_32 + 1_834_000, _EB_32, _EB_32)
+    eb_same, changed_same = vp.effective_balance_for(same, ref)
+    assert changed_same is False
+    assert eb_same == _EB_32
+    missing_start = vp.BalanceSnapshot(None, _EB_32 + 1_834_000, None, _EB_32)
+    eb_ms, changed_ms = vp.effective_balance_for(missing_start, ref)
+    assert eb_ms == _EB_32
+    assert changed_ms is False
+
+
+def test_diverged_delta_annotates_and_exits_0(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    snaps, degs, _transport = _collect_snaps(
+        vp,
+        w,
+        [ref],
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "balances__diverged"
+        ),
+    )
+    snap = snaps[1]
+    consensus_reward = _CONSENSUS_REWARD_GWEI
+    original = consensus_reward
+    assert snap.delta_gwei == original - _ETH_GWEI
+    got = vp.reconcile_balance(snap.delta_gwei, consensus_reward)
+    assert got.reconciliation == "diverged"
+    assert got.consensus_reward_gwei == original
+    assert consensus_reward == original
+    assert got.exit_code == vp.EXIT_OK == 0
+    assert all(d.reason != "diverged" for d in degs)
+
+
+def test_within_tolerance_is_consistent(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    snaps, _degs, _transport = _collect_snaps(
+        vp,
+        w,
+        [ref],
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "states_validators__snapshot_end"
+        ),
+    )
+    delta = snaps[1].delta_gwei
+    assert delta == 1_834_000
+    inside = vp.reconcile_balance(delta, delta + vp.BALANCE_TOLERANCE_GWEI)
+    assert inside.reconciliation == "consistent"
+    assert vp.BALANCE_TOLERANCE_GWEI == 50_000_000
+    exact = vp.reconcile_balance(delta, delta)
+    assert exact.reconciliation == "consistent"
+
+
+def _pruned_slot(vp, slot: int) -> dict:
+    path = _validators_at(slot)
+    return {
+        ("POST", path): [_raw(vp, 404)],
+        ("GET", path): [_raw(vp, 404)],
+    }
+
+
+def test_snapshot_failure_falls_back_to_head_eb_with_state_unavailable(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 2, PK2, _EB_2048, "active_exiting", 10, 200)
+    routes = {**_pruned_slot(vp, w.start_slot), **_pruned_slot(vp, w.end_slot)}
+    snaps, degs, _transport = _collect_snaps(vp, w, [ref], routes)
+    snap = snaps[2]
+    assert snap.start_gwei is None
+    assert snap.end_gwei is None
+    assert snap.eb_start_gwei is None
+    assert snap.eb_end_gwei is None
+    assert snap.delta_gwei is None
+    eb, changed = vp.effective_balance_for(snap, ref)
+    assert eb == ref.effective_balance_gwei == _EB_2048
+    assert changed is False
+    assert any(d.reason == "state_unavailable" for d in degs)
+    assert all(d.metric == "balance" for d in degs)
+
+
+def test_end_slot_unreachable_reports_unavailable_not_a_wrong_slot(vp, load):
+    ctx = _chain_ctx(
+        vp, load, head_epoch=133, finalized_epoch=131, head_slot=4000
+    )
+    opts = _window_opts(
+        vp, from_epoch=100, to_epoch=131, force_unsafe_window=True
+    )
+    w = vp.resolve_window(opts, ctx)
+    assert w.start_slot == 3232
+    assert w.end_slot == 4256
+    assert w.end_slot_reachable is False
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    snaps, _degs, transport = _collect_snaps(
+        vp,
+        w,
+        [ref],
+        _slot_routes(vp, w, "states_validators__snapshot_start"),
+    )
+    paths = [c[2] for c in transport.calls]
+    assert _validators_at(3232) in paths
+    assert _validators_at(4256) not in paths
+    assert all("4256" not in p for p in paths)
+    assert all("/4000/" not in p for p in paths)
+    snap = snaps[1]
+    got = vp.reconcile_balance(snap.delta_gwei, _CONSENSUS_REWARD_GWEI)
+    assert got.reconciliation == "unavailable"
+    assert got.consensus_reward_gwei == _CONSENSUS_REWARD_GWEI
+
+
+def test_2048_eth_effective_balance_is_carried(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 2, PK2, _EB_2048, "active_exiting", 10, 200)
+    snaps, _degs, _transport = _collect_snaps(
+        vp,
+        w,
+        [ref],
+        _slot_routes(
+            vp, w, "states_validators__snapshot_start", "states_validators__snapshot_end"
+        ),
+    )
+    snap = snaps[2]
+    assert snap.eb_start_gwei == _EB_2048
+    assert snap.eb_end_gwei == _EB_2048
+    eb, changed = vp.effective_balance_for(snap, ref)
+    assert eb == _EB_2048
+    assert eb != _EB_32
+    assert changed is False
+    assert snap.start_gwei == _EB_2048
+    assert snap.end_gwei == 2_048_001_834_000
+
+
+def test_start_slot_pruned_uses_end_eb_without_changed_flag(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    routes = {
+        **_pruned_slot(vp, w.start_slot),
+        ("POST", _validators_at(w.end_slot)): [
+            raw_response(vp, "states_validators__snapshot_end")
+        ],
+    }
+    snaps, degs, transport = _collect_snaps(vp, w, [ref], routes)
+    snap = snaps[1]
+    assert snap.eb_start_gwei is None
+    assert snap.start_gwei is None
+    assert snap.eb_end_gwei == _EB_32
+    assert snap.end_gwei == 32_001_834_000
+    eb, changed = vp.effective_balance_for(snap, ref)
+    assert eb == _EB_32
+    assert changed is False
+    assert any(d.reason == "state_unavailable" for d in degs)
+    paths = [c[2] for c in transport.calls]
+    assert _validators_at(w.end_slot) in paths
+    assert snap.delta_gwei is None
+
+
+def test_empty_parsed_snapshot_is_state_unavailable(vp, load):
+    w = _p08_window(vp, load)
+    ref = _snap_ref(vp, 1, PK1, _EB_32)
+    empty = _raw(vp, 200, b'{"data": []}')
+    routes = {
+        ("POST", _validators_at(w.start_slot)): [empty],
+        ("POST", _validators_at(w.end_slot)): [
+            _raw(vp, 200, b'{"data": []}')
+        ],
+    }
+    snaps, degs, _transport = _collect_snaps(vp, w, [ref], routes)
+    snap = snaps[1]
+    assert snap.start_gwei is None
+    assert snap.end_gwei is None
+    assert snap.eb_start_gwei is None
+    assert snap.eb_end_gwei is None
+    assert any(d.reason == "state_unavailable" for d in degs)
+    eb, changed = vp.effective_balance_for(snap, ref)
+    assert eb == ref.effective_balance_gwei == _EB_32
+    assert changed is False
+

@@ -1148,6 +1148,137 @@ def build_ideal_index(
 
 # ===== § 13. Balances and effective balance =====
 
+
+@dataclass(frozen=True)
+class Degradation:
+    metric: str
+    scope: str
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class BalanceSnapshot:
+    start_gwei: int | None
+    end_gwei: int | None
+    eb_start_gwei: int | None
+    eb_end_gwei: int | None
+
+    @property
+    def delta_gwei(self) -> int | None:
+        if self.start_gwei is None or self.end_gwei is None:
+            return None
+        return self.end_gwei - self.start_gwei
+
+
+@dataclass(frozen=True)
+class BalanceReconciliation:
+    reconciliation: str
+    consensus_reward_gwei: int | None
+    exit_code: int
+
+
+def _row_balance(row: object) -> tuple[int, int, int] | None:
+    if not isinstance(row, dict):
+        return None
+    validator = row.get("validator")
+    if not isinstance(validator, dict):
+        return None
+    try:
+        return (
+            parse_uint(row.get("index"), "index"),
+            parse_uint(row.get("balance"), "balance"),
+            parse_uint(validator.get("effective_balance"), "effective_balance"),
+        )
+    except UsageError:
+        return None
+
+
+def _snapshot(
+    client: BeaconClient, slot: int, ids: list[str]
+) -> dict[int, tuple[int, int]] | None:
+    # D5: this route carries balance and validator.effective_balance.
+    try:
+        rows = client.states_validators(str(slot), ids)
+    except (BeaconStatus, BeaconTransport):
+        return None
+    out: dict[int, tuple[int, int]] = {}
+    for row in rows:
+        parsed = _row_balance(row)
+        if parsed is not None:
+            index, balance, eb = parsed
+            out[index] = (balance, eb)
+    if not out:
+        return None
+    return out
+
+
+def collect_balances(
+    client: BeaconClient, w: Window, refs: Sequence[ValidatorRef]
+) -> tuple[dict[int, BalanceSnapshot], list[Degradation]]:
+    ids = [str(ref.index) for ref in refs if ref.index is not None]
+    degradations: list[Degradation] = []
+    start: dict[int, tuple[int, int]] = {}
+    end: dict[int, tuple[int, int]] = {}
+    if ids:
+        got = _snapshot(client, w.start_slot, ids)
+        if got is None:
+            degradations.append(
+                Degradation(
+                    "balance", "run", "state_unavailable", f"slot {w.start_slot}"
+                )
+            )
+        else:
+            start = got
+        if w.end_slot_reachable:
+            got = _snapshot(client, w.end_slot, ids)
+            if got is None:
+                degradations.append(
+                    Degradation(
+                        "balance", "run", "state_unavailable", f"slot {w.end_slot}"
+                    )
+                )
+            else:
+                end = got
+        else:
+            degradations.append(
+                Degradation(
+                    "balance", "run", "state_unavailable", "end_slot unreachable"
+                )
+            )
+    snaps: dict[int, BalanceSnapshot] = {}
+    for ref in refs:
+        if ref.index is None:
+            continue
+        s_bal, s_eb = start.get(ref.index, (None, None))
+        e_bal, e_eb = end.get(ref.index, (None, None))
+        snaps[ref.index] = BalanceSnapshot(s_bal, e_bal, s_eb, e_eb)
+    return snaps, degradations
+
+
+def effective_balance_for(
+    snap: BalanceSnapshot, ref: ValidatorRef
+) -> tuple[int | None, bool]:
+    if snap.eb_end_gwei is None:
+        return ref.effective_balance_gwei, False
+    if snap.eb_start_gwei is None:
+        return snap.eb_end_gwei, False
+    return snap.eb_end_gwei, snap.eb_start_gwei != snap.eb_end_gwei
+
+
+def reconcile_balance(
+    delta_gwei: int | None, consensus_reward_gwei: int | None
+) -> BalanceReconciliation:
+    if delta_gwei is None or consensus_reward_gwei is None:
+        status = "unavailable"
+    elif abs(delta_gwei - consensus_reward_gwei) > BALANCE_TOLERANCE_GWEI:
+        status = "diverged"
+    else:
+        status = "consistent"
+    # A8: annotation only; never rewrite the consensus reward or raise.
+    return BalanceReconciliation(status, consensus_reward_gwei, EXIT_OK)
+
+
 # ===== § 14. Aggregation, APR, thresholds =====
 
 # ===== § 15. Reporting =====
