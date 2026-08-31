@@ -759,6 +759,134 @@ class BeaconClient:
 
 # ===== § 7. Chain context and bootstrap =====
 
+
+def _spec_uint(raw: dict, key: str) -> int:
+    if key not in raw:
+        raise UsageError(f"missing spec key {key}")
+    value = parse_uint(raw[key], key)
+    if key in ("SLOTS_PER_EPOCH", "SECONDS_PER_SLOT") and value < 1:
+        raise UsageError(f"invalid {key}: {raw[key]!r}")
+    return value
+
+
+def _nested_uint(obj: object, keys: tuple[str, ...], field: str) -> int:
+    cur: object = obj
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            raise UsageError(f"missing {field}")
+        cur = cur[key]
+    return parse_uint(cur, field)
+
+
+def _require_data(payload: object, what: str) -> dict:
+    # header() maps 404→None; 204 is None from _call. Phase 1 abort is exit 5.
+    if payload is None:
+        raise NoBeaconAvailable(f"{what} unavailable")
+    if not isinstance(payload, dict):
+        raise UsageError(f"invalid {what}")
+    return payload
+
+
+def _is_syncing(status: object) -> bool:
+    if not isinstance(status, dict):
+        return True
+    flag = status.get("is_syncing")
+    if flag is False or (isinstance(flag, str) and flag.lower() == "false"):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class Spec:
+    slots_per_epoch: int
+    seconds_per_slot: int
+    epochs_per_sync_committee_period: int
+    min_epochs_to_inactivity_penalty: int
+    raw: dict[str, str]
+
+    @property
+    def epochs_per_year(self) -> float:
+        return SECONDS_PER_JULIAN_YEAR / (
+            self.seconds_per_slot * self.slots_per_epoch
+        )
+
+
+@dataclass(frozen=True)
+class ChainContext:
+    spec: Spec
+    genesis_time: int
+    network_name: str | None
+    head_slot: int
+    head_epoch: int
+    finalized_epoch: int
+    node_version: str
+    rewards_api: str  # "" until VP-1m probe_rewards_api
+
+
+def select_endpoint(client: BeaconClient) -> None:
+    client._selected_version = ""
+    for i in range(len(client._endpoints)):
+        with client._lock:
+            client._current = i
+        try:
+            version = client.node_version()
+        except (BeaconStatus, BeaconTransport):
+            continue
+        if not isinstance(version, str) or not version:
+            continue
+        try:
+            status = client.syncing()
+        except (BeaconStatus, BeaconTransport):
+            continue
+        if _is_syncing(status):
+            continue
+        client._selected_version = version
+        return
+    raise NoBeaconAvailable("no beacon node available")
+
+
+def load_chain_context(client: BeaconClient) -> ChainContext:
+    raw = _require_data(client.spec(), "spec")
+    spec = Spec(
+        slots_per_epoch=_spec_uint(raw, "SLOTS_PER_EPOCH"),
+        seconds_per_slot=_spec_uint(raw, "SECONDS_PER_SLOT"),
+        epochs_per_sync_committee_period=_spec_uint(
+            raw, "EPOCHS_PER_SYNC_COMMITTEE_PERIOD"
+        ),
+        min_epochs_to_inactivity_penalty=_spec_uint(
+            raw, "MIN_EPOCHS_TO_INACTIVITY_PENALTY"
+        ),
+        raw=raw,
+    )
+    genesis = _require_data(client.genesis(), "genesis")
+    genesis_time = _nested_uint(genesis, ("genesis_time",), "genesis_time")
+    header = _require_data(client.header("head"), "head header")
+    head_slot = _nested_uint(header, ("header", "message", "slot"), "slot")
+    checkpoints = _require_data(
+        client.finality_checkpoints("head"), "finality checkpoints"
+    )
+    finalized_epoch = _nested_uint(
+        checkpoints, ("finalized", "epoch"), "finalized.epoch"
+    )
+    config_name = raw.get("CONFIG_NAME")
+    network_name = (
+        config_name if isinstance(config_name, str) and config_name else None
+    )
+    version = getattr(client, "_selected_version", "")
+    if not isinstance(version, str):
+        version = ""
+    return ChainContext(
+        spec=spec,
+        genesis_time=genesis_time,
+        network_name=network_name,
+        head_slot=head_slot,
+        head_epoch=head_slot // spec.slots_per_epoch,
+        finalized_epoch=finalized_epoch,
+        node_version=version,
+        rewards_api="",
+    )
+
+
 # ===== § 8. Window resolution =====
 
 # ===== § 9. Validator resolution =====

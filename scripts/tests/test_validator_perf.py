@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from pytest_socket import SocketBlockedError
 
-from conftest import FakeTransport, SCRIPT, load_script, route_map
+from conftest import FakeTransport, SCRIPT, load_script, raw_response, route_map
 
 
 def test_exit_codes_are_the_six_documented_values(vp):
@@ -867,12 +867,23 @@ def _raw(vp, status, body=b"{}", truncated=False, headers=None):
     return vp.RawResponse(status, body, truncated, headers or {})
 
 
-def _client(vp, transport, *, request_delay=0.0, verbosity=1, ep=None, stream=None):
+def _client(
+    vp,
+    transport,
+    *,
+    request_delay=0.0,
+    verbosity=1,
+    ep=None,
+    stream=None,
+    endpoints=None,
+):
     buf = stream if stream is not None else io.StringIO()
-    if ep is None:
-        ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    if endpoints is None:
+        if ep is None:
+            ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+        endpoints = [ep]
     log = vp.Log(verbosity, buf)
-    return vp.BeaconClient([ep], transport, request_delay=request_delay, log=log), buf
+    return vp.BeaconClient(endpoints, transport, request_delay=request_delay, log=log), buf
 
 
 def _no_sleep(monkeypatch, vp):
@@ -1414,3 +1425,293 @@ def test_get_fallback_query_not_passed_through_str_format(vp):
     client.states_validators("head", ids)
     assert [c[1] for c in transport.calls] == ["POST", "GET"]
     assert _query_ids(transport.calls[1][2]) == ids
+
+
+# ----- VP-1j: §7 Spec, ChainContext, select_endpoint -----
+
+_GENESIS_PATH = "/eth/v1/beacon/genesis"
+_HEADER_HEAD_PATH = "/eth/v1/beacon/headers/head"
+_FINALITY_PATH = "/eth/v1/beacon/states/head/finality_checkpoints"
+_SYNCING_PATH = "/eth/v1/node/syncing"
+
+
+def _chain_transport(vp, *, spec="spec__mainnet", spec_body=None):
+    spec_resp = (
+        _raw(vp, 200, spec_body)
+        if spec_body is not None
+        else raw_response(vp, spec)
+    )
+    return FakeTransport(
+        route_map(
+            **{
+                f"GET {_SPEC_TEMPLATE}": [spec_resp],
+                f"GET {_GENESIS_PATH}": [raw_response(vp, "genesis__mainnet")],
+                f"GET {_HEADER_HEAD_PATH}": [raw_response(vp, "headers__head")],
+                f"GET {_FINALITY_PATH}": [
+                    raw_response(vp, "finality_checkpoints__head")
+                ],
+            }
+        )
+    )
+
+
+def _load_ctx(vp, *, spec="spec__mainnet", spec_body=None):
+    transport = _chain_transport(vp, spec=spec, spec_body=spec_body)
+    client, _ = _client(vp, transport)
+    ctx = vp.load_chain_context(client)
+    return ctx, transport, client
+
+
+def test_epochs_per_year_is_82181_25_on_mainnet_timing(vp):
+    ctx, _, _ = _load_ctx(vp, spec="spec__mainnet")
+    assert ctx.spec.seconds_per_slot == 12
+    assert ctx.spec.slots_per_epoch == 32
+    assert ctx.spec.epochs_per_year == 82181.25
+
+
+def test_epochs_per_year_halves_at_six_second_slots(vp):
+    ctx, _, _ = _load_ctx(vp, spec="spec__spe8")
+    assert ctx.spec.seconds_per_slot == 6
+    assert ctx.spec.slots_per_epoch == 8
+    assert ctx.spec.epochs_per_year == 31_557_600 / 48
+
+
+def test_load_chain_context_issues_exactly_four_calls(vp):
+    ctx, transport, _ = _load_ctx(vp)
+    assert [(c[1], c[2]) for c in transport.calls] == [
+        ("GET", _SPEC_TEMPLATE),
+        ("GET", _GENESIS_PATH),
+        ("GET", _HEADER_HEAD_PATH),
+        ("GET", _FINALITY_PATH),
+    ]
+    assert ctx.genesis_time == 1606824023
+    assert ctx.network_name == "mainnet"
+    assert ctx.finalized_epoch == 99
+    assert ctx.rewards_api == ""
+
+
+def test_head_epoch_derived_from_header_slot_not_clock(vp):
+    ctx, transport, _ = _load_ctx(vp, spec="spec__mainnet")
+    assert ctx.head_slot == 3232
+    assert ctx.head_epoch == 101
+    assert ctx.spec.slots_per_epoch == 32
+    src = inspect.getsource(vp.load_chain_context)
+    assert "time.time" not in src
+    assert "datetime" not in src
+    clock_epoch = int(vp.time.time() - ctx.genesis_time) // (
+        ctx.spec.seconds_per_slot * ctx.spec.slots_per_epoch
+    )
+    assert clock_epoch != 101
+    assert [c[2] for c in transport.calls] == [
+        _SPEC_TEMPLATE,
+        _GENESIS_PATH,
+        _HEADER_HEAD_PATH,
+        _FINALITY_PATH,
+    ]
+
+
+def test_select_endpoint_skips_a_syncing_node(vp):
+    endpoints = [
+        vp.Endpoint("bn0", "http", "syncing.example", 5052, "", None),
+        vp.Endpoint("bn1", "http", "ready.example", 5052, "", None),
+    ]
+    transport = FakeTransport(
+        route_map(
+            **{
+                f"GET {_VERSION_TEMPLATE}": [
+                    raw_response(vp, "node_version__lighthouse"),
+                    raw_response(vp, "node_version__lighthouse"),
+                ],
+                f"GET {_SYNCING_PATH}": [
+                    raw_response(vp, "node_syncing__is_syncing"),
+                    raw_response(vp, "node_syncing__ready"),
+                ],
+            }
+        )
+    )
+    client, _ = _client(vp, transport, endpoints=endpoints)
+    vp.select_endpoint(client)
+    assert [c[0] for c in transport.calls] == ["bn0", "bn0", "bn1", "bn1"]
+    assert [(c[1], c[2]) for c in transport.calls] == [
+        ("GET", _VERSION_TEMPLATE),
+        ("GET", _SYNCING_PATH),
+        ("GET", _VERSION_TEMPLATE),
+        ("GET", _SYNCING_PATH),
+    ]
+    assert client._current == 1
+    assert client._endpoint().label == "bn1"
+
+
+def test_all_endpoints_failing_raises_no_beacon_available(vp):
+    endpoints = [
+        vp.Endpoint("bn0", "http", "dead0.example", 5052, "", None),
+        vp.Endpoint("bn1", "http", "dead1.example", 5052, "", None),
+    ]
+    transport = FakeTransport(
+        route_map(
+            **{
+                f"GET {_VERSION_TEMPLATE}": [_raw(vp, 404), _raw(vp, 404)],
+            }
+        )
+    )
+    client, _ = _client(vp, transport, endpoints=endpoints)
+    with pytest.raises(vp.NoBeaconAvailable):
+        vp.select_endpoint(client)
+    assert [c[0] for c in transport.calls] == ["bn0", "bn1"]
+
+
+def test_missing_spec_key_names_the_key(vp, load):
+    payload = load("spec__mainnet")
+    key = "EPOCHS_PER_SYNC_COMMITTEE_PERIOD"
+    del payload["data"][key]
+    transport = _chain_transport(vp, spec_body=json.dumps(payload).encode())
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.load_chain_context(client)
+    assert key in str(ei.value)
+    assert not isinstance(ei.value, vp.NoBeaconAvailable)
+
+
+def test_network_name_is_none_without_config_name(vp, load):
+    payload = load("spec__mainnet")
+    payload["data"].pop("CONFIG_NAME")
+    ctx, _, _ = _load_ctx(vp, spec_body=json.dumps(payload).encode())
+    assert ctx.network_name is None
+
+
+def test_head_header_404_and_204_are_not_usage_error_missing_slot(vp):
+    for status in (404, 204):
+        transport = _chain_transport(vp)
+        transport.routes[("GET", _HEADER_HEAD_PATH)] = [_raw(vp, status, b"")]
+        client, _ = _client(vp, transport)
+        with pytest.raises(vp.NoBeaconAvailable) as ei:
+            vp.load_chain_context(client)
+        assert ei.type is vp.NoBeaconAvailable
+        assert not isinstance(ei.value, vp.UsageError)
+        assert "missing slot" not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [_SPEC_TEMPLATE, _GENESIS_PATH, _FINALITY_PATH],
+)
+def test_phase1_204_is_no_beacon_available(vp, path):
+    transport = _chain_transport(vp)
+    transport.routes[("GET", path)] = [_raw(vp, 204, b"")]
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.NoBeaconAvailable) as ei:
+        vp.load_chain_context(client)
+    assert "missing slot" not in str(ei.value)
+
+
+def test_select_then_load_records_lighthouse_version(vp):
+    transport = _chain_transport(vp)
+    transport.routes[("GET", _VERSION_TEMPLATE)] = [
+        raw_response(vp, "node_version__lighthouse")
+    ]
+    transport.routes[("GET", _SYNCING_PATH)] = [
+        raw_response(vp, "node_syncing__ready")
+    ]
+    client, _ = _client(vp, transport)
+    vp.select_endpoint(client)
+    ctx = vp.load_chain_context(client)
+    assert ctx.node_version == "Lighthouse/v5.3.0-aa11a3b"
+    assert [(c[1], c[2]) for c in transport.calls] == [
+        ("GET", _VERSION_TEMPLATE),
+        ("GET", _SYNCING_PATH),
+        ("GET", _SPEC_TEMPLATE),
+        ("GET", _GENESIS_PATH),
+        ("GET", _HEADER_HEAD_PATH),
+        ("GET", _FINALITY_PATH),
+    ]
+
+
+def test_select_endpoint_ready_node_is_exactly_two_calls(vp):
+    transport = FakeTransport(
+        route_map(
+            **{
+                f"GET {_VERSION_TEMPLATE}": [
+                    raw_response(vp, "node_version__lighthouse")
+                ],
+                f"GET {_SYNCING_PATH}": [raw_response(vp, "node_syncing__ready")],
+            }
+        )
+    )
+    client, _ = _client(vp, transport)
+    vp.select_endpoint(client)
+    assert [(c[1], c[2]) for c in transport.calls] == [
+        ("GET", _VERSION_TEMPLATE),
+        ("GET", _SYNCING_PATH),
+    ]
+    assert client._current == 0
+    assert client._selected_version == "Lighthouse/v5.3.0-aa11a3b"
+
+
+def test_all_syncing_endpoints_raise_no_beacon_available(vp):
+    endpoints = [
+        vp.Endpoint("bn0", "http", "sync0.example", 5052, "", None),
+        vp.Endpoint("bn1", "http", "sync1.example", 5052, "", None),
+    ]
+    transport = FakeTransport(
+        route_map(
+            **{
+                f"GET {_VERSION_TEMPLATE}": [
+                    raw_response(vp, "node_version__lighthouse"),
+                    raw_response(vp, "node_version__lighthouse"),
+                ],
+                f"GET {_SYNCING_PATH}": [
+                    raw_response(vp, "node_syncing__is_syncing"),
+                    raw_response(vp, "node_syncing__is_syncing"),
+                ],
+            }
+        )
+    )
+    client, _ = _client(vp, transport, endpoints=endpoints)
+    with pytest.raises(vp.NoBeaconAvailable):
+        vp.select_endpoint(client)
+    assert [c[0] for c in transport.calls] == ["bn0", "bn0", "bn1", "bn1"]
+    assert client._selected_version == ""
+
+
+def test_select_endpoint_skips_nonempty_version_required(vp):
+    transport = FakeTransport(
+        route_map(
+            **{
+                f"GET {_VERSION_TEMPLATE}": [_raw(vp, 204, b"")],
+                f"GET {_SYNCING_PATH}": [raw_response(vp, "node_syncing__ready")],
+            }
+        )
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.NoBeaconAvailable):
+        vp.select_endpoint(client)
+    assert [c[2] for c in transport.calls] == [_VERSION_TEMPLATE]
+    assert client._selected_version == ""
+
+
+def test_spec_is_frozen(vp):
+    ctx, _, _ = _load_ctx(vp)
+    with pytest.raises(FrozenInstanceError):
+        ctx.spec.slots_per_epoch = 8
+    with pytest.raises(FrozenInstanceError):
+        ctx.spec.epochs_per_year = 1.0
+
+
+def test_spec_underscored_uint_names_the_key(vp, load):
+    payload = load("spec__mainnet")
+    payload["data"]["SLOTS_PER_EPOCH"] = "1_000"
+    transport = _chain_transport(vp, spec_body=json.dumps(payload).encode())
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.load_chain_context(client)
+    assert "SLOTS_PER_EPOCH" in str(ei.value)
+
+
+def test_non_positive_slots_per_epoch_names_the_key(vp, load):
+    payload = load("spec__mainnet")
+    payload["data"]["SLOTS_PER_EPOCH"] = "0"
+    transport = _chain_transport(vp, spec_body=json.dumps(payload).encode())
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.load_chain_context(client)
+    assert "SLOTS_PER_EPOCH" in str(ei.value)
