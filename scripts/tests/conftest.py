@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -49,31 +50,58 @@ def route_map(**scenarios):
     return routes
 
 
+def concurrent_failures(n: int, item, *, timeout: float = 5.0):
+    """N callers wait at a barrier, then each yields `item`.
+
+    Harness capability (VP-4a / VP-4d): first N in-flight calls all fail
+    together so workers observe the dying endpoint simultaneously.
+    `item` is a RawResponse, an exception instance, or a callable.
+    """
+    barrier = threading.Barrier(n, timeout=timeout)
+
+    def once():
+        barrier.wait()
+        if isinstance(item, BaseException):
+            raise item
+        if callable(item):
+            return item()
+        return item
+
+    return [once for _ in range(n)]
+
+
 class FakeTransport:
-    def __init__(self, routes: dict[tuple[str, str], list]):
+    def __init__(self, routes: dict[tuple, list]):
         self.routes = {key: list(queue) for key, queue in routes.items()}
         self.calls: list[tuple[str, str, str, object]] = []
         self.drops: list = []
         self.closed = False
+        self._lock = threading.Lock()
 
     def __call__(self, ep, method, path, body):
-        self.calls.append((ep.label, method, path, body))
-        try:
-            queue = self.routes[(method, path)]
-        except KeyError:
-            queue = None
-            # Exact (method, path) wins. Bare-path fallback is only GET
-            # .../validators?id= chunks (RD-1); other queried routes stay exact.
-            if method == "GET" and "?" in path:
-                bare = path.split("?", 1)[0]
-                if bare.endswith("/validators"):
-                    queue = self.routes.get((method, bare))
+        # Pop under the lock; invoke callables after release so a barrier
+        # in concurrent_failures cannot deadlock against this lock.
+        with self._lock:
+            self.calls.append((ep.label, method, path, body))
+            queue = self.routes.get((ep.label, method, path))
             if queue is None:
-                raise KeyError(f"unscripted FakeTransport call: {method} {path}") from None
-        if not queue:
-            raise IndexError(f"no scripted responses left for {method} {path}")
-        item = queue.pop(0)
-        # Callables inject exceptions (or late RawResponse) without extra FakeTransport fields.
+                queue = self.routes.get((method, path))
+            if queue is None:
+                # Exact (method, path) wins. Bare-path fallback is only GET
+                # .../validators?id= chunks (RD-1); other queried routes stay exact.
+                if method == "GET" and "?" in path:
+                    bare = path.split("?", 1)[0]
+                    if bare.endswith("/validators"):
+                        queue = self.routes.get((ep.label, method, bare))
+                        if queue is None:
+                            queue = self.routes.get((method, bare))
+            if queue is None:
+                raise KeyError(
+                    f"unscripted FakeTransport call: {method} {path}"
+                ) from None
+            if not queue:
+                raise IndexError(f"no scripted responses left for {method} {path}")
+            item = queue.pop(0)
         if callable(item):
             return item()
         return item

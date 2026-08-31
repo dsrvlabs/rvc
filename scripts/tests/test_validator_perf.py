@@ -27,7 +27,14 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from pytest_socket import SocketBlockedError
 
-from conftest import FakeTransport, SCRIPT, load_script, raw_response, route_map
+from conftest import (
+    FakeTransport,
+    SCRIPT,
+    concurrent_failures,
+    load_script,
+    raw_response,
+    route_map,
+)
 
 
 def test_exit_codes_are_the_six_documented_values(vp):
@@ -1649,6 +1656,8 @@ def test_select_endpoint_ready_node_is_exactly_two_calls(vp):
     ]
     assert client._current == 0
     assert client._selected_version == "Lighthouse/v5.3.0-aa11a3b"
+    assert client._pinned is True
+    assert client._generation == 0
 
 
 def test_all_syncing_endpoints_raise_no_beacon_available(vp):
@@ -4998,7 +5007,7 @@ _G5_KIND_PREFIXES = (
     ("finality_checkpoints__", "bootstrap"),
 )
 _G5_SKIP = {
-    "failover__midrun_promotion": "declared VP-4a; not exercised",
+    "failover__midrun_promotion": "scenario descriptor; exercised by VP-4a tests",
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
 }
@@ -5668,8 +5677,9 @@ def test_every_reason_in_the_closed_enum_is_produced_by_a_fixture(
         for name in names:
             assert (FIXTURES / f"{name}.json").is_file(), name
             if reason == "endpoint_failover":
-                continue
-            produced = _doc_reasons(_g5_doc(vp, capsys, monkeypatch, name))
+                produced = {d.reason for d in _midrun_failover_degs(vp, monkeypatch)}
+            else:
+                produced = _doc_reasons(_g5_doc(vp, capsys, monkeypatch, name))
             if reason not in produced:
                 missing.append((reason, name, produced))
     snap = _failing_snapshot_doc(vp, capsys, monkeypatch)
@@ -5706,6 +5716,9 @@ def test_scope_values_are_run_validator_or_epoch(vp, capsys, monkeypatch):
     prefixes = set()
     for reason, names in _REASON_PRODUCERS.items():
         if reason == "endpoint_failover":
+            for d in _midrun_failover_degs(vp, monkeypatch):
+                assert _SCOPE_RE.fullmatch(d.scope), d
+                prefixes.add(d.scope.split(":", 1)[0])
             continue
         for name in names:
             doc = _g5_doc(vp, capsys, monkeypatch, name)
@@ -7743,5 +7756,311 @@ def test_p0_acceptance_matrix():
         "M1/M5-rewards-less",
     ]
     _assert_named_tests(present, _MC_NULL_RULES)
+
+
+# ----- VP-4a: §6/§4.5 mid-run promotion — lock-under-comparison (D11) -----
+
+
+def _midrun_spec(load):
+    spec = load("failover__midrun_promotion")
+    assert spec["concurrent_failures"] == 4
+    assert spec["expected_advances"] == 1
+    assert spec["reason"] == "endpoint_failover"
+    return spec
+
+
+def _midrun_endpoints(vp, spec, *, secret=False):
+    urls = list(spec["endpoints"])
+    if secret:
+        urls = [
+            "https://user:secret@" + u.split("://", 1)[1].rstrip("/") + "/hidden/"
+            for u in urls
+        ]
+    return [vp.parse_endpoint(url, f"bn{i}") for i, url in enumerate(urls)]
+
+
+def _midrun_client(vp, transport, spec, *, secret=False):
+    client = _client(
+        vp, transport, endpoints=_midrun_endpoints(vp, spec, secret=secret)
+    )[0]
+    client._pinned = True
+    return client
+
+
+def test_four_concurrent_failures_advance_exactly_once(vp, load, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    n = spec["concurrent_failures"]
+    path = _REWARDS_TEMPLATE.format(epoch=100)
+    head_epoch = 200
+    probe_att = _REWARDS_TEMPLATE.format(epoch=head_epoch - 2)
+    fail = _raw(vp, 503)
+    ok = _data_raw(vp, {})
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", path): concurrent_failures(n, fail) + [fail] * (n * 3),
+            ("bn1", "POST", path): [ok] * n,
+            ("bn1", "GET", _BLOCKS_HEAD_PATH): [_raw(vp, 200, b'{"data": {}}')],
+            ("bn1", "POST", probe_att): [ok],
+            ("bn2", "POST", path): [ok] * n,
+            ("bn3", "POST", path): [ok] * n,
+        }
+    )
+    client = _midrun_client(vp, transport, spec)
+    client._probe_head_epoch = head_epoch
+    client._probe_ids = ["1"]
+    client._rewards_api = "available"
+
+    def work():
+        return client.rewards_attestations(100, ["1"])
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futs = [pool.submit(work) for _ in range(n)]
+        for fut in futs:
+            fut.result()
+    assert client._current == spec["expected_advances"]
+    assert client._endpoint().label == "bn1"
+    assert client._endpoint().label != "bn3"
+    assert client._current != 3
+    probe_on_bn1 = [
+        c
+        for c in transport.calls
+        if c[0] == "bn1" and (c[2] == _BLOCKS_HEAD_PATH or c[2] == probe_att)
+    ]
+    assert len(probe_on_bn1) == 2
+    orig_on_bn1 = [c for c in transport.calls if c[0] == "bn1" and c[2] == path]
+    assert len(orig_on_bn1) == n
+
+
+def test_workers_on_a_stale_endpoint_retry_on_current_without_advancing(
+    vp, load, monkeypatch
+):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    transport = FakeTransport({})
+    client = _midrun_client(vp, transport, spec)
+    endpoints = client._endpoints
+    with client._lock:
+        client._current = 1
+    stale = endpoints[0]
+    current = client._promote_from(stale)
+    assert current is endpoints[1]
+    assert client._current == 1
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        got = [
+            fut.result()
+            for fut in [pool.submit(client._promote_from, stale) for _ in range(4)]
+        ]
+    assert client._current == 1
+    assert all(ep is endpoints[1] for ep in got)
+
+
+def test_promotion_retries_original_when_reprobe_fails(vp, load, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    fail_path = _REWARDS_TEMPLATE.format(epoch=50)
+    fail = _raw(vp, 503)
+    ok = _data_raw(vp, {})
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", fail_path): [fail] * 3,
+            ("bn1", "GET", _BLOCKS_HEAD_PATH): [_boom(ssl.SSLError("bad cert"))],
+            ("bn1", "POST", fail_path): [ok],
+        }
+    )
+    client = _midrun_client(vp, transport, spec)
+    client._probe_head_epoch = 100
+    client._probe_ids = ["1"]
+    client._rewards_api = "available"
+    assert client.rewards_attestations(50, ["1"]) == {}
+    assert client._current == 1
+    assert any(c[0] == "bn1" and c[2] == fail_path for c in transport.calls)
+
+
+def test_promotion_reruns_the_capability_probe(vp, load, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    fail_path = _REWARDS_TEMPLATE.format(epoch=50)
+    head_epoch = 100
+    probe_att = _REWARDS_TEMPLATE.format(epoch=head_epoch - 2)
+    fail = _raw(vp, 503)
+    ok = _data_raw(vp, {})
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", fail_path): [fail] * 3,
+            ("bn1", "POST", fail_path): [ok],
+            ("bn1", "GET", _BLOCKS_HEAD_PATH): [_raw(vp, 200, b'{"data": {}}')],
+            ("bn1", "POST", probe_att): [ok],
+        }
+    )
+    client = _midrun_client(vp, transport, spec)
+    client._probe_head_epoch = head_epoch
+    client._probe_ids = ["1"]
+    client._rewards_api = "available"
+    client.rewards_attestations(50, ["1"])
+    probe_on_bn1 = [
+        c
+        for c in transport.calls
+        if c[0] == "bn1"
+        and (c[2] == _BLOCKS_HEAD_PATH or c[2] == probe_att)
+    ]
+    assert len(probe_on_bn1) == 2
+    assert [c[1] for c in probe_on_bn1] == ["GET", "POST"]
+
+
+def _midrun_failover_degs(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = json.loads(
+        (FIXTURES / "failover__midrun_promotion.json").read_text()
+    )
+    w = _att_window(vp, 100, 101)
+    refs = [_active_ref(vp)]
+    ok = _att_ok(vp, indices=(1,))
+    fail = _raw(vp, 503)
+    path100 = _REWARDS_TEMPLATE.format(epoch=100)
+    path101 = _REWARDS_TEMPLATE.format(epoch=101)
+    probe_att = _REWARDS_TEMPLATE.format(epoch=198)
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", path100): [ok],
+            ("bn0", "POST", path101): [fail] * 3,
+            ("bn1", "GET", _BLOCKS_HEAD_PATH): [_raw(vp, 404)],
+            ("bn1", "POST", probe_att): [_raw(vp, 404)],
+            ("bn1", "POST", path101): [_raw(vp, 404)],
+        }
+    )
+    client = _midrun_client(vp, transport, spec)
+    client._probe_head_epoch = 200
+    client._probe_ids = ["1"]
+    client._rewards_api = "available"
+    budget = vp.RequestBudget()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        _outcomes, degs = vp.collect_attestations(client, w, refs, pool, budget)
+    return degs
+
+
+def test_epochs_after_promotion_degrade_with_endpoint_failover(vp, load, monkeypatch):
+    spec = _midrun_spec(load)
+    degs = _midrun_failover_degs(vp, monkeypatch)
+    hits = [
+        d
+        for d in degs
+        if d.reason == spec["reason"] and d.scope.startswith("epoch:")
+    ]
+    assert hits
+    assert all(d.scope == "epoch:101" for d in hits)
+    opts = vp.build_options(_minimal_opts_argv())
+    run = vp.RunReport(
+        vp.ChainContext(
+            vp.Spec(32, 12, 256, 4, {}),
+            0,
+            None,
+            0,
+            0,
+            0,
+            "",
+            "available",
+        ),
+        _att_window(vp, 100, 101),
+        [],
+        {},
+        degs,
+        [],
+        0,
+    )
+    assert vp.decide_exit_code(run, opts) == vp.EXIT_DEGRADED == 3
+
+
+def test_no_refetch_of_already_served_epochs(vp, load, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    w = _att_window(vp, 100, 101)
+    refs = [_active_ref(vp)]
+    ok = _att_ok(vp, indices=(1,))
+    fail = _raw(vp, 503)
+    path100 = _REWARDS_TEMPLATE.format(epoch=100)
+    path101 = _REWARDS_TEMPLATE.format(epoch=101)
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", path100): [ok],
+            ("bn0", "POST", path101): [fail] * 3,
+            ("bn1", "POST", path101): [ok],
+        }
+    )
+    client = _midrun_client(vp, transport, spec)
+    budget = vp.RequestBudget()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        outcomes, _degs = vp.collect_attestations(client, w, refs, pool, budget)
+    posts_100 = [c for c in transport.calls if c[2] == path100]
+    assert len(posts_100) == 1
+    assert posts_100[0][0] == "bn0"
+    posts_101 = [c for c in transport.calls if c[2] == path101]
+    assert any(c[0] == "bn1" for c in posts_101)
+    assert {o.epoch for o in outcomes[1]} == {100, 101}
+
+
+def test_all_endpoints_exhausted_exits_5(vp, monkeypatch, capsys):
+    _no_sleep(monkeypatch, vp)
+    routes = _full_run_routes(vp)
+    fail = _raw(vp, 503)
+    collect = _REWARDS_TEMPLATE.format(epoch=_FULL_FROM)
+    routes[("POST", collect)] = [fail] * 20
+    pair = json.loads((FIXTURES / "probe__state_unavailable.json").read_text())
+    routes[("GET", _BLOCKS_HEAD_PATH)] = list(routes[("GET", _BLOCKS_HEAD_PATH)]) + [
+        _raw_from_probe_leg(vp, pair["blocks"])
+    ]
+    routes[("POST", _DRY_RUN_ATT_PATH)] = list(routes[("POST", _DRY_RUN_ATT_PATH)]) + [
+        _raw_from_probe_leg(vp, pair["attestations"])
+    ]
+    transport = FakeTransport(routes)
+    argv = _full_argv(
+        "--json",
+        "--beacon-url",
+        "http://bn1.example:5052",
+    )
+    code = vp.main(argv, transport=transport)
+    assert code == vp.EXIT_NO_BEACON == 5
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert captured.err.strip() != ""
+
+
+def test_endpoints_used_records_both_in_order_redacted(vp, load, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    spec = _midrun_spec(load)
+    path = _REWARDS_TEMPLATE.format(epoch=100)
+    fail = _raw(vp, 503)
+    ok = _data_raw(vp, {})
+    transport = FakeTransport(
+        {
+            ("bn0", "POST", path): [fail] * 3,
+            ("bn1", "POST", path): [ok],
+        }
+    )
+    client = _midrun_client(vp, transport, spec, secret=True)
+    client.rewards_attestations(100, ["1"])
+    used = client.endpoints_used
+    assert used == ["https://bn0:5052", "https://bn1:5052"]
+    blob = " ".join(used)
+    assert "secret" not in blob
+    assert "user:secret" not in blob
+    assert "hidden" not in blob
+    assert "/hidden" not in blob
+
+
+def test_one_promotion_attempt_per_endpoint(vp, load):
+    spec = _midrun_spec(load)
+    client = _midrun_client(vp, FakeTransport({}), spec)
+    endpoints = client._endpoints
+    first = client._promote_from(endpoints[0])
+    assert first is endpoints[1]
+    assert client._current == 1
+    again = client._promote_from(endpoints[0])
+    assert again is endpoints[1]
+    assert client._current == 1
+    nxt = client._promote_from(endpoints[1])
+    assert nxt is endpoints[2]
+    assert client._current == 2
 
 

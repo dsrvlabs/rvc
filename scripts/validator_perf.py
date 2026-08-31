@@ -535,6 +535,12 @@ def _classify(
     return "semantic"
 
 
+def _promotable(exc: BaseException) -> bool:
+    if isinstance(exc, BeaconTransport):
+        return True
+    return isinstance(exc, BeaconStatus) and exc.status == 503
+
+
 class BeaconClient:
     def __init__(
         self,
@@ -551,10 +557,48 @@ class BeaconClient:
         self._lock = threading.Lock()
         self._current = 0
         self._used: list[str] = []
+        self._generation = 0
+        self._pinned = False
+        self._tls = threading.local()
+        self._probe_head_epoch: int | None = None
+        self._probe_ids: list[str] = []
+        self._rewards_api: str | None = None
 
     def _endpoint(self) -> Endpoint:
         with self._lock:
             return self._endpoints[self._current]
+
+    def _promote_from(self, ep: Endpoint) -> Endpoint:
+        """Advance by one iff `ep` is still current.
+
+        Concurrent failures on the same endpoint collapse to a single
+        advance. If `ep` is stale, return the current endpoint and do
+        not skip ahead. One promotion attempt per endpoint.
+        """
+        with self._lock:
+            cur = self._endpoints[self._current]
+            if cur is not ep:
+                return cur
+            nxt = self._current + 1
+            if nxt >= len(self._endpoints):
+                raise NoBeaconAvailable("no beacon node available")
+            self._current = nxt
+            self._generation += 1
+            new = self._endpoints[nxt]
+            shown = redact(new)
+            if shown not in self._used:
+                self._used.append(shown)
+        try:
+            self._reprobe()
+        except (BeaconStatus, BeaconTransport, NoBeaconAvailable):
+            pass
+        return new
+
+    def _reprobe(self) -> None:
+        head = self._probe_head_epoch
+        if head is None:
+            return
+        probe_rewards_api(self, head, self._probe_ids)
 
     def _call(
         self,
@@ -565,6 +609,7 @@ class BeaconClient:
         *,
         retry_500: bool = False,
         extra: str = "",
+        allow_promote: bool = True,
     ) -> object:
         path = template.format(**fmt) + extra
         ep = self._endpoint()
@@ -575,48 +620,68 @@ class BeaconClient:
         label = ep.label
         last_exc: BaseException | None = None
         raw: RawResponse | None = None
-        for attempt in range(_MAX_ATTEMPTS):
-            self._log.info("%s %s via %s", method, template, redact(ep))
-            _await_slot(self._request_delay)
-            try:
-                raw = self._transport(ep, method, path, body)
-            except (
-                ssl.SSLError,
-                socket.gaierror,
-                TimeoutError,
-                ConnectionError,
-                http.client.HTTPException,
-            ) as exc:
-                last_exc = exc
-                action = _classify(None, exc, retry_500)
-                if action == "retry" and attempt + 1 < _MAX_ATTEMPTS:
-                    self._transport.drop(ep)
-                    time.sleep(_retry_after_delay({}, attempt))
-                    continue
-                raise BeaconTransport(template, label) from exc
-            if raw.truncated:
-                # Truncation leaves the keep-alive connection in an unknown state.
-                self._transport.drop(ep)
-                raise BeaconStatus(raw.status, template, label)
-            if raw.status == 204:
-                return None
-            if 200 <= raw.status < 300:
+        try:
+            for attempt in range(_MAX_ATTEMPTS):
+                self._log.info("%s %s via %s", method, template, redact(ep))
+                _await_slot(self._request_delay)
                 try:
-                    return json.loads(raw.body)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                    raise BeaconStatus(raw.status, template, label) from exc
-            action = _classify(raw.status, None, retry_500)
-            retry_limit = 2 if raw.status == 500 else _MAX_ATTEMPTS
-            if action == "retry" and attempt + 1 < retry_limit:
-                self._transport.drop(ep)
-                time.sleep(_retry_after_delay(raw.headers, attempt))
-                continue
+                    raw = self._transport(ep, method, path, body)
+                except (
+                    ssl.SSLError,
+                    socket.gaierror,
+                    TimeoutError,
+                    ConnectionError,
+                    http.client.HTTPException,
+                ) as exc:
+                    last_exc = exc
+                    action = _classify(None, exc, retry_500)
+                    if action == "retry" and attempt + 1 < _MAX_ATTEMPTS:
+                        self._transport.drop(ep)
+                        time.sleep(_retry_after_delay({}, attempt))
+                        continue
+                    raise BeaconTransport(template, label) from exc
+                if raw.truncated:
+                    # Truncation leaves the keep-alive connection in an unknown state.
+                    self._transport.drop(ep)
+                    raise BeaconStatus(raw.status, template, label)
+                if raw.status == 204:
+                    return None
+                if 200 <= raw.status < 300:
+                    try:
+                        return json.loads(raw.body)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        raise BeaconStatus(raw.status, template, label) from exc
+                action = _classify(raw.status, None, retry_500)
+                retry_limit = 2 if raw.status == 500 else _MAX_ATTEMPTS
+                if action == "retry" and attempt + 1 < retry_limit:
+                    self._transport.drop(ep)
+                    time.sleep(_retry_after_delay(raw.headers, attempt))
+                    continue
+                raise BeaconStatus(raw.status, template, label)
+            if last_exc is not None:
+                raise BeaconTransport(template, label) from last_exc
+            if raw is None:
+                raise BeaconTransport(template, label)
             raise BeaconStatus(raw.status, template, label)
-        if last_exc is not None:
-            raise BeaconTransport(template, label) from last_exc
-        if raw is None:
-            raise BeaconTransport(template, label)
-        raise BeaconStatus(raw.status, template, label)
+        except (BeaconStatus, BeaconTransport) as exc:
+            allow = allow_promote and getattr(self._tls, "allow_promote", True)
+            if not allow or not self._pinned or not _promotable(exc):
+                raise
+            try:
+                self._promote_from(ep)
+            except NoBeaconAvailable:
+                if self._generation:
+                    raise
+                raise exc from None
+            return self._call(
+                method,
+                template,
+                fmt,
+                body,
+                retry_500=retry_500,
+                extra=extra,
+                allow_promote=allow_promote,
+            )
 
     def _unwrap_call(
         self,
@@ -846,6 +911,7 @@ def select_endpoint(client: BeaconClient) -> None:
         if _is_syncing(status):
             continue
         client._selected_version = version
+        client._pinned = True
         return
     raise NoBeaconAvailable("no beacon node available")
 
@@ -898,35 +964,41 @@ _PROBE_VERDICT = {
     (False, True): "available",
     (False, False): "route_absent",
 }
-
-
 def probe_rewards_api(
     client: BeaconClient, head_epoch: int, ids: Sequence[str]
 ) -> str:
+    client._probe_head_epoch = head_epoch
+    client._probe_ids = list(ids)
+    prev = getattr(client._tls, "allow_promote", True)
+    client._tls.allow_promote = False
     try:
-        blocks = client.rewards_block("head")
-    except BeaconStatus as exc:
-        blocks_ok, blocks_404 = 200 <= exc.status < 300, exc.status == 404
-    else:
-        # rewards_block maps 404 → None; that None is the 404 column, not 2xx.
-        blocks_ok, blocks_404 = (False, True) if blocks is None else (True, False)
-    id_list = list(ids)
-    if not id_list:
-        # POST [] is the unfiltered rewards form on some clients; classify from GET.
-        att_ok, att_404 = False, True
-    else:
         try:
-            att = client.rewards_attestations(head_epoch - 2, id_list)
+            blocks = client.rewards_block("head")
         except BeaconStatus as exc:
-            att_ok, att_404 = 200 <= exc.status < 300, exc.status == 404
+            blocks_ok, blocks_404 = 200 <= exc.status < 300, exc.status == 404
         else:
-            # Teku 204 unwraps to None; store-not-ready is not a 2xx success.
-            att_ok, att_404 = (False, True) if att is None else (True, False)
-    verdict = _PROBE_VERDICT[(blocks_ok, att_ok)]
-    # 500/400 are not 2xx, so the 4-row table would say route_absent; fold them.
-    if verdict == "route_absent" and not (blocks_404 and att_404):
-        return "state_unavailable"
-    return verdict
+            # rewards_block maps 404 → None; that None is the 404 column, not 2xx.
+            blocks_ok, blocks_404 = (False, True) if blocks is None else (True, False)
+        id_list = list(ids)
+        if not id_list:
+            # POST [] is the unfiltered rewards form on some clients; classify from GET.
+            att_ok, att_404 = False, True
+        else:
+            try:
+                att = client.rewards_attestations(head_epoch - 2, id_list)
+            except BeaconStatus as exc:
+                att_ok, att_404 = 200 <= exc.status < 300, exc.status == 404
+            else:
+                # Teku 204 unwraps to None; store-not-ready is not a 2xx success.
+                att_ok, att_404 = (False, True) if att is None else (True, False)
+        verdict = _PROBE_VERDICT[(blocks_ok, att_ok)]
+        # 500/400 are not 2xx, so the 4-row table would say route_absent; fold them.
+        if verdict == "route_absent" and not (blocks_404 and att_404):
+            verdict = "state_unavailable"
+        client._rewards_api = verdict
+        return verdict
+    finally:
+        client._tls.allow_promote = prev
 
 
 # ===== § 8. Window resolution =====
@@ -1334,8 +1406,10 @@ def collect_attestations(
         )
         return out, degs
     log = getattr(client, "_log", None)
+    start_gen: dict[int, int] = {}
 
     def worker(epoch: int) -> dict[int, EpochOutcome]:
+        start_gen[epoch] = getattr(client, "_generation", 0)
         resp = _fetch_epoch_rewards(client, epoch, ids, budget)
         if not isinstance(resp, dict):
             raise BeaconStatus(
@@ -1356,10 +1430,14 @@ def collect_attestations(
                 if isinstance(exc, BeaconStatus)
                 else "transport"
             )
+            started = start_gen.get(epoch, 0)
+            reason = (
+                "endpoint_failover"
+                if getattr(client, "_generation", 0) > started or started > 0
+                else "state_unavailable"
+            )
             degs.append(
-                Degradation(
-                    "attestation", f"epoch:{epoch}", "state_unavailable", detail
-                )
+                Degradation("attestation", f"epoch:{epoch}", reason, detail)
             )
             continue
         for idx, outcome in reduced.items():
@@ -2548,7 +2626,12 @@ def main(
         )
         att_failed = any(
             d.metric == "attestation"
-            and d.reason in ("rewards_api_unsupported", "state_unavailable")
+            and d.reason
+            in (
+                "rewards_api_unsupported",
+                "state_unavailable",
+                "endpoint_failover",
+            )
             for d in att_degs
         )
         index_set = {ref.index for ref in refs if ref.index is not None}
