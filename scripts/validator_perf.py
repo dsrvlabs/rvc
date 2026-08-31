@@ -10,11 +10,13 @@ import base64
 import http.client
 import json
 import math
+import os
 import random
 import re
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -932,6 +934,7 @@ class ChainContext:
     finalized_epoch: int
     node_version: str
     rewards_api: str  # "" until VP-1m probe_rewards_api
+    genesis_validators_root: str
 
 
 def select_endpoint(client: BeaconClient) -> None:
@@ -972,6 +975,8 @@ def load_chain_context(client: BeaconClient) -> ChainContext:
     )
     genesis = _require_data(client.genesis(), "genesis")
     genesis_time = _nested_uint(genesis, ("genesis_time",), "genesis_time")
+    raw_root = genesis.get("genesis_validators_root")
+    genesis_validators_root = raw_root if isinstance(raw_root, str) else ""
     header = _require_data(client.header("head"), "head header")
     head_slot = _nested_uint(header, ("header", "message", "slot"), "slot")
     checkpoints = _require_data(
@@ -996,6 +1001,7 @@ def load_chain_context(client: BeaconClient) -> ChainContext:
         finalized_epoch=finalized_epoch,
         node_version=version,
         rewards_api="",
+        genesis_validators_root=genesis_validators_root,
     )
 
 
@@ -1227,6 +1233,146 @@ def resolve_validators(
         if ref is not None:
             by_pk[ref.pubkey] = ref
     return [by_pk.get(pk) or _unknown_ref(pk) for pk in keys]
+
+
+_GVR_RE = re.compile(r"0x[0-9a-fA-F]{64}")
+
+
+def _cache_dir() -> str:
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    # Relative XDG_CACHE_HOME would land inside the repo (SM3).
+    if xdg and os.path.isabs(xdg):
+        return os.path.join(xdg, "rvc-validator-perf")
+    return os.path.join(os.path.expanduser("~"), ".cache", "rvc-validator-perf")
+
+
+def _cache_path(root: str) -> str | None:
+    if _GVR_RE.fullmatch(root) is None:
+        return None
+    return os.path.join(_cache_dir(), f"indices-{root}.json")
+
+
+def _cache_miss(log: Log | None, reason: object) -> None:
+    if log is not None:
+        log.info("index cache miss: %s", reason)
+    return None
+
+
+def _entries_from_payload(data: object, root: str) -> dict[str, int] | None:
+    if not isinstance(data, dict):
+        return None
+    if data.get("genesis_validators_root") != root:
+        return None
+    raw = data.get("entries")
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, int] = {}
+    for key, val in raw.items():
+        if not isinstance(key, str) or type(val) is not int or val < 0:
+            continue
+        out[key] = val
+    return out
+
+
+def _cache_read(
+    root: str, pubkeys: Sequence[str], log: Log | None = None
+) -> dict[str, int] | None:
+    path = _cache_path(root)
+    if path is None:
+        return _cache_miss(log, "genesis_validators_root")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return _cache_miss(log, "not found")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _cache_miss(log, exc)
+    entries = _entries_from_payload(data, root)
+    if entries is None:
+        return _cache_miss(log, "genesis_validators_root")
+    out: dict[str, int] = {}
+    for pk in pubkeys:
+        val = entries.get(pk)
+        if type(val) is not int or val < 0:
+            return _cache_miss(log, "incomplete")
+        out[pk] = val
+    return out
+
+
+def _load_cache_entries(root: str) -> dict[str, int]:
+    path = _cache_path(root)
+    if path is None:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return _entries_from_payload(data, root) or {}
+
+
+def _ensure_cache_dir() -> str:
+    directory = _cache_dir()
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def _cache_write(
+    root: str, entries: dict[str, int], log: Log | None = None
+) -> None:
+    dest = _cache_path(root)
+    if dest is None or not entries:
+        return
+    tmp = ""
+    try:
+        _ensure_cache_dir()
+        merged = _load_cache_entries(root)
+        merged.update(entries)
+        payload = {
+            "genesis_validators_root": root,
+            "written_at": datetime.now(timezone.utc).isoformat(),
+            "entries": merged,
+        }
+        # Random tmp name; dest+".tmp" is symlink-plantable.
+        fd, tmp = tempfile.mkstemp(prefix="idx.", suffix=".tmp", dir=_cache_dir())
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, dest)
+    except OSError as exc:
+        if log is not None:
+            log.info("index cache write failed: %s", exc)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _hydrate_cached_refs(
+    client: BeaconClient,
+    state_id: str,
+    pubkeys: Sequence[str],
+    cached: dict[str, int],
+    log: Log | None = None,
+) -> tuple[list[ValidatorRef] | None, list | None]:
+    ids = [str(cached[pk]) for pk in pubkeys if pk in cached]
+    if not ids:
+        return None, None
+    try:
+        rows = client.states_validators(state_id, ids)
+    except (BeaconStatus, BeaconTransport):
+        return None, None
+    lg = log if log is not None else client._log
+    by_pk: dict[str, ValidatorRef] = {}
+    for row in rows:
+        ref = _ref_from_row(row, lg)
+        if ref is not None:
+            by_pk[ref.pubkey] = ref
+    refs = [by_pk.get(pk) or _unknown_ref(pk) for pk in pubkeys]
+    if all(ref.index is None for ref in refs):
+        return None, None
+    return refs, rows
 
 
 # ===== § 10. Attestation metrics — M1–M6 =====
@@ -1947,6 +2093,16 @@ def _row_balance(row: object) -> tuple[int, int, int] | None:
         return None
 
 
+def _snapshot_balances(rows: Sequence[object]) -> dict[int, tuple[int, int]]:
+    out: dict[int, tuple[int, int]] = {}
+    for row in rows:
+        parsed = _row_balance(row)
+        if parsed is not None:
+            index, balance, eb = parsed
+            out[index] = (balance, eb)
+    return out
+
+
 def _snapshot(
     client: BeaconClient, slot: int, ids: list[str]
 ) -> dict[int, tuple[int, int]] | None:
@@ -1955,34 +2111,36 @@ def _snapshot(
         rows = client.states_validators(str(slot), ids)
     except (BeaconStatus, BeaconTransport):
         return None
-    out: dict[int, tuple[int, int]] = {}
-    for row in rows:
-        parsed = _row_balance(row)
-        if parsed is not None:
-            index, balance, eb = parsed
-            out[index] = (balance, eb)
-    if not out:
-        return None
-    return out
+    out = _snapshot_balances(rows)
+    return out or None
 
 
 def collect_balances(
-    client: BeaconClient, w: Window, refs: Sequence[ValidatorRef]
+    client: BeaconClient,
+    w: Window,
+    refs: Sequence[ValidatorRef],
+    *,
+    start: dict[int, tuple[int, int]] | None = None,
 ) -> tuple[dict[int, BalanceSnapshot], list[Degradation]]:
     ids = [str(ref.index) for ref in refs if ref.index is not None]
     degradations: list[Degradation] = []
-    start: dict[int, tuple[int, int]] = {}
     end: dict[int, tuple[int, int]] = {}
-    if ids:
-        got = _snapshot(client, w.start_slot, ids)
-        if got is None:
-            degradations.append(
-                Degradation(
-                    "balance", "run", "state_unavailable", f"slot {w.start_slot}"
+    if start is None:
+        start = {}
+        if ids:
+            got = _snapshot(client, w.start_slot, ids)
+            if got is None:
+                degradations.append(
+                    Degradation(
+                        "balance",
+                        "run",
+                        "state_unavailable",
+                        f"slot {w.start_slot}",
+                    )
                 )
-            )
-        else:
-            start = got
+            else:
+                start = got
+    if ids:
         if w.end_slot_reachable:
             got = _snapshot(client, w.end_slot, ids)
             if got is None:
@@ -2748,7 +2906,44 @@ def main(
         select_endpoint(client)
         ctx = load_chain_context(client)
         window = resolve_window(opts, ctx, log)
-        refs = resolve_validators(client, list(opts.pubkeys))
+        keys = list(opts.pubkeys)
+        cached = (
+            None
+            if opts.no_cache
+            else _cache_read(ctx.genesis_validators_root, keys, log)
+        )
+        hydrate_rows = None
+        if cached is None:
+            refs = resolve_validators(client, keys)
+            if not opts.no_cache:
+                _cache_write(
+                    ctx.genesis_validators_root,
+                    {r.pubkey: r.index for r in refs if r.index is not None},
+                    log,
+                )
+        else:
+            state_id = "head" if opts.dry_run else str(window.start_slot)
+            refs, hydrate_rows = _hydrate_cached_refs(
+                client, state_id, keys, cached, log
+            )
+            if refs is None:
+                refs = resolve_validators(client, keys)
+                hydrate_rows = None
+                if not opts.no_cache:
+                    _cache_write(
+                        ctx.genesis_validators_root,
+                        {
+                            r.pubkey: r.index
+                            for r in refs
+                            if r.index is not None
+                        },
+                        log,
+                    )
+        start_balances = (
+            _snapshot_balances(hydrate_rows) or None
+            if hydrate_rows is not None
+            else None
+        )
         ids = [str(ref.index) for ref in refs if ref.rewards_eligible][:1]
         ctx = replace(
             ctx, rewards_api=probe_rewards_api(client, ctx.head_epoch, ids)
@@ -2774,7 +2969,9 @@ def main(
         proposals, prop_degs, duties_available = collect_proposals(
             client, window, index_set, pool, budget, ctx.rewards_api
         )
-        snaps, bal_degs = collect_balances(client, window, refs)
+        snaps, bal_degs = collect_balances(
+            client, window, refs, start=start_balances
+        )
         index_set = {ref.index for ref in refs if ref.index is not None}
         sync_map, sync_degs = collect_sync(
             client, window, ctx, index_set, pool, budget

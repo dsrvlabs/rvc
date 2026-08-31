@@ -11,6 +11,7 @@ import http.client
 import inspect
 import io
 import json
+import os
 import re
 import socket
 import ssl
@@ -1765,6 +1766,7 @@ def _chain_ctx(
         finalized_epoch=finalized_epoch,
         node_version="",
         rewards_api="",
+        genesis_validators_root="",
     )
 
 
@@ -4378,6 +4380,7 @@ def _table_ctx(vp, load, genesis_time=1606824023):
         finalized_epoch=131,
         node_version="Lighthouse/v8.2.2",
         rewards_api="available",
+        genesis_validators_root="",
     )
 
 
@@ -5006,11 +5009,13 @@ _G5_KIND_PREFIXES = (
     ("node_syncing__", "syncing"),
     ("node_version__", "bootstrap"),
     ("finality_checkpoints__", "bootstrap"),
+    ("cache__", "declared"),
 )
 _G5_SKIP = {
     "failover__midrun_promotion": "scenario descriptor; exercised by VP-4a tests",
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
+    "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
 }
 
 
@@ -5560,7 +5565,7 @@ def _g5_doc(vp, capsys, monkeypatch, stem):
     transport = _lenient_full_transport(vp, routes)
     pubkeys = _g5_pubkeys(stem)
     extra = {} if pubkeys is None else {"pubkeys": pubkeys}
-    _run_full(vp, "--json", transport=transport, **extra)
+    _run_full(vp, "--json", "--no-cache", transport=transport, **extra)
     captured = capsys.readouterr()
     out = captured.out.strip()
     assert out, f"{stem} produced no JSON report"
@@ -7961,6 +7966,7 @@ def test_epochs_after_promotion_degrade_with_endpoint_failover(vp, load, monkeyp
             0,
             "",
             "available",
+            "",
         ),
         _att_window(vp, 100, 101),
         [],
@@ -8363,4 +8369,332 @@ def test_breaching_rows_are_marked_in_table_and_json(vp, load):
     assert "target_rate" in by_json[PK1]["threshold_breaches"]
     assert "target_rate" not in by_json[PK2]["threshold_breaches"]
     validate_schema(doc, _load_perf_schema())
+
+
+# ----- VP-5c: §9 pubkey→index cache keyed by genesis root -----
+
+_MAINNET_GENESIS_ROOT = (
+    "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+)
+_STALE_CACHE_INDEX = 999999
+_CHANGED_GENESIS_ROOT = (
+    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+
+
+def _cache_file(xdg_cache_home, root=_MAINNET_GENESIS_ROOT):
+    return (
+        xdg_cache_home / "rvc-validator-perf" / f"indices-{root}.json"
+    )
+
+
+def _dup_routes(routes, n=2):
+    return {key: list(queue) * n for key, queue in routes.items()}
+
+
+def _cache_argv(*extra, pubkeys=(PK1,)):
+    argv: list[str] = []
+    for pk in pubkeys:
+        argv.extend(["--pubkey", pk])
+    argv.extend(
+        ["--beacon-url", "https://bn.example:5052", "--dry-run", *extra]
+    )
+    return argv
+
+
+def _run_cached(vp, *extra, pubkeys=(PK1,), routes=None, transport=None):
+    if transport is None:
+        transport = FakeTransport(routes or _dry_run_routes(vp))
+    code = vp.main(_cache_argv(*extra, pubkeys=pubkeys), transport=transport)
+    return code, transport
+
+
+def _resolution_posts(calls):
+    seq = calls.calls if hasattr(calls, "calls") else calls
+    return [
+        c
+        for c in seq
+        if c[1] == "POST" and c[2] == _VALIDATORS_PATH
+    ]
+
+
+def test_cache_hit_removes_exactly_one_request(vp, xdg_cache_home, capsys):
+    argv = _full_argv("--json")
+    transport = FakeTransport(_dup_routes(_full_run_routes(vp), 2))
+    code1 = vp.main(argv, transport=transport)
+    n1 = len(transport.calls)
+    doc1, _captured = _stdout_json(capsys)
+    assert _resolution_posts(transport.calls[:n1])
+    code2 = vp.main(argv, transport=transport)
+    doc2, _captured = _stdout_json(capsys)
+    first, second = transport.calls[:n1], transport.calls[n1:]
+    assert code1 == code2
+    assert len(second) == n1 - 1
+    first_keys = [(c[1], c[2]) for c in first]
+    second_keys = [(c[1], c[2]) for c in second]
+    removed = [key for key in first_keys if key not in second_keys]
+    assert removed == [("POST", _VALIDATORS_PATH)]
+    assert ("POST", _VALIDATORS_PATH) not in second_keys
+    assert doc1["validators"] == doc2["validators"]
+    assert doc1["exit_code"] == doc2["exit_code"]
+
+
+def test_dry_run_cache_hit_prints_live_status_and_eb(
+    vp, xdg_cache_home, capsys
+):
+    code, _t1 = _run_cached(vp, pubkeys=(PK1,))
+    assert code == vp.EXIT_OK
+    capsys.readouterr()
+    code, transport = _run_cached(vp, pubkeys=(PK1,))
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    line = next(ln for ln in captured.out.splitlines() if PK1 in ln)
+    assert "status=active_ongoing" in line
+    assert "eb=32000000000" in line
+    assert "status= " not in line
+    assert "eb=None" not in line
+    assert _resolution_posts(transport)
+
+
+def test_changed_genesis_root_invalidates_the_cache(
+    vp, xdg_cache_home, capsys
+):
+    dest = _cache_file(xdg_cache_home)
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(
+        (FIXTURES / "cache__genesis_root_changed.json").read_bytes()
+    )
+    payload = json.loads(dest.read_text(encoding="utf-8"))
+    assert payload["genesis_validators_root"] == _CHANGED_GENESIS_ROOT
+    assert payload["genesis_validators_root"] != _MAINNET_GENESIS_ROOT
+    assert payload["entries"][PK1] == _STALE_CACHE_INDEX
+    code, transport = _run_cached(vp, pubkeys=(PK1,))
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert _resolution_posts(transport)
+    text = captured.out + captured.err
+    assert str(_STALE_CACHE_INDEX) not in text
+    assert f"{PK1} index=1 " in captured.out
+
+
+def test_cache_key_is_compared_not_merely_stored(
+    vp, xdg_cache_home, capsys
+):
+    dest = _cache_file(xdg_cache_home, _MAINNET_GENESIS_ROOT)
+    dest.parent.mkdir(parents=True)
+    dest.write_text(
+        json.dumps(
+            {
+                "genesis_validators_root": _CHANGED_GENESIS_ROOT,
+                "written_at": "2020-12-01T12:00:23+00:00",
+                "entries": {PK1: _STALE_CACHE_INDEX},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert dest.name == f"indices-{_MAINNET_GENESIS_ROOT}.json"
+    # Filename matches the live root; the stored root does not — miss.
+    got = vp._cache_read(_MAINNET_GENESIS_ROOT, [PK1], None)
+    assert got is None
+    code, transport = _run_cached(vp, pubkeys=(PK1,))
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert _resolution_posts(transport)
+    assert str(_STALE_CACHE_INDEX) not in captured.out
+    assert f"{PK1} index=1 " in captured.out
+
+
+def test_partial_hit_falls_back_to_a_full_resolve(
+    vp, xdg_cache_home, capsys
+):
+    code, _t1 = _run_cached(vp, pubkeys=(PK1,))
+    assert code == vp.EXIT_OK
+    capsys.readouterr()
+    cached = json.loads(
+        _cache_file(xdg_cache_home).read_text(encoding="utf-8")
+    )
+    assert PK1 in cached["entries"]
+    assert PK2 not in cached["entries"]
+    code, transport = _run_cached(vp, pubkeys=(PK1, PK2))
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    posts = _resolution_posts(transport)
+    assert len(posts) == 1
+    assert json.loads(posts[0][3]) == {"ids": [PK1, PK2]}
+    assert f"{PK1} index=1 " in captured.out
+    assert f"{PK2} index=2 " in captured.out
+
+
+def test_only_the_index_is_cached(vp, xdg_cache_home, capsys):
+    code, _transport = _run_cached(vp, pubkeys=(PK1, PK2, PK3))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    raw = _cache_file(xdg_cache_home).read_text(encoding="utf-8")
+    data = json.loads(raw)
+    assert data["genesis_validators_root"] == _MAINNET_GENESIS_ROOT
+    assert "written_at" in data
+    assert data["entries"] == {PK1: 1, PK2: 2, PK3: 3}
+    assert "status" not in raw
+    assert "effective_balance" not in raw
+    assert "activation_epoch" not in raw
+    for value in data["entries"].values():
+        assert type(value) is int
+
+
+def test_malformed_cache_is_a_miss_not_an_error(
+    vp, xdg_cache_home, capsys
+):
+    dest = _cache_file(xdg_cache_home)
+    dest.parent.mkdir(parents=True)
+    for body in ("{", "[", "null", '{"entries": []}', "not-json"):
+        dest.write_text(body, encoding="utf-8")
+        code, transport = _run_cached(vp, "-v", pubkeys=(PK1,))
+        captured = capsys.readouterr()
+        assert code == vp.EXIT_OK
+        assert "Traceback" not in captured.out
+        assert "Traceback" not in captured.err
+        assert _resolution_posts(transport)
+
+
+def test_unwritable_cache_dir_does_not_fail_the_run(
+    vp, tmp_path, monkeypatch, capsys
+):
+    blocked = tmp_path / "blocked-cache"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(blocked))
+    try:
+        code, transport = _run_cached(vp, "-v", pubkeys=(PK1,))
+    finally:
+        blocked.chmod(0o700)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert "Traceback" not in captured.out
+    assert _resolution_posts(transport)
+
+
+def test_cache_written_atomically(vp, xdg_cache_home, monkeypatch, capsys):
+    seen: list[tuple[str, str, bool, bool]] = []
+    real_replace = vp.os.replace
+
+    def spy(src, dst):
+        seen.append(
+            (str(src), str(dst), os.path.exists(src), os.path.exists(dst))
+        )
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(vp.os, "replace", spy)
+    code, _transport = _run_cached(vp, pubkeys=(PK1,))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    dest = _cache_file(xdg_cache_home)
+    assert seen
+    src, dst, src_exists, dst_existed = seen[0]
+    assert src_exists is True
+    assert dst == str(dest)
+    assert src != dst
+    assert dst_existed is False
+    assert not src.endswith(os.path.basename(dst) + ".tmp")
+    assert os.path.basename(src).startswith("idx.")
+    assert json.loads(dest.read_text(encoding="utf-8"))["entries"][PK1] == 1
+    mode = dest.parent.stat().st_mode & 0o777
+    assert mode == 0o700
+
+
+def test_no_cache_file_inside_the_repo(vp, tmp_path, monkeypatch, capsys):
+    repo = SCRIPT.resolve().parent.parent
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    before = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+    )
+    code, _transport = _run_cached(vp, pubkeys=(PK1,))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    after = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+    )
+    added = set(after.splitlines()) - set(before.splitlines())
+    assert not any(b"indices-" in line for line in added)
+    stray = [
+        path
+        for path in (repo / "scripts").rglob("indices-*.json")
+        if "xdg-cache" not in path.parts
+    ]
+    assert stray == []
+    fallback = tmp_path / "home" / ".cache" / "rvc-validator-perf"
+    written = list(fallback.glob("indices-*.json"))
+    assert written
+
+
+def test_no_cache_flag_disables_read_and_write(
+    vp, xdg_cache_home, capsys
+):
+    dest = _cache_file(xdg_cache_home)
+    dest.parent.mkdir(parents=True)
+    stale = {
+        "genesis_validators_root": _MAINNET_GENESIS_ROOT,
+        "written_at": "2020-12-01T12:00:23+00:00",
+        "entries": {PK1: _STALE_CACHE_INDEX},
+    }
+    dest.write_text(json.dumps(stale), encoding="utf-8")
+    before = dest.read_text(encoding="utf-8")
+    code, transport = _run_cached(vp, "--no-cache", pubkeys=(PK1,))
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert _resolution_posts(transport)
+    assert dest.read_text(encoding="utf-8") == before
+    assert str(_STALE_CACHE_INDEX) not in captured.out
+    assert f"{PK1} index=1 " in captured.out
+    # Write is disabled on a miss too.
+    dest.unlink()
+    code, _transport = _run_cached(vp, "--no-cache", pubkeys=(PK1,))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert not dest.exists()
+
+
+def test_cache_write_unions_existing_entries(vp, xdg_cache_home, capsys):
+    code, _t1 = _run_cached(vp, pubkeys=(PK1,))
+    assert code == vp.EXIT_OK
+    capsys.readouterr()
+    code, transport = _run_cached(vp, pubkeys=(PK2,))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert _resolution_posts(transport)
+    data = json.loads(_cache_file(xdg_cache_home).read_text(encoding="utf-8"))
+    assert data["entries"][PK1] == 1
+    assert data["entries"][PK2] == 2
+
+
+def test_relative_xdg_cache_home_is_treated_as_unset(
+    vp, tmp_path, monkeypatch, capsys
+):
+    repo = SCRIPT.resolve().parent.parent
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative-cache")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    code, _transport = _run_cached(vp, pubkeys=(PK1,))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert not (repo / "relative-cache").exists()
+    written = list(
+        (tmp_path / "home" / ".cache" / "rvc-validator-perf").glob(
+            "indices-*.json"
+        )
+    )
+    assert written
+
+
+def test_non_hex_genesis_root_is_a_cache_miss(vp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert vp._cache_path("mainnet") is None
+    assert vp._cache_path("../0x" + "aa" * 32) is None
+    assert vp._cache_path("0x" + "aa" * 31) is None
+    assert vp._cache_read("mainnet", [PK1], None) is None
+    assert vp._cache_read("0x" + "aa" * 32 + "/../x", [PK1], None) is None
+    vp._cache_write("not-a-root", {PK1: 1}, None)
+    assert list((tmp_path / "xdg").rglob("*.json")) == []
+
 

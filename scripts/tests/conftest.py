@@ -16,6 +16,14 @@ def _no_network():
     disable_socket()  # no ini file exists, so no addopts; do it here
 
 
+@pytest.fixture(autouse=True)
+def xdg_cache_home(tmp_path, monkeypatch):
+    # Isolate the P2-3 index cache; never touch the real ~/.cache (SM3).
+    cache_home = tmp_path / "xdg-cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    return cache_home
+
+
 def load_script(name: str = "validator_perf"):
     spec = importlib.util.spec_from_file_location(name, SCRIPT)
     if spec is None or spec.loader is None:
