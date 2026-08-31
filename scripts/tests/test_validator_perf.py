@@ -16,6 +16,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -4289,4 +4290,276 @@ def test_by_status_counts_every_input_validator(vp, load):
         "exited_unslashed": 1,
     }
     assert agg["proposals"] == {"scheduled": 0, "included": 0, "missed": 0}
+
+
+# ----- VP-2g: §15 render_table + golden files (P0-9) -----
+
+_PK_DOC = "0x9324" + "ab" * 44 + "a6d3"
+_BOX_DRAWING = "─━│┃┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬═║╭╮╯╰"
+_TABLE_COL_COUNT = 14
+
+
+def _rewards_gwei(total=0):
+    return {
+        "source": 0,
+        "target": 0,
+        "head": 0,
+        "inactivity": 0,
+        "proposer": 0,
+        "sync": 0,
+        "total": total,
+    }
+
+
+def _table_report(vp, ref=None, **kw):
+    if ref is None:
+        ref = _active_ref(vp)
+    fields = dict(
+        ref=ref,
+        active_epochs=32,
+        participation_rate=1.0,
+        source_rate=1.0,
+        target_rate=1.0,
+        head_rate=1.0,
+        missed_attestations=0,
+        attester_effectiveness=1.0,
+        effectiveness_method="reward_ratio",
+        leak_epochs_excluded=0,
+        proposals={"scheduled": None, "included": 0, "missed": None},
+        sync=None,
+        balance=vp.BalanceSnapshot(_EB_32, _EB_32, _EB_32, _EB_32),
+        rewards_gwei=_rewards_gwei(0),
+        reward_source="rewards_api",
+        estimated_apr=0.05,
+        window_epochs=32,
+        degradations=[],
+    )
+    fields.update(kw)
+    return vp.ValidatorReport(**fields)
+
+
+def _table_ctx(vp, load, genesis_time=1606824023):
+    spec = _spec_from_fixture(vp, load)
+    return vp.ChainContext(
+        spec=spec,
+        genesis_time=genesis_time,
+        network_name="mainnet",
+        head_slot=4256,
+        head_epoch=133,
+        finalized_epoch=131,
+        node_version="Lighthouse/v8.2.2",
+        rewards_api="available",
+    )
+
+
+def _table_window(vp):
+    return _att_window(vp, 100, 131)
+
+
+def _table_run(vp, load, reports, *, ctx=None, window=None):
+    if ctx is None:
+        ctx = _table_ctx(vp, load)
+    if window is None:
+        window = _table_window(vp)
+    return vp.RunReport(
+        ctx,
+        window,
+        reports,
+        vp.build_aggregate(reports, ctx.spec),
+        [],
+        ["http://bn0:5052"],
+        0,
+    )
+
+
+def _render_table(vp, run):
+    buf = io.StringIO()
+    vp.render_table(run, buf)
+    return buf.getvalue()
+
+
+def _cut_cols(line: str) -> list[str]:
+    return [part.strip() for part in line.split("  ") if part.strip()]
+
+
+def _table_header_and_rows(text: str) -> tuple[list[str], list[list[str]]]:
+    header = None
+    rows = []
+    for line in text.splitlines():
+        cols = _cut_cols(line)
+        if not cols:
+            continue
+        if header is None:
+            if cols[0] == "pubkey":
+                header = cols
+            continue
+        if cols[0].startswith("0x"):
+            rows.append(cols)
+    assert header is not None
+    return header, rows
+
+
+def _golden_reports(vp):
+    worst = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1),
+        participation_rate=0.5,
+        source_rate=0.5,
+        target_rate=0.5,
+        head_rate=0.5,
+        missed_attestations=16,
+        attester_effectiveness=0.5,
+        estimated_apr=0.02,
+        rewards_gwei=_rewards_gwei(1_000_000),
+        balance=vp.BalanceSnapshot(_EB_32, _EB_32 + 1_834_000, _EB_32, _EB_32),
+    )
+    best = _table_report(
+        vp,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        attester_effectiveness=1.0,
+        estimated_apr=0.0471,
+        rewards_gwei=_rewards_gwei(2_000_000),
+        balance=vp.BalanceSnapshot(_EB_32, _EB_32 + 2_000_000, _EB_32, _EB_32),
+    )
+    empty = _table_report(
+        vp,
+        ref=vp._unknown_ref(_PK_DOC),
+        active_epochs=0,
+        participation_rate=None,
+        source_rate=None,
+        target_rate=None,
+        head_rate=None,
+        missed_attestations=None,
+        attester_effectiveness=None,
+        estimated_apr=None,
+        reward_source=None,
+        rewards_gwei=_rewards_gwei(0),
+        balance=vp.BalanceSnapshot(None, None, None, None),
+    )
+    return [best, empty, worst]
+
+
+def test_null_renders_em_dash_never_zero(vp, load):
+    report = _table_report(
+        vp,
+        ref=_active_ref(vp, index=7, pubkey=PK1),
+        head_rate=None,
+        missed_attestations=0,
+    )
+    text = _render_table(vp, _table_run(vp, load, [report]))
+    header, rows = _table_header_and_rows(text)
+    cell = rows[0][header.index("head%")]
+    assert cell == "—"
+    assert "0" not in cell
+
+
+# table__golden_phase2.txt is superseded on arrival (anti-churn b).
+# Phase 3 asserts table__golden.txt instead (real incl/sched and sync%).
+def test_golden_table_matches_exactly(vp, load):
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    expected = (FIXTURES / "table__golden_phase2.txt").read_text(encoding="utf-8")
+    assert text == expected
+
+
+def test_rows_sorted_by_effectiveness_ascending(vp, load):
+    best = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1),
+        attester_effectiveness=1.0,
+    )
+    worst = _table_report(
+        vp,
+        ref=_active_ref(vp, index=2, pubkey=PK2),
+        attester_effectiveness=0.1,
+    )
+    missing = _table_report(
+        vp,
+        ref=_active_ref(vp, index=3, pubkey=PK3),
+        attester_effectiveness=None,
+    )
+    text = _render_table(vp, _table_run(vp, load, [best, missing, worst]))
+    _, rows = _table_header_and_rows(text)
+    assert [row[0] for row in rows] == [
+        "0x2222…2222",
+        "0x1111…1111",
+        "0x3333…3333",
+    ]
+
+
+def test_pubkey_abbreviated_head_and_tail(vp, load):
+    assert len(_PK_DOC) == 2 + 96
+    report = _table_report(vp, ref=_active_ref(vp, index=1234, pubkey=_PK_DOC))
+    text = _render_table(vp, _table_run(vp, load, [report]))
+    assert _PK_DOC not in text
+    assert "0x9324…a6d3" in text
+
+
+def test_columns_separated_by_two_spaces_and_cut_friendly(vp, load):
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    assert not any(ch in text for ch in _BOX_DRAWING)
+    header, rows = _table_header_and_rows(text)
+    assert header == [
+        "pubkey",
+        "index",
+        "status",
+        "active epochs",
+        "part%",
+        "src%",
+        "tgt%",
+        "head%",
+        "missed",
+        "incl/sched",
+        "sync%",
+        "Δbal ETH",
+        "eff%",
+        "APR%",
+    ]
+    assert len(header) == _TABLE_COL_COUNT
+    assert len(rows) == 3
+    for row in rows:
+        assert len(row) == _TABLE_COL_COUNT
+    table_lines = [
+        line
+        for line in text.splitlines()
+        if line.startswith("pubkey") or line.startswith("0x")
+    ]
+    assert table_lines
+    for line in table_lines:
+        assert "  " in line
+
+
+def test_no_ansi_escape_in_output(vp, load):
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    assert "\x1b" not in text
+    assert "\033" not in text
+
+
+def test_aggregate_block_reports_window_and_wall_clock_span(vp, load):
+    ctx = _table_ctx(vp, load)
+    window = _table_window(vp)
+    text = _render_table(
+        vp, _table_run(vp, load, _golden_reports(vp), ctx=ctx, window=window)
+    )
+    assert f"epochs {window.from_epoch}–{window.to_epoch}" in text
+    start = ctx.genesis_time + window.start_slot * ctx.spec.seconds_per_slot
+    end = ctx.genesis_time + window.end_slot * ctx.spec.seconds_per_slot
+    assert time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)) in text
+    assert time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end)) in text
+
+
+def test_footnotes_state_inclusion_distance_and_zero_proposals(vp, load):
+    text = _render_table(vp, _table_run(vp, load, _golden_reports(vp)))
+    assert "inclusion distance is absent because it requires a full block scan" in text
+    assert (
+        "0/0 proposals is normal at this key count — 200 keys over 32 epochs "
+        "expect ≈0.19 proposals; proposals_expected is not implemented"
+    ) in text
+
+
+def test_degraded_block_header_present_when_empty(vp, load):
+    run = _table_run(vp, load, _golden_reports(vp))
+    assert run.degradations == []
+    text = _render_table(vp, run)
+    assert "DEGRADED:" in text
+    assert text.split("DEGRADED:", 1)[1].strip() == ""
 

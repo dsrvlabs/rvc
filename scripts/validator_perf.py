@@ -1685,7 +1685,124 @@ def build_aggregate(reports: list[ValidatorReport], spec: Spec) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class RunReport:
+    ctx: ChainContext
+    window: Window
+    validators: list[ValidatorReport]
+    aggregate: dict
+    degradations: list[Degradation]
+    endpoints_used: list[str]
+    exit_code: int
+
+
 # ===== § 15. Reporting =====
+
+_EM_DASH = "—"
+_TABLE_HEADERS = (
+    "pubkey",
+    "index",
+    "status",
+    "active epochs",
+    "part%",
+    "src%",
+    "tgt%",
+    "head%",
+    "missed",
+    "incl/sched",
+    "sync%",
+    "Δbal ETH",
+    "eff%",
+    "APR%",
+)
+
+
+def _cell(value: object) -> str:
+    return _EM_DASH if value is None else str(value)
+
+
+def _fmt_pct(rate: float | None) -> str:
+    return _cell(None) if rate is None else f"{rate * 100:.2f}"
+
+
+def _fmt_eth(delta_gwei: int | None) -> str:
+    if delta_gwei is None:
+        return _cell(None)
+    return f"{delta_gwei / 1_000_000_000:.6f}"
+
+
+def _abbrev_pubkey(pubkey: str) -> str:
+    body = pubkey[2:] if pubkey.startswith("0x") else pubkey
+    return f"0x{body[:4]}…{body[-4:]}"
+
+
+def _slot_utc(ctx: ChainContext, slot: int) -> str:
+    ts = ctx.genesis_time + slot * ctx.spec.seconds_per_slot
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _table_row(report: ValidatorReport) -> list[str]:
+    return [
+        _abbrev_pubkey(report.ref.pubkey),
+        _cell(report.ref.index),
+        report.ref.status,
+        str(report.active_epochs),
+        _fmt_pct(report.participation_rate),
+        _fmt_pct(report.source_rate),
+        _fmt_pct(report.target_rate),
+        _fmt_pct(report.head_rate),
+        _cell(report.missed_attestations),
+        _EM_DASH,  # Phase 2: incl/sched and sync% stay — (VP-3f fills them)
+        _EM_DASH,
+        _fmt_eth(report.balance.delta_gwei),
+        _fmt_pct(report.attester_effectiveness),
+        _fmt_pct(report.estimated_apr),
+    ]
+
+
+def _align_rows(rows: list[list[str]]) -> list[str]:
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return ["  ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)) for row in rows]
+
+
+def render_table(run: RunReport, out: TextIO) -> None:
+    ordered = sorted(
+        run.validators,
+        key=lambda r: (r.attester_effectiveness is None, r.attester_effectiveness),
+    )
+    lines = _align_rows([list(_TABLE_HEADERS), *(_table_row(r) for r in ordered)])
+    agg = run.aggregate
+    by_status = agg.get("by_status") or {}
+    status_txt = ", ".join(f"{name}: {count}" for name, count in by_status.items())
+    window = run.window
+    proposals = agg.get("proposals") or {}
+    lines.extend(
+        [
+            "",
+            f"validators: {agg.get('validators', 0)}  ({status_txt})",
+            f"window: epochs {window.from_epoch}–{window.to_epoch} "
+            f"({_slot_utc(run.ctx, window.start_slot)} – "
+            f"{_slot_utc(run.ctx, window.end_slot)})",
+            f"part% {_fmt_pct(agg.get('participation_rate'))}  "
+            f"src% {_fmt_pct(agg.get('source_rate'))}  "
+            f"tgt% {_fmt_pct(agg.get('target_rate'))}  "
+            f"head% {_fmt_pct(agg.get('head_rate'))}  "
+            f"eff% {_fmt_pct(agg.get('attester_effectiveness'))}",
+            f"missed {_cell(agg.get('missed_attestations'))}  "
+            f"incl/sched {_cell(proposals.get('included'))}/"
+            f"{_cell(proposals.get('scheduled'))}  "
+            f"consensus_reward_gwei {_cell(agg.get('consensus_reward_gwei'))}  "
+            f"APR% {_fmt_pct(agg.get('estimated_apr'))}",
+            "",
+            "inclusion distance is absent because it requires a full block scan",
+            "0/0 proposals is normal at this key count — 200 keys over 32 epochs "
+            "expect ≈0.19 proposals; proposals_expected is not implemented",
+            "",
+            "DEGRADED:",
+        ]
+    )
+    out.write("\n".join(lines) + "\n")
+
 
 # ===== § 16. main =====
 
