@@ -1049,6 +1049,90 @@ def probe_rewards_api(
         client._tls.allow_promote = prev
 
 
+def _liveness_epochs(head_epoch: int) -> tuple[int, ...]:
+    # Spec SHOULD: current and previous epoch only. Do not walk the window.
+    if head_epoch < 1:
+        return (head_epoch,)
+    return (head_epoch, head_epoch - 1)
+
+
+def _liveness_cause(status: int | None, node_version: str) -> str:
+    ver = node_version.lower()
+    if "teku" in ver:
+        return "Teku (liveness off by default)"
+    if "grandine" in ver:
+        return "Grandine (needs --track-liveness)"
+    # 400/500 name Teku/Grandine only when version did not name a client.
+    if not ver:
+        if status == 400:
+            return "Teku (liveness off by default)"
+        if status == 500:
+            return "Grandine (needs --track-liveness)"
+    if status is not None:
+        return f"HTTP {status}"
+    return "unavailable"
+
+
+def _liveness_index(raw: object) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    try:
+        return parse_uint(raw, "index")
+    except UsageError:
+        return None
+
+
+def collect_liveness(
+    client: "BeaconClient",
+    head_epoch: int,
+    ids: Sequence[str],
+    node_version: str,
+    log: Log | None = None,
+) -> tuple[dict[int, list[dict]], str | None]:
+    """Opt-in head-window sanity check. Never a degradation (RD-6)."""
+    id_list = [item for item in ids if item]
+    if not id_list:
+        return {}, None
+    by_index: dict[int, list[dict]] = {}
+    for epoch in _liveness_epochs(head_epoch):
+        try:
+            rows = client.liveness(epoch, id_list)
+        except BeaconStatus as exc:
+            cause = _liveness_cause(exc.status, node_version)
+            if log is not None:
+                log.warn("liveness_sanity unavailable: %s", cause)
+            return {}, cause
+        except (BeaconTransport, NoBeaconAvailable):
+            cause = _liveness_cause(None, node_version)
+            if log is not None:
+                log.warn("liveness_sanity unavailable: %s", cause)
+            return {}, cause
+        if not isinstance(rows, list):
+            cause = _liveness_cause(None, node_version)
+            if log is not None:
+                log.warn("liveness_sanity unavailable: %s", cause)
+            return {}, cause
+        live_by: dict[int, bool] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            idx = _liveness_index(row.get("index"))
+            if idx is None:
+                continue
+            live_by[idx] = row.get("is_live") is True
+        for raw in id_list:
+            idx = _liveness_index(raw)
+            if idx is None:
+                continue
+            # Missing from the response is null, not a true-negative false.
+            by_index.setdefault(idx, []).append(
+                {"epoch": epoch, "observed": live_by.get(idx)}
+            )
+    return by_index, None
+
+
 # ===== § 8. Window resolution =====
 
 
@@ -2285,6 +2369,7 @@ class ValidatorReport:
     estimated_apr: float | None
     window_epochs: int
     degradations: list[Degradation]
+    liveness_sanity: list | None = None
 
 
 def _proposal_counts(
@@ -2516,6 +2601,8 @@ class RunReport:
     endpoints_used: list[str]
     exit_code: int
     threshold_breaches: list[str] = field(default_factory=list)
+    liveness_checked: bool = False
+    liveness_unavailable: str | None = None
 
 
 def _breaches(value: float | None, threshold: float) -> bool:
@@ -2579,6 +2666,12 @@ def decide_exit_code(run: RunReport, opts: Options) -> int:
 # ===== § 15. Reporting =====
 
 _EM_DASH = "—"
+_LIVENESS_FOOTNOTE = (
+    "liveness_sanity is a head-window observation check "
+    "(current and previous epoch only); it does not mean an "
+    "attestation was included on chain, is not canonical, "
+    "and is not participation_rate"
+)
 _TABLE_HEADERS = (
     "pubkey",
     "index",
@@ -2714,6 +2807,17 @@ def render_table(run: RunReport, out: TextIO) -> None:
             "0/0 proposals is normal at this key count — 200 keys over 32 epochs "
             "expect ≈0.19 proposals; proposals_expected is not implemented",
             "an orphaned block is not canonical and reads as missed",
+        ]
+    )
+    if run.liveness_checked:
+        lines.append(_LIVENESS_FOOTNOTE)
+        if run.liveness_unavailable:
+            lines.append(
+                f"liveness_sanity unavailable: {run.liveness_unavailable}; "
+                "the run is not degraded"
+            )
+    lines.extend(
+        [
             "",
             "DEGRADED:",
         ]
@@ -2769,6 +2873,8 @@ def _validator_json(
     report: ValidatorReport,
     window: Window,
     breaches: Sequence[str] = (),
+    *,
+    include_liveness: bool = False,
 ) -> dict:
     snap = report.balance
     eb, changed = effective_balance_for(snap, report.ref)
@@ -2776,39 +2882,47 @@ def _validator_json(
     # Fallback total is the delta; nothing independent remains to reconcile.
     if report.reward_source != "rewards_api":
         rec = replace(rec, reconciliation="unavailable")
-    return {
+    row = {
         "pubkey": report.ref.pubkey,
         "index": report.ref.index,
         "status": report.ref.status,
         "active_epochs": report.active_epochs,
         "participation_rate": report.participation_rate,
-        "source_rate": report.source_rate,
-        "target_rate": report.target_rate,
-        "head_rate": report.head_rate,
-        "missed_attestations": report.missed_attestations,
-        "attester_effectiveness": report.attester_effectiveness,
-        "effectiveness_method": report.effectiveness_method,
-        "leak_epochs_excluded": report.leak_epochs_excluded,
-        "proposals": report.proposals,
-        "sync": _sync_json(report.sync),
-        "balance": {
-            "start_gwei": snap.start_gwei,
-            "end_gwei": snap.end_gwei,
-            "delta_gwei": snap.delta_gwei,
-            "effective_balance_gwei": eb,
-            "effective_balance_changed": changed,
-            "start_slot": window.start_slot,
-            "end_slot": window.end_slot,
-            "reconciliation": rec.reconciliation,
-        },
-        "rewards_gwei": dict(report.rewards_gwei),
-        "estimated_apr": report.estimated_apr,
-        "reward_source": report.reward_source,
-        "degradations": [_degradation_json(d) for d in report.degradations],
-        "threshold_breaches": _metrics_for_scope(
-            breaches, _threshold_scope(report)
-        ),
     }
+    # Distinct key, adjacent to M1; omitted unless --liveness-check (RD-6).
+    if include_liveness:
+        row["liveness_sanity"] = report.liveness_sanity
+    row.update(
+        {
+            "source_rate": report.source_rate,
+            "target_rate": report.target_rate,
+            "head_rate": report.head_rate,
+            "missed_attestations": report.missed_attestations,
+            "attester_effectiveness": report.attester_effectiveness,
+            "effectiveness_method": report.effectiveness_method,
+            "leak_epochs_excluded": report.leak_epochs_excluded,
+            "proposals": report.proposals,
+            "sync": _sync_json(report.sync),
+            "balance": {
+                "start_gwei": snap.start_gwei,
+                "end_gwei": snap.end_gwei,
+                "delta_gwei": snap.delta_gwei,
+                "effective_balance_gwei": eb,
+                "effective_balance_changed": changed,
+                "start_slot": window.start_slot,
+                "end_slot": window.end_slot,
+                "reconciliation": rec.reconciliation,
+            },
+            "rewards_gwei": dict(report.rewards_gwei),
+            "estimated_apr": report.estimated_apr,
+            "reward_source": report.reward_source,
+            "degradations": [_degradation_json(d) for d in report.degradations],
+            "threshold_breaches": _metrics_for_scope(
+                breaches, _threshold_scope(report)
+            ),
+        }
+    )
+    return row
 
 
 def render_json(
@@ -2841,7 +2955,12 @@ def render_json(
             "endpoints_used": used,
         },
         "validators": [
-            _validator_json(v, run.window, run.threshold_breaches)
+            _validator_json(
+                v,
+                run.window,
+                run.threshold_breaches,
+                include_liveness=run.liveness_checked,
+            )
             for v in run.validators
         ],
         "aggregate": aggregate,
@@ -3062,6 +3181,13 @@ def main(
         sync_map, sync_degs = collect_sync(
             client, window, ctx, index_set, pool, budget
         )
+        live_by_index: dict[int, list] = {}
+        liveness_unavail: str | None = None
+        if opts.liveness_check:
+            live_ids = [str(r.index) for r in refs if r.index is not None]
+            live_by_index, liveness_unavail = collect_liveness(
+                client, ctx.head_epoch, live_ids, ctx.node_version, log
+            )
         empty_snap = BalanceSnapshot(None, None, None, None)
         reports: list[ValidatorReport] = []
         report_degs: list[Degradation] = []
@@ -3092,6 +3218,11 @@ def main(
                 sync=sync_out,
                 attestation_degraded=att_failed,
             )
+            if opts.liveness_check:
+                sanity = None
+                if liveness_unavail is None and ref.index is not None:
+                    sanity = live_by_index.get(ref.index)
+                report = replace(report, liveness_sanity=sanity)
             reports.append(report)
             report_degs.extend(report.degradations)
         run = RunReport(
@@ -3102,6 +3233,8 @@ def main(
             att_degs + prop_degs + bal_degs + sync_degs + report_degs,
             client.endpoints_used,
             EXIT_OK,
+            liveness_checked=opts.liveness_check,
+            liveness_unavailable=liveness_unavail,
         )
         breaches = evaluate_thresholds(run, parse_thresholds(opts.fail_under))
         code = decide_exit_code(run, opts)

@@ -4997,6 +4997,7 @@ _REASON_PRODUCERS = {
 }
 _G5_KIND_PREFIXES = (
     ("failover__", "declared"),
+    ("liveness__", "declared"),
     ("thresholds__", "rewards"),
     ("rewards_attestations__", "rewards"),
     ("states_validators__", "validators"),
@@ -5017,6 +5018,7 @@ _G5_KIND_PREFIXES = (
 _G5_SKIP = {
     "failover__midrun_promotion": "scenario descriptor; exercised by VP-4a tests",
     "failover__first_503": "scenario descriptor; exercised by VP-4b tests",
+    "liveness__head_window": "scenario descriptor; exercised by VP-4e tests",
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
     "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
@@ -9343,6 +9345,232 @@ def test_csv_quotes_fields_containing_separators(vp, load, tmp_path):
     assert '"active,ongoing"' in text
     _header, rows = _csv_rows(path)
     assert rows[0]["status"] == "active,ongoing"
+
+
+# ----- VP-4e: --liveness-check opt-in, distinct field (P1-2, RD-6) -----
+
+_LIVENESS_HEAD = _DRY_RUN_HEAD_EPOCH  # 101 from headers__head
+_LIVENESS_PREV = _LIVENESS_HEAD - 1
+
+
+def _liveness_path(epoch: int) -> str:
+    return f"/eth/v1/validator/liveness/{epoch}"
+
+
+def _script_liveness(vp, routes, item=None, *, status=200):
+    if item is None:
+        item = (
+            raw_response(vp, "liveness__head_window")
+            if status == 200
+            else _raw(vp, status, headers={"Retry-After": "0"})
+        )
+    n = 2 if status == 500 else 1
+    queue = [item] * n
+    for epoch in (_LIVENESS_HEAD, _LIVENESS_PREV):
+        routes[("POST", _liveness_path(epoch))] = list(queue)
+    return routes
+
+
+def _liveness_calls(transport):
+    return [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "/validator/liveness/" in c[2]
+    ]
+
+
+def test_no_liveness_request_without_the_flag(vp, capsys):
+    routes = _script_liveness(vp, _full_run_routes(vp))
+    code, transport = _run_full(vp, "--json", routes=routes)
+    capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    assert _liveness_calls(transport) == []
+    assert not any("liveness" in c[2] for c in transport.calls)
+
+    routes = _script_liveness(vp, _rewards_less_routes(vp))
+    code, transport = _run_full(vp, "--json", routes=routes)
+    doc, _captured = _stdout_json(capsys)
+    assert code == vp.EXIT_DEGRADED == 3
+    assert _liveness_calls(transport) == []
+    assert not any("liveness" in c[2] for c in transport.calls)
+    assert doc["validators"][0]["participation_rate"] is None
+    assert "liveness_sanity" not in doc["validators"][0]
+
+
+def test_liveness_check_flag_issues_the_request(vp, capsys):
+    routes = _script_liveness(vp, _full_run_routes(vp))
+    code, transport = _run_full(
+        vp, "--json", "--liveness-check", routes=routes
+    )
+    doc, _captured = _stdout_json(capsys)
+    assert code == vp.EXIT_OK == 0
+    calls = _liveness_calls(transport)
+    assert calls
+    paths = [c[2] for c in calls]
+    assert _liveness_path(_LIVENESS_HEAD) in paths
+    assert _liveness_path(_LIVENESS_PREV) in paths
+    row = doc["validators"][0]
+    assert "liveness_sanity" in row
+    assert row["liveness_sanity"] == [
+        {"epoch": _LIVENESS_HEAD, "observed": True},
+        {"epoch": _LIVENESS_PREV, "observed": True},
+    ]
+    validate_schema(doc, _load_perf_schema())
+
+
+def test_liveness_reported_under_a_distinct_field_never_merged_into_m1(
+    vp, capsys
+):
+    routes = _script_liveness(vp, _rewards_less_routes(vp))
+    code, transport = _run_full(
+        vp, "--json", "--liveness-check", routes=routes
+    )
+    doc, _captured = _stdout_json(capsys)
+    assert code == vp.EXIT_DEGRADED == 3
+    row = doc["validators"][0]
+    assert row["participation_rate"] is None
+    assert row["missed_attestations"] is None
+    assert "liveness_sanity" in row
+    assert row["liveness_sanity"] is not None
+    assert row["liveness_sanity"] != row["participation_rate"]
+    src = inspect.getsource(vp.build_validator_report)
+    assert "liveness" not in src
+    assert _liveness_calls(transport)
+
+
+def test_liveness_covers_current_and_previous_epoch_only(vp, capsys):
+    routes = _script_liveness(vp, _full_run_routes(vp))
+    _code, transport = _run_full(
+        vp, "--json", "--liveness-check", routes=routes
+    )
+    capsys.readouterr()
+    epochs = [
+        int(c[2].rsplit("/", 1)[-1]) for c in _liveness_calls(transport)
+    ]
+    assert epochs == [_LIVENESS_HEAD, _LIVENESS_PREV]
+    assert len(epochs) == 2
+    assert len(epochs) != 32
+    assert _FULL_FROM not in epochs
+    src = inspect.getsource(vp._liveness_epochs) + inspect.getsource(
+        vp.collect_liveness
+    )
+    assert "head_epoch" in src
+    assert "head_epoch - 1" in src
+
+
+def test_teku_400_and_grandine_500_report_unavailable_without_degrading_the_run(
+    vp, capsys, monkeypatch
+):
+    _no_sleep(monkeypatch, vp)
+    cases = (
+        (400, "teku/v26.8.0", "Teku"),
+        (500, "Grandine/2.0.6", "Grandine"),
+    )
+    for status, version, name in cases:
+        routes = _full_run_routes(vp)
+        routes[("GET", _VERSION_TEMPLATE)] = [
+            _raw(
+                vp,
+                200,
+                json.dumps({"data": {"version": version}}).encode(),
+            )
+        ]
+        _script_liveness(vp, routes, status=status)
+        code, transport = _run_full(
+            vp, "--json", "--liveness-check", routes=routes
+        )
+        doc, captured = _stdout_json(capsys)
+        assert code == vp.EXIT_OK == 0, name
+        assert doc["exit_code"] == 0, name
+        assert doc["degradations"] == [], name
+        assert _liveness_calls(transport), name
+        row = doc["validators"][0]
+        assert row["liveness_sanity"] is None, name
+        assert row["participation_rate"] is not None, name
+        blob = captured.err + captured.out
+        assert name in blob, name
+        assert "unavailable" in blob.lower(), name
+
+    routes = _script_liveness(vp, _rewards_less_routes(vp), status=400)
+    code, _transport = _run_full(
+        vp, "--json", "--liveness-check", routes=routes
+    )
+    doc, _captured = _stdout_json(capsys)
+    assert code == vp.EXIT_DEGRADED == 3
+    assert doc["exit_code"] == 3
+    assert doc["validators"][0]["liveness_sanity"] is None
+    assert doc["validators"][0]["participation_rate"] is None
+    assert not any("liveness" in d["reason"] for d in doc["degradations"])
+
+
+def test_liveness_cause_versions_first_status_is_fallback_only(vp):
+    assert "Teku" in vp._liveness_cause(500, "teku/v26.8.0")
+    assert "Grandine" in vp._liveness_cause(400, "Grandine/2.0.6")
+    lighthouse_400 = vp._liveness_cause(400, "Lighthouse/v5.3.0")
+    lighthouse_500 = vp._liveness_cause(500, "Lighthouse/v5.3.0")
+    assert "Teku" not in lighthouse_400
+    assert "Grandine" not in lighthouse_500
+    assert "HTTP 400" in lighthouse_400
+    assert "HTTP 500" in lighthouse_500
+    assert "Teku" in vp._liveness_cause(400, "")
+    assert "Grandine" in vp._liveness_cause(500, "")
+
+
+def test_liveness_missing_index_is_null_int_index_and_is_live_false(vp):
+    head = 10
+    body = json.dumps(
+        {
+            "data": [
+                {"index": 1, "is_live": True},
+                {"index": "2", "is_live": False},
+            ]
+        }
+    ).encode()
+    ok = _raw(vp, 200, body)
+    transport = FakeTransport(
+        {
+            ("POST", _liveness_path(head)): [ok],
+            ("POST", _liveness_path(head - 1)): [ok],
+        }
+    )
+    client, _buf = _client(vp, transport)
+    by_index, cause = vp.collect_liveness(
+        client, head, ["1", "2", "3"], "Lighthouse/v5.3.0"
+    )
+    assert cause is None
+    assert by_index[1] == [
+        {"epoch": head, "observed": True},
+        {"epoch": head - 1, "observed": True},
+    ]
+    assert by_index[2] == [
+        {"epoch": head, "observed": False},
+        {"epoch": head - 1, "observed": False},
+    ]
+    assert by_index[3] == [
+        {"epoch": head, "observed": None},
+        {"epoch": head - 1, "observed": None},
+    ]
+    assert by_index[3][0]["observed"] is not False
+
+
+def test_liveness_footnote_states_what_it_does_not_mean(vp, load, capsys):
+    run = replace(
+        _table_run(vp, load, _golden_reports(vp)),
+        liveness_checked=True,
+    )
+    text = _render_table(vp, run)
+    assert vp._LIVENESS_FOOTNOTE in text
+    lower = text.lower()
+    assert "does not mean" in lower
+    assert "included on chain" in lower
+    assert "not canonical" in lower
+    assert "not participation_rate" in lower
+    routes = _script_liveness(vp, _full_run_routes(vp))
+    code, _transport = _run_full(vp, "--liveness-check", routes=routes)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    assert vp._LIVENESS_FOOTNOTE in captured.out
+    assert "does not mean" in captured.out.lower()
 
 
 def test_csv_neutralizes_formula_injection(vp, load, tmp_path):
