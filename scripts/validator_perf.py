@@ -9,6 +9,7 @@ import argparse
 import base64
 import re
 import sys
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TextIO
@@ -145,6 +146,103 @@ def redact(ep: "Endpoint") -> str:
 
 # ===== § 4. CLI and configuration =====
 
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Estimate consensus-layer performance of a validator set from the Beacon API.",
+    )
+    p.add_argument("--pubkey", action="append")
+    p.add_argument("--pubkeys-file")
+    p.add_argument("--validators-config")
+    p.add_argument("--beacon-url", action="append")
+    p.add_argument("--config")
+    p.add_argument("--epochs", type=int)
+    p.add_argument("--from-epoch", type=int)
+    p.add_argument("--to-epoch", type=int)
+    p.add_argument("--allow-unfinalized", action="store_true")
+    p.add_argument("--force-unsafe-window", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--csv")
+    p.add_argument("--concurrency", type=int)
+    p.add_argument("--request-delay-ms", type=int)
+    p.add_argument("--connect-timeout", type=float)
+    p.add_argument("--read-timeout", type=float)
+    p.add_argument("--degraded-ok", action="store_true")
+    p.add_argument("--fail-under", action="append")
+    p.add_argument("--liveness-check", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-cache", action="store_true")
+    p.add_argument("-v", action="count", default=0, dest="verbose")
+    p.add_argument("-q", action="store_true", dest="quiet")
+    return p
+
+
+def _read_source(
+    out: list[str],
+    seen: set[str],
+    items: list[tuple[str, object]],
+) -> None:
+    for origin, raw in items:
+        key = normalize_pubkey(raw if isinstance(raw, str) else "", origin)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+
+
+def _pubkeys_from_file(path: str) -> list[tuple[str, object]]:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        raise UsageError(f"{path}: {e}") from e
+    items: list[tuple[str, object]] = []
+    for lineno, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        items.append((f"{path}:{lineno}", text))
+    return items
+
+
+def _pubkeys_from_validators_config(path: str) -> list[tuple[str, object]]:
+    try:
+        # tomllib.load requires a binary handle; text mode raises TypeError.
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except OSError as e:
+        raise UsageError(f"{path}: {e.strerror}") from e
+    except tomllib.TOMLDecodeError as e:
+        raise UsageError(f"{path}: {e}") from e
+    entries = data.get("validators", [])
+    if not isinstance(entries, list):
+        raise UsageError(f"{path}: [[validators]] must be an array")
+    items: list[tuple[str, object]] = []
+    for n, entry in enumerate(entries, start=1):
+        origin = f"{path} [[validators]] #{n}"
+        raw: object = entry.get("pubkey") if isinstance(entry, dict) else ""
+        items.append((origin, raw if raw is not None else ""))
+    return items
+
+
+def load_pubkeys(args: argparse.Namespace) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    _read_source(
+        out,
+        seen,
+        [(f"--pubkey #{n}", raw) for n, raw in enumerate(args.pubkey or [], start=1)],
+    )
+    if args.pubkeys_file:
+        _read_source(out, seen, _pubkeys_from_file(args.pubkeys_file))
+    if args.validators_config:
+        _read_source(out, seen, _pubkeys_from_validators_config(args.validators_config))
+    if not out:
+        raise UsageError(
+            "no pubkeys: supply --pubkey, --pubkeys-file, or --validators-config"
+        )
+    return out
+
+
 # ===== § 5. Transport =====
 
 
@@ -191,9 +289,7 @@ Transport = Callable[[Endpoint, str, str, bytes | None], RawResponse]
 
 
 def main(argv: list[str] | None = None) -> int:
-    argparse.ArgumentParser(
-        description="Estimate consensus-layer performance of a validator set from the Beacon API.",
-    ).parse_args(argv)
+    build_parser().parse_args(argv)
     return EXIT_OK
 
 

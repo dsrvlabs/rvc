@@ -280,3 +280,136 @@ def test_endpoint_is_frozen(vp):
     ep = vp.parse_endpoint("http://h", "bn0")
     with pytest.raises(FrozenInstanceError):
         ep.base_path = "/abc123SECRET"
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+PK1 = "0x" + "11" * 48
+PK2 = "0x" + "22" * 48
+PK3 = "0x" + "33" * 48
+PK4 = "0x" + "44" * 48
+
+_DOCUMENTED_FLAGS = {
+    "--pubkey",
+    "--pubkeys-file",
+    "--validators-config",
+    "--beacon-url",
+    "--config",
+    "--epochs",
+    "--from-epoch",
+    "--to-epoch",
+    "--allow-unfinalized",
+    "--force-unsafe-window",
+    "--json",
+    "--csv",
+    "--concurrency",
+    "--request-delay-ms",
+    "--connect-timeout",
+    "--read-timeout",
+    "--degraded-ok",
+    "--fail-under",
+    "--liveness-check",
+    "--dry-run",
+    "--no-cache",
+    "-v",
+    "-q",
+}
+
+
+def _load_pubkeys(vp, argv):
+    return vp.load_pubkeys(vp.build_parser().parse_args(argv))
+
+
+def test_pubkey_union_across_three_sources_in_input_order(vp):
+    # --pubkey ∪ --pubkeys-file ∪ --validators-config, first-seen; file dups PK1.
+    toml = str(FIXTURES / "validators__three_entries.toml")
+    pubfile = str(FIXTURES / "pubkeys__two_one_dup.txt")
+    expected = [PK4, PK1, PK2, PK3]
+    assert _load_pubkeys(
+        vp,
+        ["--pubkey", PK4, "--pubkeys-file", pubfile, "--validators-config", toml],
+    ) == expected
+    # Argv order must not change operand order; second --pubkey is append + de-dup.
+    assert _load_pubkeys(
+        vp,
+        [
+            "--validators-config",
+            toml,
+            "--pubkeys-file",
+            pubfile,
+            "--pubkey",
+            PK4,
+            "--pubkey",
+            PK1,
+        ],
+    ) == expected
+
+
+def test_short_pubkey_exits_2_naming_source_and_line(vp):
+    path = str(FIXTURES / "pubkeys__short_hex.txt")
+    with pytest.raises(vp.UsageError) as ei:
+        _load_pubkeys(vp, ["--pubkeys-file", path])
+    msg = str(ei.value)
+    assert path in msg
+    assert f"{path}:3" in msg
+    assert vp.EXIT_USAGE == 2
+
+
+def test_short_cli_pubkey_names_flag_origin(vp):
+    with pytest.raises(vp.UsageError) as ei:
+        _load_pubkeys(vp, ["--pubkey", "aa" * 47])
+    assert "--pubkey #1" in str(ei.value)
+    assert vp.EXIT_USAGE == 2
+
+
+def test_short_toml_pubkey_names_table_origin(vp, tmp_path):
+    path = str(tmp_path / "validators__short.toml")
+    Path(path).write_text(f'[[validators]]\npubkey = "{"aa" * 47}"\n', encoding="utf-8")
+    with pytest.raises(vp.UsageError) as ei:
+        _load_pubkeys(vp, ["--validators-config", path])
+    assert f"{path} [[validators]] #1" in str(ei.value)
+    assert vp.EXIT_USAGE == 2
+
+
+def test_pubkeys_file_ignores_blanks_and_comments(vp):
+    path = str(FIXTURES / "pubkeys__two_one_dup.txt")
+    assert _load_pubkeys(vp, ["--pubkeys-file", path]) == [PK1, PK4]
+
+
+def test_validators_config_accepts_unprefixed_pubkey(vp):
+    path = str(FIXTURES / "validators__unprefixed.toml")
+    assert _load_pubkeys(vp, ["--validators-config", path]) == [
+        "0x" + "aa" * 48,
+    ]
+
+
+def test_no_pubkeys_exits_2(vp):
+    with pytest.raises(vp.UsageError) as ei:
+        _load_pubkeys(vp, [])
+    assert "pubkey" in str(ei.value).lower()
+    assert vp.EXIT_USAGE == 2
+
+
+def test_validators_config_opened_in_binary_mode(vp, monkeypatch):
+    path = str(FIXTURES / "validators__three_entries.toml")
+    modes: list[str] = []
+    real_load = vp.tomllib.load
+
+    def spy(fp, *a, **kw):
+        modes.append(getattr(fp, "mode", ""))
+        return real_load(fp, *a, **kw)
+
+    monkeypatch.setattr(vp.tomllib, "load", spy)
+    assert _load_pubkeys(vp, ["--validators-config", path]) == [PK1, PK2, PK3]
+    assert any("b" in mode for mode in modes)
+
+
+def test_parser_declares_every_documented_flag(vp):
+    parser = vp.build_parser()
+    names = {opt for action in parser._actions for opt in action.option_strings}
+    dests = {action.dest: list(action.option_strings) for action in parser._actions}
+    assert _DOCUMENTED_FLAGS <= names
+    assert "--prometheus" not in names
+    assert names - _DOCUMENTED_FLAGS <= {"-h", "--help"}
+    assert dests["verbose"] == ["-v"]
+    assert dests["quiet"] == ["-q"]
