@@ -3571,3 +3571,334 @@ def test_empty_parsed_snapshot_is_state_unavailable(vp, load):
     assert eb == ref.effective_balance_gwei == _EB_32
     assert changed is False
 
+
+# ----- VP-2e: §14 ValidatorReport + M6 + M9 + per-validator APR -----
+
+
+def _snap(vp, eb=_EB_32):
+    return vp.BalanceSnapshot(eb, eb, eb, eb)
+
+
+def _report_window(vp, from_epoch=100, to_epoch=103):
+    return _att_window(vp, from_epoch, to_epoch)
+
+
+def _eval_outcomes(vp, envelopes, ref, eb, start_epoch=100):
+    out = []
+    for i, env in enumerate(envelopes):
+        got = _eval_epoch(vp, start_epoch + i, env, [ref], {ref.index: eb})
+        if ref.index in got:
+            out.append(got[ref.index])
+    return out
+
+
+def _hand_m6(envelopes, eb):
+    actual = 0
+    ideal = 0
+    for env in envelopes:
+        body = _rewards_body(env)
+        rows = body["ideal_rewards"]
+        largest = max(rows, key=lambda r: int(r["effective_balance"]))
+        if _flag_tuple(largest) == (0, 0, 0):
+            continue
+        ideal_row = next(
+            (r for r in rows if int(r["effective_balance"]) == eb), None
+        )
+        if ideal_row is None:
+            continue
+        tr = body["total_rewards"][0]
+        actual += int(tr["source"]) + int(tr["target"]) + int(tr["head"])
+        ideal += (
+            int(ideal_row["source"])
+            + int(ideal_row["target"])
+            + int(ideal_row["head"])
+        )
+    if ideal == 0:
+        return None
+    return max(0.0, min(1.0, actual / ideal))
+
+
+def _mk_outcome(vp, **kw):
+    fields = dict(
+        epoch=100,
+        source_credited=True,
+        target_credited=True,
+        head_credited=True,
+        missed=False,
+        flag_actual_gwei=0,
+        flag_ideal_gwei=1,
+        inactivity_gwei=0,
+        leak=False,
+    )
+    fields.update(kw)
+    return vp.EpochOutcome(**fields)
+
+
+def _build_report(
+    vp,
+    load,
+    ref,
+    outcomes,
+    *,
+    spec="spec__mainnet",
+    snap=None,
+    window=None,
+    degradations=None,
+    **kwargs,
+):
+    if snap is None:
+        snap = _snap(vp, ref.effective_balance_gwei or _EB_32)
+    if window is None:
+        window = _report_window(vp)
+    return vp.build_validator_report(
+        ref,
+        outcomes,
+        snap,
+        _spec_from_fixture(vp, load, spec),
+        window,
+        degradations,
+        **kwargs,
+    )
+
+
+def test_effectiveness_matches_a_hand_computed_ratio(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    assert isinstance(envelopes, list) and len(envelopes) == 4
+    ref = _active_ref(vp)
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    assert len(outcomes) == 4
+    expected = _hand_m6(envelopes, _EB_32)
+    assert expected is not None
+    report = _build_report(vp, load, ref, outcomes)
+    assert report.attester_effectiveness == expected
+    # Fixture-side actuals, not EpochOutcome.flag_ideal_gwei (would tautologize).
+    actuals = [
+        int(row["source"]) + int(row["target"]) + int(row["head"])
+        for env in envelopes
+        for row in [_rewards_body(env)["total_rewards"][0]]
+    ]
+    ideals = []
+    for env in envelopes:
+        row = next(
+            r
+            for r in _rewards_body(env)["ideal_rewards"]
+            if int(r["effective_balance"]) == _EB_32
+        )
+        ideals.append(int(row["source"]) + int(row["target"]) + int(row["head"]))
+    assert actuals == [o.flag_actual_gwei for o in outcomes]
+    assert sum(ideals) != 0
+    assert expected == max(0.0, min(1.0, sum(actuals) / sum(ideals)))
+
+
+def test_leak_epochs_excluded_from_effectiveness(vp, load):
+    leak_env = load("rewards_attestations__leak")
+    basic = load("rewards_attestations__basic")
+    ref = _active_ref(vp)
+    leak_o = _eval_outcomes(vp, [leak_env], ref, _EB_32, start_epoch=99)
+    basic_o = _eval_outcomes(vp, basic, ref, _EB_32, start_epoch=100)
+    assert leak_o and leak_o[0].leak is True
+    assert leak_o[0].flag_ideal_gwei is None
+    leak_only = _build_report(vp, load, ref, leak_o)
+    assert leak_only.leak_epochs_excluded == 1
+    assert leak_only.attester_effectiveness is None
+    assert leak_only.attester_effectiveness != 0.0
+    assert leak_only.head_rate is None
+    assert leak_only.head_rate != 0.0
+    mixed = _build_report(vp, load, ref, leak_o + basic_o)
+    basic_only = _build_report(vp, load, ref, basic_o)
+    assert mixed.leak_epochs_excluded == 1
+    assert mixed.attester_effectiveness == basic_only.attester_effectiveness
+    assert mixed.attester_effectiveness == _hand_m6(basic, _EB_32)
+    assert mixed.head_rate == basic_only.head_rate == 0.5
+
+
+def test_missing_ideal_row_nulls_effectiveness_for_that_epoch_not_zero(vp, load):
+    missing_env = load("rewards_attestations__ideal_filtered")
+    rows = _ideal_rows(missing_env)
+    assert all(int(r["effective_balance"]) != _EB_32 for r in rows)
+    ref = _active_ref(vp, eb=_EB_32)
+    missing_o = _eval_outcomes(vp, [missing_env], ref, _EB_32)
+    assert missing_o and missing_o[0].flag_ideal_gwei is None
+    assert missing_o[0].leak is False
+    assert missing_o[0].flag_actual_gwei != 0
+    only = _build_report(vp, load, ref, missing_o)
+    assert only.attester_effectiveness is None
+    assert only.attester_effectiveness != 0.0
+    assert any(
+        d.reason == "ideal_row_missing" and d.scope == f"epoch:{missing_o[0].epoch}"
+        for d in only.degradations
+    )
+    basic = load("rewards_attestations__basic")
+    basic_o = _eval_outcomes(vp, basic, ref, _EB_32, start_epoch=101)
+    mixed = _build_report(vp, load, ref, missing_o + basic_o)
+    basic_only = _build_report(vp, load, ref, basic_o)
+    assert mixed.attester_effectiveness == basic_only.attester_effectiveness
+    assert mixed.attester_effectiveness == _hand_m6(basic, _EB_32)
+    polluted = (
+        missing_o[0].flag_actual_gwei + sum(o.flag_actual_gwei for o in basic_o)
+    ) / sum(o.flag_ideal_gwei for o in basic_o if o.flag_ideal_gwei)
+    assert mixed.attester_effectiveness != polluted
+    assert any(
+        d.reason == "ideal_row_missing" and d.scope == f"epoch:{missing_o[0].epoch}"
+        for d in mixed.degradations
+    )
+    assert not any(d.reason == "ideal_row_missing" for d in basic_only.degradations)
+
+
+def test_effectiveness_clamped_to_zero_one(vp, load):
+    ref = _active_ref(vp)
+    over = _build_report(
+        vp,
+        load,
+        ref,
+        [_mk_outcome(vp, flag_actual_gwei=200, flag_ideal_gwei=100)],
+    )
+    under = _build_report(
+        vp,
+        load,
+        ref,
+        [_mk_outcome(vp, flag_actual_gwei=-50, flag_ideal_gwei=100)],
+    )
+    assert over.attester_effectiveness == 1.0
+    assert under.attester_effectiveness == 0.0
+    zero_den = _build_report(
+        vp,
+        load,
+        ref,
+        [_mk_outcome(vp, flag_actual_gwei=10, flag_ideal_gwei=0)],
+    )
+    assert zero_den.attester_effectiveness is None
+
+
+def test_effectiveness_method_label_is_reward_ratio(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    ref = _active_ref(vp)
+    report = _build_report(
+        vp, load, ref, _eval_outcomes(vp, envelopes, ref, _EB_32)
+    )
+    assert report.effectiveness_method == "reward_ratio"
+    empty = _build_report(vp, load, ref, [])
+    assert empty.effectiveness_method == "reward_ratio"
+    assert empty.attester_effectiveness is None
+
+
+def test_estimated_apr_matches_to_four_decimal_places(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    ref = _active_ref(vp)
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    window = _att_window(vp, 100, 131)
+    assert window.epochs == 32
+    spec = _spec_from_fixture(vp, load, "spec__mainnet")
+    snap = _snap(vp, _EB_32)
+    report = vp.build_validator_report(ref, outcomes, snap, spec, window)
+    eb, _changed = vp.effective_balance_for(snap, ref)
+    total = report.rewards_gwei["total"]
+    expected = total / eb * spec.epochs_per_year / window.epochs
+    assert spec.epochs_per_year == 82181.25
+    assert report.window_epochs == window.epochs
+    assert report.window_epochs != report.active_epochs
+    assert round(report.estimated_apr, 4) == round(expected, 4)
+
+
+def test_apr_halves_on_six_second_slots(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    ref = _active_ref(vp)
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    window = _att_window(vp, 100, 131)
+    snap = _snap(vp, _EB_32)
+    mainnet = _spec_from_fixture(vp, load, "spec__mainnet")
+    spe8 = _spec_from_fixture(vp, load, "spec__spe8")
+    r_main = vp.build_validator_report(ref, outcomes, snap, mainnet, window)
+    r_spe8 = vp.build_validator_report(ref, outcomes, snap, spe8, window)
+    total = r_main.rewards_gwei["total"]
+    eb, _ = vp.effective_balance_for(snap, ref)
+    hardcoded = total / eb * 82181.25 / window.epochs
+    expected_spe8 = total / eb * spe8.epochs_per_year / window.epochs
+    assert spe8.seconds_per_slot == 6
+    assert spe8.epochs_per_year != 82181.25
+    assert round(r_spe8.estimated_apr, 12) == round(expected_spe8, 12)
+    assert r_spe8.estimated_apr != pytest.approx(hardcoded)
+    assert r_spe8.estimated_apr != pytest.approx(r_main.estimated_apr)
+    assert r_spe8.estimated_apr / r_main.estimated_apr == pytest.approx(
+        spe8.epochs_per_year / mainnet.epochs_per_year
+    )
+    src = inspect.getsource(vp.build_validator_report)
+    assert "82181" not in src
+    assert "EPOCHS_PER_YEAR" not in src
+    assert not hasattr(vp, "EPOCHS_PER_YEAR")
+
+
+def test_apr_denominator_is_the_validators_own_effective_balance(vp, load):
+    envelopes = load("rewards_attestations__basic")
+    ref = _active_ref(vp, eb=_EB_32)
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    window = _att_window(vp, 100, 131)
+    snap = _snap(vp, _EB_2048)
+    spec = _spec_from_fixture(vp, load)
+    report = vp.build_validator_report(ref, outcomes, snap, spec, window)
+    eb, _ = vp.effective_balance_for(snap, ref)
+    assert eb == _EB_2048
+    assert eb != _EB_32
+    total = report.rewards_gwei["total"]
+    own = total / _EB_2048 * spec.epochs_per_year / window.epochs
+    thirty_two = total / _EB_32 * spec.epochs_per_year / window.epochs
+    assert round(report.estimated_apr, 12) == round(own, 12)
+    assert report.estimated_apr != pytest.approx(thirty_two)
+
+
+def test_zero_active_epochs_gives_null_rates_not_zero(vp, load):
+    ref = _active_ref(vp)
+    existing = [
+        vp.Degradation("balance", "run", "state_unavailable", "slot 0")
+    ]
+    report = _build_report(vp, load, ref, [], degradations=list(existing))
+    for name in (
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "attester_effectiveness",
+        "estimated_apr",
+    ):
+        val = getattr(report, name)
+        assert val is None, name
+        assert val != 0.0, name
+    assert report.missed_attestations is None
+    assert report.missed_attestations != 0
+    assert report.active_epochs == 0
+    assert report.degradations == existing
+    assert report.reward_source == "rewards_api"
+    empty = _build_report(vp, load, ref, [])
+    assert empty.degradations == []
+
+
+def test_inactivity_summed_with_its_negative_sign(vp, load):
+    ref = _active_ref(vp)
+    o = _mk_outcome(
+        vp,
+        flag_actual_gwei=1000,
+        source_gwei=400,
+        target_gwei=500,
+        head_gwei=100,
+        inactivity_gwei=-300,
+        flag_ideal_gwei=1000,
+    )
+    assert o.inactivity_gwei < 0
+    report = _build_report(vp, load, ref, [o])
+    total = report.rewards_gwei["total"]
+    assert report.rewards_gwei["inactivity"] == -300
+    assert total == 1000 + (-300)
+    assert total != 1000
+    assert total != 1000 + 300
+    assert total != abs(-300) + 1000
+
+
+def test_slashed_validator_is_reported_with_its_status(vp, load):
+    ref = _active_ref(vp, status="active_slashed", slashed=True)
+    envelopes = load("rewards_attestations__basic")
+    outcomes = _eval_outcomes(vp, envelopes, ref, _EB_32)
+    report = _build_report(vp, load, ref, outcomes)
+    assert report.ref.status == "active_slashed"
+    assert report.ref.slashed is True
+    assert report.ref is ref
+

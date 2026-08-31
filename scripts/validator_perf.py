@@ -1157,6 +1157,9 @@ class EpochOutcome:
     flag_ideal_gwei: int | None
     inactivity_gwei: int
     leak: bool
+    source_gwei: int = 0
+    target_gwei: int = 0
+    head_gwei: int = 0
 
 
 def evaluate_epoch(
@@ -1212,6 +1215,9 @@ def evaluate_epoch(
             flag_ideal_gwei=flag_ideal_gwei,
             inactivity_gwei=inactivity,
             leak=leak,
+            source_gwei=source,
+            target_gwei=target,
+            head_gwei=head,
         )
     return out
 
@@ -1490,6 +1496,121 @@ def reconcile_balance(
 
 
 # ===== § 14. Aggregation, APR, thresholds =====
+
+
+def _rate(numerator: float, denominator: float) -> float | None:
+    if not denominator:
+        return None
+    return numerator / denominator
+
+
+@dataclass(frozen=True)
+class ValidatorReport:
+    ref: ValidatorRef
+    active_epochs: int
+    participation_rate: float | None
+    source_rate: float | None
+    target_rate: float | None
+    head_rate: float | None
+    missed_attestations: int | None
+    attester_effectiveness: float | None
+    effectiveness_method: str
+    leak_epochs_excluded: int
+    proposals: dict
+    sync: object | None
+    balance: BalanceSnapshot
+    rewards_gwei: dict
+    reward_source: str | None
+    estimated_apr: float | None
+    window_epochs: int
+    degradations: list[Degradation]
+
+
+def build_validator_report(
+    ref: ValidatorRef,
+    outcomes: list[EpochOutcome],
+    snap: BalanceSnapshot,
+    spec: Spec,
+    window: Window,
+    degradations: list[Degradation] | None = None,
+    *,
+    proposer_gwei: int = 0,
+    sync_gwei: int = 0,
+) -> ValidatorReport:
+    degs = list(degradations or ())
+    n_active = len(outcomes)
+    n_head = sum(1 for o in outcomes if o.head_credited is not None)
+    m6_actual = 0
+    m6_ideal = 0
+    for o in outcomes:
+        if o.flag_ideal_gwei is not None:
+            m6_actual += o.flag_actual_gwei
+            m6_ideal += o.flag_ideal_gwei
+        elif not o.leak:
+            degs.append(
+                Degradation(
+                    "attester_effectiveness",
+                    f"epoch:{o.epoch}",
+                    "ideal_row_missing",
+                    "",
+                )
+            )
+    raw = _rate(m6_actual, m6_ideal)
+    effectiveness = None if raw is None else max(0.0, min(1.0, raw))
+    inactivity = sum(o.inactivity_gwei for o in outcomes)
+    source = sum(o.source_gwei for o in outcomes)
+    target = sum(o.target_gwei for o in outcomes)
+    head = sum(o.head_gwei for o in outcomes)
+    total = (
+        sum(o.flag_actual_gwei for o in outcomes)
+        + inactivity
+        + proposer_gwei
+        + sync_gwei
+    )
+    eb, _changed = effective_balance_for(snap, ref)
+    window_epochs = window.epochs
+    # 0/EB annualizes to 0.0; an empty outcome list is null.
+    apr = (
+        None
+        if n_active == 0
+        else _rate(total * spec.epochs_per_year, (eb or 0) * window_epochs)
+    )
+    return ValidatorReport(
+        ref=ref,
+        active_epochs=n_active,
+        participation_rate=_rate(
+            sum(1 for o in outcomes if o.source_credited or o.target_credited),
+            n_active,
+        ),
+        source_rate=_rate(sum(1 for o in outcomes if o.source_credited), n_active),
+        target_rate=_rate(sum(1 for o in outcomes if o.target_credited), n_active),
+        head_rate=_rate(
+            sum(1 for o in outcomes if o.head_credited is True), n_head
+        ),
+        missed_attestations=(
+            None if n_active == 0 else sum(1 for o in outcomes if o.missed)
+        ),
+        attester_effectiveness=effectiveness,
+        effectiveness_method="reward_ratio",
+        leak_epochs_excluded=sum(1 for o in outcomes if o.leak),
+        proposals={"scheduled": None, "included": 0, "missed": None},
+        sync=None,
+        balance=snap,
+        rewards_gwei={
+            "source": source,
+            "target": target,
+            "head": head,
+            "inactivity": inactivity,
+            "proposer": proposer_gwei,
+            "sync": sync_gwei,
+            "total": total,
+        },
+        reward_source="rewards_api",
+        estimated_apr=apr,
+        window_epochs=window_epochs,
+        degradations=degs,
+    )
+
 
 # ===== § 15. Reporting =====
 
