@@ -5162,3 +5162,296 @@ def test_every_null_metric_has_a_matching_degradation_entry(vp, capsys):
                         reasons,
                     )
 
+
+# ----- VP-3a: §11 proposer duties — four failure codes (RD-3, P0-7) -----
+
+
+def _duty_error(vp, name, status):
+    item = raw_response(vp, name, status=status)
+    # 500 retries once; 503 retries up to _MAX_ATTEMPTS; 400/404 are semantic.
+    n = 3 if status == 503 else (2 if status == 500 else 1)
+    return [item] * n
+
+
+def _duty_routes(w, response, *, fail_epoch=None, fail=None):
+    routes = {}
+    for epoch in w:
+        path = _PROPOSER_TEMPLATE.format(epoch=epoch)
+        item = fail if fail_epoch is not None and epoch == fail_epoch else response
+        routes[("GET", path)] = list(item) if isinstance(item, list) else [item]
+    return routes
+
+
+def _collect_prop(vp, w, index_set, routes, *, concurrency=4, budget=None, pool=None):
+    transport = FakeTransport(routes)
+    client, _ = _client(vp, transport)
+    if budget is None:
+        budget = vp.RequestBudget()
+    if pool is not None:
+        outcomes, degs, available = vp.collect_proposals(
+            client, w, index_set, pool, budget
+        )
+        return outcomes, degs, available, transport, budget
+    with ThreadPoolExecutor(max_workers=concurrency) as owned:
+        outcomes, degs, available = vp.collect_proposals(
+            client, w, index_set, owned, budget
+        )
+    return outcomes, degs, available, transport, budget
+
+
+def _assert_duties_unavailable(vp, outcomes, degs, available, epoch):
+    assert available is False
+    assert vp._DUTIES_UNAVAILABLE == frozenset({400, 404, 500, 503})
+    assert any(
+        d.reason == "proposer_duties_unavailable" and d.scope == f"epoch:{epoch}"
+        for d in degs
+    )
+    assert not any(d.reason == "state_unavailable" for d in degs)
+    decided = [o.included for series in outcomes.values() for o in series]
+    assert all(flag is None for flag in decided)
+
+
+def test_scheduled_slots_intersected_with_our_index_set(vp, load):
+    payload = load("duties_proposer__ok")
+    rows = payload["data"]
+    assert len(rows) == 32
+    w = _att_window(vp, 100, 100)
+    index_set = {1, 99}
+    ok = raw_response(vp, "duties_proposer__ok")
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, index_set, _duty_routes(w, ok)
+    )
+    assert available is True
+    assert degs == []
+    ours = [o for series in outcomes.values() for o in series]
+    assert {o.validator_index for o in ours} <= index_set
+    assert {o.validator_index for o in ours} == {1}
+    assert len(ours) == 1
+    o = ours[0]
+    assert o.slot == 3200
+    assert o.epoch == 100
+    assert o.included is None
+    assert o.reward_gwei is None
+    assert 99 in outcomes
+    assert outcomes[99] == []
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 1
+    assert gets[0][1] == "GET"
+
+
+def test_teku_503_takes_the_unavailable_path(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__teku_503", 503)
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 3
+    assert all(c[1] == "GET" for c in gets)
+
+
+def test_nimbus_400_takes_the_unavailable_path(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__nimbus_400", 400)
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 1
+
+
+def test_lodestar_500_takes_the_unavailable_path(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__lodestar_500", 500)
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 2
+
+
+def test_404_takes_the_unavailable_path(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__404", 404)
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 1
+
+
+def test_unavailable_duties_null_scheduled_and_missed_but_not_included(vp):
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__404", 404)
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    assert available is False
+    scheduled = None if not available else sum(len(s) for s in outcomes.values())
+    missed = (
+        None
+        if not available
+        else sum(1 for s in outcomes.values() for o in s if o.included is False)
+    )
+    assert scheduled is None
+    assert missed is None
+    assert all(o.included is None for s in outcomes.values() for o in s)
+    assert all(o.included is not False for s in outcomes.values() for o in s)
+    assert not any("included" in d.metric for d in degs)
+    assert not any(d.reason == "block_reward_unavailable" for d in degs)
+
+
+def test_unavailable_duties_emit_proposer_duties_unavailable_and_exit_3(vp, load):
+    w = _att_window(vp, 100, 100)
+    fail = _duty_error(vp, "duties_proposer__404", 404)
+    _outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, _duty_routes(w, fail)
+    )
+    assert available is False
+    assert any(
+        d.reason == "proposer_duties_unavailable" and d.scope == "epoch:100"
+        for d in degs
+    )
+    run = vp.RunReport(
+        _chain_ctx(vp, load),
+        w,
+        [],
+        {},
+        degs,
+        [],
+        vp.EXIT_OK,
+    )
+    assert vp.decide_exit_code(run, _window_opts(vp)) == vp.EXIT_DEGRADED == 3
+    assert vp.EXIT_ERROR == 1
+    assert vp.decide_exit_code(run, _window_opts(vp)) != vp.EXIT_ERROR
+
+
+def test_one_duties_request_per_epoch(vp):
+    w = _att_window(vp, 100, 131)
+    assert w.epochs == 32
+    index_set = set(range(1, 201))
+    ok = raw_response(vp, "duties_proposer__ok")
+    _outcomes, _degs, available, transport, _budget = _collect_prop(
+        vp, w, index_set, _duty_routes(w, ok)
+    )
+    assert available is True
+    gets = [
+        c
+        for c in transport.calls
+        if c[1] == "GET" and "duties/proposer/" in c[2]
+    ]
+    assert len(gets) == 32
+    assert {c[2] for c in gets} == {
+        _PROPOSER_TEMPLATE.format(epoch=e) for e in w
+    }
+    assert not any(c[1] == "POST" for c in transport.calls)
+    src = inspect.getsource(vp.collect_proposals)
+    assert "as_completed" in src
+
+
+def test_duties_500_is_not_treated_as_a_rewards_retention_miss(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    index_set = set(range(1, 201))
+    fail = _duty_error(vp, "duties_proposer__lodestar_500", 500)
+    outcomes, degs, available, transport, budget = _collect_prop(
+        vp, w, index_set, _duty_routes(w, fail)
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 2
+    assert all(c[1] == "GET" for c in gets)
+    assert not any(c[1] == "POST" for c in transport.calls)
+    assert not any("rewards/" in c[2] for c in transport.calls)
+    assert budget.extra == 0
+    assert budget.flagged is False
+    src = inspect.getsource(vp.collect_proposals)
+    assert "retry_500" not in src
+    assert "_fetch_epoch_rewards" not in src
+    assert "state_unavailable" not in src
+    assert "retry_500=True" not in inspect.getsource(
+        vp.BeaconClient.proposer_duties
+    )
+
+
+def test_duties_transport_error_takes_the_unavailable_path(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    path = _PROPOSER_TEMPLATE.format(epoch=100)
+    routes = {("GET", path): [_boom(TimeoutError("timed out"))] * 3}
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    assert any(d.detail == "transport" for d in degs)
+    assert len(transport.calls) == 3
+
+
+def test_unknown_duties_status_fails_closed_as_unavailable(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    w = _att_window(vp, 100, 100)
+    path = _PROPOSER_TEMPLATE.format(epoch=100)
+    routes = {("GET", path): [_raw(vp, 418)]}
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    assert any(d.detail == "HTTP 418" for d in degs)
+    assert len(transport.calls) == 1
+
+
+def test_duties_non_list_data_takes_the_unavailable_path(vp):
+    w = _att_window(vp, 100, 100)
+    path = _PROPOSER_TEMPLATE.format(epoch=100)
+    routes = {("GET", path): [_raw(vp, 200, b'{"data": null}')]}
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    _assert_duties_unavailable(vp, outcomes, degs, available, 100)
+    assert sum(len(s) for s in outcomes.values()) == 0
+
+
+def test_duties_dedup_cap_and_drop_slots_outside_epoch(vp):
+    w = _att_window(vp, 100, 100)
+    assert w.end_slot - w.start_slot == 32
+    rows = [
+        {"pubkey": PK1, "validator_index": "1", "slot": "3200"},
+        {"pubkey": PK1, "validator_index": "1", "slot": "3200"},
+        {"pubkey": PK1, "validator_index": "1", "slot": "3199"},
+        {"pubkey": PK1, "validator_index": "1", "slot": "3232"},
+        {"pubkey": PK1, "validator_index": "1", "slot": "3201"},
+    ]
+    rows.extend(
+        {
+            "pubkey": PK1,
+            "validator_index": "1",
+            "slot": str(3200 + i),
+        }
+        for i in range(40)
+    )
+    path = _PROPOSER_TEMPLATE.format(epoch=100)
+    body = json.dumps({"data": rows}).encode()
+    routes = {("GET", path): [_raw(vp, 200, body)]}
+    outcomes, degs, available, _transport, _budget = _collect_prop(
+        vp, w, {1}, routes
+    )
+    assert available is True
+    assert degs == []
+    slots = [o.slot for o in outcomes[1]]
+    assert slots == sorted(set(slots))
+    assert 3199 not in slots
+    assert 3232 not in slots
+    assert 3200 in slots
+    assert 3201 in slots
+    assert all(3200 <= slot < 3232 for slot in slots)
+    assert len(slots) <= 32
+    assert len(slots) == 32
+

@@ -1369,6 +1369,120 @@ def collect_attestations(
 
 # ===== § 11. Proposals — M7 and M9's proposer component =====
 
+# Lighthouse/Prysm/Grandine 404; Teku 503; Nimbus 400 (PrunedStateError); Lodestar 500.
+_DUTIES_UNAVAILABLE = frozenset({400, 404, 500, 503})
+
+
+@dataclass(frozen=True)
+class ProposalOutcome:
+    slot: int
+    epoch: int
+    validator_index: int
+    included: bool | None
+    reward_gwei: int | None
+
+
+def _proposal_from_duty(
+    row: object, epoch: int, index_set: set[int]
+) -> ProposalOutcome | None:
+    if not isinstance(row, dict):
+        return None
+    try:
+        idx = parse_uint(row.get("validator_index"), "validator_index")
+        slot = parse_uint(row.get("slot"), "slot")
+    except UsageError:
+        return None
+    if idx not in index_set:
+        return None
+    return ProposalOutcome(slot, epoch, idx, None, None)
+
+
+def _window_slots_per_epoch(w: Window) -> int | None:
+    n = w.epochs
+    delta = w.end_slot - w.start_slot
+    if n <= 0 or delta <= 0 or delta % n:
+        return None
+    spe = delta // n
+    return spe if spe >= 1 else None
+
+
+def _duties_for_epoch(
+    rows: list,
+    epoch: int,
+    index_set: set[int],
+    spe: int | None,
+) -> list[ProposalOutcome]:
+    slot_lo = epoch * spe if spe is not None else None
+    slot_hi = slot_lo + spe if slot_lo is not None and spe is not None else None
+    cap = spe
+    seen: set[int] = set()
+    hits: list[ProposalOutcome] = []
+    for row in rows:
+        outcome = _proposal_from_duty(row, epoch, index_set)
+        if outcome is None:
+            continue
+        if slot_lo is not None and slot_hi is not None and not (
+            slot_lo <= outcome.slot < slot_hi
+        ):
+            continue
+        if outcome.slot in seen:
+            continue
+        if cap is not None and len(hits) >= cap:
+            break
+        seen.add(outcome.slot)
+        hits.append(outcome)
+    return hits
+
+
+def collect_proposals(
+    client: BeaconClient,
+    w: Window,
+    index_set: set[int],
+    pool,
+    budget,
+) -> tuple[dict[int, list[ProposalOutcome]], list[Degradation], bool]:
+    degs: list[Degradation] = []
+    out: dict[int, list[ProposalOutcome]] = {idx: [] for idx in index_set}
+    available = True
+    spe = _window_slots_per_epoch(w)
+    template = "/eth/v1/validator/duties/proposer/{epoch}"
+
+    def worker(epoch: int) -> list[ProposalOutcome]:
+        rows = client.proposer_duties(epoch)
+        if not isinstance(rows, list):
+            # Empty-list would report scheduled=0 with no degradation.
+            raise BeaconStatus(200, template, client._endpoint().label)
+        return _duties_for_epoch(rows, epoch, index_set, spe)
+
+    futs = {pool.submit(worker, epoch): epoch for epoch in w}
+    for fut in as_completed(futs):
+        epoch = futs[fut]
+        try:
+            hits = fut.result()
+        except (BeaconStatus, BeaconTransport) as exc:
+            # Transport and unknown codes abort as exit 1/5 if left uncaught.
+            available = False
+            detail = (
+                f"HTTP {exc.status}"
+                if isinstance(exc, BeaconStatus)
+                else "transport"
+            )
+            degs.append(
+                Degradation(
+                    "proposals",
+                    f"epoch:{epoch}",
+                    "proposer_duties_unavailable",
+                    detail,
+                )
+            )
+            continue
+        for outcome in hits:
+            out.setdefault(outcome.validator_index, []).append(outcome)
+    for series in out.values():
+        series.sort(key=lambda o: o.slot)
+    return out, degs, available
+
+
 # ===== § 12. Sync committee — M8 =====
 
 # ===== § 13. Balances and effective balance =====
