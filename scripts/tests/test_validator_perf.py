@@ -3238,7 +3238,6 @@ def test_main_body_has_no_metric_logic():
         "rewards_gwei",
         "inactivity_gwei",
         "consensus_reward",
-        "collect_attestations",
         "evaluate_epoch",
         "BALANCE_TOLERANCE",
     ):
@@ -3250,9 +3249,17 @@ def test_main_body_has_no_metric_logic():
         "resolve_window",
         "resolve_validators",
         "probe_rewards_api",
+        "collect_attestations",
+        "collect_balances",
+        "build_validator_report",
+        "build_aggregate",
+        "decide_exit_code",
+        "render_json",
+        "render_table",
         "_render_dry_run",
         "replace(",
         "ThreadPoolExecutor",
+        "RequestBudget",
         "opts.concurrency",
         "shutdown",
     ):
@@ -3263,6 +3270,13 @@ def test_main_body_has_no_metric_logic():
         "resolve_window",
         "resolve_validators",
         "probe_rewards_api",
+        "collect_attestations",
+        "collect_balances",
+        "build_validator_report",
+        "build_aggregate",
+        "decide_exit_code",
+        "render_json",
+        "render_table",
     ]
     positions = [body.index(name) for name in order]
     assert positions == sorted(positions)
@@ -4820,4 +4834,331 @@ def test_gwei_emitted_as_numbers_not_strings(vp, load):
     reward = doc["aggregate"]["consensus_reward_gwei"]
     if reward is not None:
         assert type(reward) is int
+
+
+# ----- VP-2i: §14 decide_exit_code + §16 full-run wiring (P0-11, P0-12) -----
+
+_FULL_FROM = 98
+_FULL_TO = 98
+_PHASE2_NULL_REASONS = frozenset(
+    {
+        "inactivity_leak",
+        "ideal_row_missing",
+        "effective_balance_zero",
+        "state_unavailable",
+    }
+)
+_NULL_RATE_FIELDS = (
+    "source_rate",
+    "target_rate",
+    "head_rate",
+    "attester_effectiveness",
+)
+
+
+def _full_argv(*extra, url="https://bn.example:5052", pubkeys=(PK1,)):
+    argv: list[str] = []
+    for pk in pubkeys:
+        argv.extend(["--pubkey", pk])
+    argv.extend(
+        [
+            "--beacon-url",
+            url,
+            "--from-epoch",
+            str(_FULL_FROM),
+            "--to-epoch",
+            str(_FULL_TO),
+            "--concurrency",
+            "1",
+            *extra,
+        ]
+    )
+    return argv
+
+
+def _full_run_routes(
+    vp,
+    *,
+    rewards=None,
+    validators="states_validators__basic",
+    start="states_validators__snapshot_start",
+    end="states_validators__snapshot_end",
+    fail_collect=False,
+):
+    routes = _dry_run_routes(vp, probe="probe__state_unavailable")
+    pair = json.loads((FIXTURES / "probe__state_unavailable.json").read_text())
+    routes[("GET", _BLOCKS_HEAD_PATH)] = [_raw_from_probe_leg(vp, pair["blocks"])]
+    routes[("POST", _DRY_RUN_ATT_PATH)] = [_att_ok(vp, indices=(1,))]
+    routes[("POST", _VALIDATORS_PATH)] = [raw_response(vp, validators)]
+    collect_path = _REWARDS_TEMPLATE.format(epoch=_FULL_FROM)
+    if fail_collect:
+        routes[("POST", collect_path)] = [_raw(vp, 404)]
+    elif rewards is not None:
+        routes[("POST", collect_path)] = [raw_response(vp, rewards)]
+    else:
+        routes[("POST", collect_path)] = [_att_ok(vp, indices=(1,))]
+    spe = 32
+    routes[("POST", _validators_at((_FULL_FROM + 1) * spe))] = [
+        raw_response(vp, start)
+    ]
+    routes[("POST", _validators_at((_FULL_TO + 2) * spe))] = [
+        raw_response(vp, end)
+    ]
+    return routes
+
+
+def _run_full(
+    vp,
+    *extra,
+    routes=None,
+    url="https://bn.example:5052",
+    pubkeys=None,
+    **route_kw,
+):
+    argv_kw: dict = {"url": url}
+    if pubkeys is not None:
+        argv_kw["pubkeys"] = pubkeys
+    transport = FakeTransport(routes or _full_run_routes(vp, **route_kw))
+    code = vp.main(_full_argv(*extra, **argv_kw), transport=transport)
+    return code, transport
+
+
+def _stdout_json(capsys):
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    doc = json.loads(captured.out)
+    _, end = json.JSONDecoder().raw_decode(captured.out.lstrip())
+    assert captured.out[end:].strip() == ""
+    return doc, captured
+
+
+def test_exit_0_on_a_fully_available_run(vp, capsys):
+    code, transport = _run_full(vp, "--json")
+    assert code == vp.EXIT_OK == 0
+    doc, captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 0
+    assert doc["degradations"] == []
+    assert "DEGRADED:" not in captured.out
+    att = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "rewards/attestations/" in c[2]
+    ]
+    assert any(
+        c[2] == _REWARDS_TEMPLATE.format(epoch=_FULL_FROM) for c in att
+    )
+    snaps = [
+        c
+        for c in transport.calls
+        if c[1] == "POST" and "/states/" in c[2] and c[2] != _VALIDATORS_PATH
+    ]
+    assert len(snaps) == 2
+
+
+def test_exit_2_on_a_usage_error(vp, capsys):
+    test_usage_error_exits_2(vp, capsys)
+
+
+def test_exit_3_on_a_leak_epoch(vp, capsys):
+    code, _transport = _run_full(
+        vp, "--json", rewards="rewards_attestations__leak"
+    )
+    assert code == vp.EXIT_DEGRADED == 3
+    assert code != vp.EXIT_OK
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 3
+    assert any(d["reason"] == "inactivity_leak" for d in doc["degradations"])
+    row = doc["validators"][0]
+    assert row["head_rate"] is None
+    assert row["source_rate"] is not None
+    assert row["target_rate"] is not None
+
+
+def test_exit_3_on_a_missing_ideal_row(vp, capsys):
+    code, _transport = _run_full(
+        vp, "--json", rewards="rewards_attestations__ideal_filtered"
+    )
+    assert code == vp.EXIT_DEGRADED == 3
+    doc, _captured = _stdout_json(capsys)
+    assert any(d["reason"] == "ideal_row_missing" for d in doc["degradations"])
+    assert doc["validators"][0]["attester_effectiveness"] is None
+
+
+def test_exit_3_on_an_eb_zero_key(vp, capsys):
+    code, _transport = _run_full(
+        vp, "--json", validators="states_validators__eb_zero"
+    )
+    assert code == vp.EXIT_DEGRADED == 3
+    doc, _captured = _stdout_json(capsys)
+    assert any(
+        d["reason"] == "effective_balance_zero" for d in doc["degradations"]
+    )
+    row = doc["validators"][0]
+    assert row["source_rate"] is None
+    assert row["target_rate"] is None
+    assert row["head_rate"] is None
+    assert row["attester_effectiveness"] is None
+
+
+def test_exit_3_on_an_unknown_pubkey(vp, capsys):
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        validators="states_validators__unknown_pubkey",
+        pubkeys=(PK4,),
+    )
+    assert code == vp.EXIT_DEGRADED == 3
+    assert code not in (vp.EXIT_ERROR, vp.EXIT_NO_BEACON)
+    doc, _captured = _stdout_json(capsys)
+    assert len(doc["validators"]) == 1
+    row = doc["validators"][0]
+    assert row["index"] is None
+    assert row["status"] == "unknown"
+    assert any(d["reason"] == "state_unavailable" for d in row["degradations"])
+    assert any(d["reason"] == "state_unavailable" for d in doc["degradations"])
+
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        validators="states_validators__unknown_pubkey",
+        pubkeys=(PK1, PK4),
+    )
+    assert code == vp.EXIT_DEGRADED == 3
+    assert code not in (vp.EXIT_ERROR, vp.EXIT_NO_BEACON)
+    doc, _captured = _stdout_json(capsys)
+    by_pk = {v["pubkey"]: v for v in doc["validators"]}
+    assert set(by_pk) == {PK1, PK4}
+    assert by_pk[PK1]["index"] == 1
+    assert by_pk[PK1]["source_rate"] is not None
+    unknown = by_pk[PK4]
+    assert unknown["index"] is None
+    assert unknown["status"] == "unknown"
+    assert any(
+        d["reason"] == "state_unavailable" for d in unknown["degradations"]
+    )
+
+
+def test_exit_5_when_no_beacon_is_reachable(vp, capsys):
+    transport = FakeTransport({("GET", _VERSION_TEMPLATE): [_raw(vp, 404)]})
+    code = vp.main(_full_argv(), transport=transport)
+    assert code == vp.EXIT_NO_BEACON == 5
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.out
+    assert captured.err.strip() != ""
+
+
+def test_exit_1_on_an_unhandled_exception(vp, capsys, monkeypatch):
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("except Exception") == 1
+
+    def boom(*_a, **_k):
+        raise RuntimeError("metric boom")
+
+    monkeypatch.setattr(vp, "collect_attestations", boom)
+    code, _transport = _run_full(vp, "--json")
+    assert code == vp.EXIT_ERROR == 1
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out
+    out = captured.out.strip()
+    if out:
+        json.loads(out)
+    assert "metric boom" in captured.err
+
+
+def test_degraded_ok_maps_3_to_0(vp, capsys):
+    code, _transport = _run_full(
+        vp,
+        "--json",
+        "--degraded-ok",
+        rewards="rewards_attestations__leak",
+    )
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 0
+    assert any(d["reason"] == "inactivity_leak" for d in doc["degradations"])
+
+
+def test_diverged_balance_does_not_degrade(vp, capsys):
+    code, _transport = _run_full(
+        vp, "--json", end="balances__diverged"
+    )
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    assert doc["exit_code"] == 0
+    assert doc["degradations"] == []
+    rec = doc["validators"][0]["balance"]["reconciliation"]
+    assert rec == "diverged"
+    assert not any(d.get("reason") == "diverged" for d in doc["degradations"])
+
+
+def test_full_run_leaks_no_secret_in_stdout_or_stderr(vp, capsys):
+    code, _transport = _run_full(vp, "-v", "--json", url=_SECRET_URL)
+    assert code == vp.EXIT_OK == 0
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+    json.loads(captured.out)
+    assert "https://bn.example:5052" in captured.err
+
+
+def _phase2_reasons_for_row(row, run_degs):
+    reasons = {d["reason"] for d in row.get("degradations") or []}
+    index = row.get("index")
+    unknown = index is None or row.get("status") == "unknown"
+    for d in run_degs:
+        scope = d.get("scope") or ""
+        if index is not None and scope == f"validator:{index}":
+            reasons.add(d["reason"])
+        elif unknown and scope == "validator:unknown":
+            if not d.get("detail") or d["detail"] == row.get("pubkey"):
+                reasons.add(d["reason"])
+        elif not unknown and (
+            scope == "run" or scope.startswith("epoch:")
+        ):
+            reasons.add(d["reason"])
+    return reasons
+
+
+def test_every_null_metric_has_a_matching_degradation_entry(vp, capsys):
+    scenarios = (
+        {"rewards": "rewards_attestations__leak"},
+        {"rewards": "rewards_attestations__ideal_filtered"},
+        {"validators": "states_validators__eb_zero"},
+        {"fail_collect": True},
+        {
+            "validators": "states_validators__unknown_pubkey",
+            "pubkeys": (PK4,),
+        },
+        {
+            "validators": "states_validators__unknown_pubkey",
+            "pubkeys": (PK1, PK4),
+        },
+    )
+    for kw in scenarios:
+        pubkeys = kw.get("pubkeys")
+        route_kw = {k: v for k, v in kw.items() if k != "pubkeys"}
+        extra = {} if pubkeys is None else {"pubkeys": pubkeys}
+        code, _transport = _run_full(vp, "--json", **extra, **route_kw)
+        assert code == vp.EXIT_DEGRADED == 3
+        doc, _captured = _stdout_json(capsys)
+        run_degs = list(doc["degradations"])
+        for row in doc["validators"]:
+            reasons = _phase2_reasons_for_row(row, run_degs)
+            unknown = row.get("index") is None or row.get("status") == "unknown"
+            # R9: a known validator with zero active epochs is a fact, not a deg.
+            r9 = (
+                not unknown
+                and row.get("active_epochs") == 0
+                and not (reasons & _PHASE2_NULL_REASONS)
+            )
+            for field in _NULL_RATE_FIELDS:
+                if row.get(field) is None and not r9:
+                    assert reasons & _PHASE2_NULL_REASONS, (
+                        kw,
+                        field,
+                        row.get("pubkey"),
+                        reasons,
+                    )
 

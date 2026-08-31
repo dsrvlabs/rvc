@@ -1550,6 +1550,16 @@ def build_validator_report(
     sync_gwei: int = 0,
 ) -> ValidatorReport:
     degs = list(degradations or ())
+    # Unknown to the BN is state_unavailable (exit 3), not R9's known zero-active.
+    if ref.index is None or ref.status == "unknown":
+        degs.append(
+            Degradation(
+                "attestation",
+                "validator:unknown",
+                "state_unavailable",
+                ref.pubkey,
+            )
+        )
     n_active = len(outcomes)
     n_head = sum(1 for o in outcomes if o.head_credited is not None)
     m6_actual = 0
@@ -1695,6 +1705,12 @@ class RunReport:
     degradations: list[Degradation]
     endpoints_used: list[str]
     exit_code: int
+
+
+def decide_exit_code(run: RunReport, opts: Options) -> int:
+    # D8: completed runs are 4 > 3 > 0; 4 is VP-4c. --degraded-ok maps 3 → 0 only.
+    code = EXIT_DEGRADED if run.degradations else EXIT_OK
+    return EXIT_OK if opts.degraded_ok and code == EXIT_DEGRADED else code
 
 
 # ===== § 15. Reporting =====
@@ -1949,6 +1965,7 @@ def main(
         if active is None:
             active = HttpTransport(opts.connect_timeout, opts.read_timeout)
         pool = ThreadPoolExecutor(max_workers=opts.concurrency)
+        budget = RequestBudget()
         client = BeaconClient(
             list(opts.endpoints),
             active,
@@ -1966,7 +1983,44 @@ def main(
         if opts.dry_run:
             endpoint = client.endpoints_used[-1] if client.endpoints_used else ""
             _render_dry_run(ctx, window, refs, log, endpoint)
-        return EXIT_OK
+            return EXIT_OK
+        outcomes, att_degs = collect_attestations(
+            client, window, refs, pool, budget
+        )
+        snaps, bal_degs = collect_balances(client, window, refs)
+        empty_snap = BalanceSnapshot(None, None, None, None)
+        reports: list[ValidatorReport] = []
+        report_degs: list[Degradation] = []
+        for ref in refs:
+            snap = (
+                snaps.get(ref.index, empty_snap)
+                if ref.index is not None
+                else empty_snap
+            )
+            series = (
+                outcomes.get(ref.index, []) if ref.index is not None else []
+            )
+            report = build_validator_report(
+                ref, series, snap, ctx.spec, window
+            )
+            reports.append(report)
+            report_degs.extend(report.degradations)
+        run = RunReport(
+            ctx,
+            window,
+            reports,
+            build_aggregate(reports, ctx.spec),
+            att_degs + bal_degs + report_degs,
+            client.endpoints_used,
+            EXIT_OK,
+        )
+        code = decide_exit_code(run, opts)
+        run = replace(run, exit_code=code)
+        if opts.json:
+            print(render_json(run))
+        else:
+            render_table(run, sys.stdout)
+        return code
     except UsageError as exc:
         log.error("%s", exc)
         return EXIT_USAGE
