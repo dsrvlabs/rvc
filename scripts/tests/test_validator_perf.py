@@ -119,3 +119,41 @@ def test_endpoint_repr_omits_secrets(vp):
     shown = repr(ep) + str(ep)
     assert "/abc123SECRET" not in shown
     assert "dXNlcjpzZWNyZXQ=" not in shown
+
+
+def test_parse_uint_rejects_underscored_and_padded(vp):
+    field = "effective_balance"
+    for raw in ("1_000", " 42 ", "+7", "", "0x2a", None, 42):
+        with pytest.raises((vp.UsageError, ValueError)) as ei:
+            vp.parse_uint(raw, field)
+        assert field in str(ei.value)
+
+
+def test_parse_int_accepts_signed_quoted_gwei(vp):
+    assert vp.parse_int("-100", "head") == -100
+    assert vp.parse_int("0", "head") == 0
+    assert vp.parse_int("1834000", "head") == 1834000
+    for raw in ("-", "--1"):
+        with pytest.raises((vp.UsageError, ValueError)) as ei:
+            vp.parse_int(raw, "head")
+        assert "head" in str(ei.value)
+
+
+def test_opt_int_returns_none_for_absent_key(vp):
+    absent = vp.opt_int({}, "inclusion_delay")
+    present_zero = vp.opt_int({"inclusion_delay": "0"}, "inclusion_delay")
+    assert absent is None
+    assert present_zero == 0
+    assert absent != present_zero
+
+
+def test_normalize_pubkey_adds_prefix_and_lowercases(vp):
+    raw = "AB" * 48
+    assert vp.normalize_pubkey(raw, "keys.txt:1") == "0x" + "ab" * 48
+
+
+def test_normalize_pubkey_rejects_47_bytes_naming_origin(vp):
+    origin = "keys.txt:4"
+    with pytest.raises(vp.UsageError) as ei:
+        vp.normalize_pubkey("ab" * 47, origin)
+    assert origin in str(ei.value)

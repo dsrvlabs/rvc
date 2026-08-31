@@ -6,6 +6,7 @@
 """Estimate consensus-layer performance of a validator set from the Beacon API."""
 
 import argparse
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -70,6 +71,41 @@ class Log:
 
 
 # ===== § 3. Parsing and redaction primitives =====
+
+_UINT = re.compile(r"[0-9]+")
+_INT = re.compile(r"-?[0-9]+")
+
+
+def _parse_num(pattern: re.Pattern[str], raw: object, field: str) -> int:
+    if not isinstance(raw, str) or pattern.fullmatch(raw) is None:
+        raise UsageError(f"invalid {field}: {raw!r}")
+    return int(raw)
+
+
+def parse_uint(raw: object, field: str) -> int:
+    return _parse_num(_UINT, raw, field)
+
+
+def parse_int(raw: object, field: str) -> int:
+    return _parse_num(_INT, raw, field)
+
+
+def opt_int(raw: object, field: str) -> int | None:
+    if isinstance(raw, dict):
+        if field not in raw:
+            return None
+        raw = raw[field]
+    return parse_int(raw, field)
+
+
+def normalize_pubkey(raw: str, origin: str) -> str:
+    text = raw.lower() if isinstance(raw, str) else ""
+    if text.startswith("0x"):
+        text = text[2:]
+    if re.fullmatch(r"[0-9a-f]{96}", text) is None:
+        raise UsageError(f"{origin}: pubkey must be 48-byte hex")
+    return "0x" + text
+
 
 # ===== § 4. CLI and configuration =====
 
