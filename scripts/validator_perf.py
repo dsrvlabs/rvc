@@ -887,6 +887,43 @@ def load_chain_context(client: BeaconClient) -> ChainContext:
     )
 
 
+_PROBE_VERDICT = {
+    (True, True): "available",
+    (True, False): "state_unavailable",
+    (False, True): "available",
+    (False, False): "route_absent",
+}
+
+
+def probe_rewards_api(
+    client: BeaconClient, head_epoch: int, ids: Sequence[str]
+) -> str:
+    try:
+        blocks = client.rewards_block("head")
+    except BeaconStatus as exc:
+        blocks_ok, blocks_404 = 200 <= exc.status < 300, exc.status == 404
+    else:
+        # rewards_block maps 404 → None; that None is the 404 column, not 2xx.
+        blocks_ok, blocks_404 = (False, True) if blocks is None else (True, False)
+    id_list = list(ids)
+    if not id_list:
+        # POST [] is the unfiltered rewards form on some clients; classify from GET.
+        att_ok, att_404 = False, True
+    else:
+        try:
+            att = client.rewards_attestations(head_epoch - 2, id_list)
+        except BeaconStatus as exc:
+            att_ok, att_404 = 200 <= exc.status < 300, exc.status == 404
+        else:
+            # Teku 204 unwraps to None; store-not-ready is not a 2xx success.
+            att_ok, att_404 = (False, True) if att is None else (True, False)
+    verdict = _PROBE_VERDICT[(blocks_ok, att_ok)]
+    # 500/400 are not 2xx, so the 4-row table would say route_absent; fold them.
+    if verdict == "route_absent" and not (blocks_404 and att_404):
+        return "state_unavailable"
+    return verdict
+
+
 # ===== § 8. Window resolution =====
 
 

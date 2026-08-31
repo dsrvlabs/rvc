@@ -2053,3 +2053,223 @@ def test_state_id_is_head(vp):
     assert path == _VALIDATORS_PATH
     assert re.search(r"/states/\d+/validators", path) is None
     assert json.loads(body) == {"ids": [PK1, PK2, PK3]}
+
+
+# ----- VP-1m: §7 probe_rewards_api -----
+
+_BLOCKS_HEAD_PATH = "/eth/v1/beacon/rewards/blocks/head"
+
+
+def _status_queue(vp, status, body=None):
+    if body is None:
+        body = b'{"data": {}}' if 200 <= status < 300 else b"{}"
+    # Rewards 500 retries once (RD-9); script the second response too.
+    if status == 500:
+        return [_raw(vp, 500, body), _raw(vp, 500, body)]
+    return [_raw(vp, status, body)]
+
+
+def _probe_transport(vp, *, blocks, att, head_epoch=100, extra=None):
+    att_path = _REWARDS_TEMPLATE.format(epoch=head_epoch - 2)
+    routes = {
+        ("GET", _BLOCKS_HEAD_PATH): _status_queue(vp, blocks),
+        ("POST", att_path): _status_queue(vp, att),
+    }
+    if extra:
+        routes.update(extra)
+    return FakeTransport(routes), att_path
+
+
+def _run_probe(vp, *, blocks, att, head_epoch=100, ids=("1",), extra=None):
+    transport, _ = _probe_transport(
+        vp, blocks=blocks, att=att, head_epoch=head_epoch, extra=extra
+    )
+    client, _ = _client(vp, transport)
+    verdict = vp.probe_rewards_api(client, head_epoch, list(ids))
+    return verdict, transport
+
+
+def _raw_from_probe_leg(vp, leg):
+    return _raw(vp, leg["status"], json.dumps(leg["body"]).encode())
+
+
+def _run_probe_fixture(vp, load, name, *, head_epoch=100, ids=("1",)):
+    pair = load(name)
+    att_path = _REWARDS_TEMPLATE.format(epoch=head_epoch - 2)
+    transport = FakeTransport(
+        {
+            ("GET", _BLOCKS_HEAD_PATH): [_raw_from_probe_leg(vp, pair["blocks"])],
+            ("POST", att_path): [_raw_from_probe_leg(vp, pair["attestations"])],
+        }
+    )
+    client, _ = _client(vp, transport)
+    verdict = vp.probe_rewards_api(client, head_epoch, list(ids))
+    return verdict, transport
+
+
+def test_probe_404_and_404_is_route_absent(vp, load):
+    pair = load("probe__route_absent")
+    assert pair["blocks"]["status"] == 404
+    assert pair["attestations"]["status"] == 404
+    verdict, transport = _run_probe_fixture(vp, load, "probe__route_absent")
+    assert verdict == "route_absent"
+    assert len(transport.calls) == 2
+
+
+def test_probe_200_and_404_is_state_unavailable(vp, load):
+    pair = load("probe__state_unavailable")
+    assert pair["blocks"]["status"] == 200
+    assert pair["attestations"]["status"] == 404
+    verdict, transport = _run_probe_fixture(vp, load, "probe__state_unavailable")
+    assert verdict == "state_unavailable"
+    assert len(transport.calls) == 2
+
+
+def test_probe_200_and_200_is_available(vp):
+    verdict, _ = _run_probe(vp, blocks=200, att=200)
+    assert verdict == "available"
+
+
+def test_probe_404_blocks_but_200_attestations_is_available(vp):
+    verdict, _ = _run_probe(vp, blocks=404, att=200)
+    assert verdict == "available"
+
+
+def test_probe_500_and_400_fold_into_state_unavailable(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    # Lodestar 500 / Nimbus 400 on attestations, even when blocks is 2xx.
+    lodestar, _ = _run_probe(vp, blocks=200, att=500)
+    nimbus, _ = _run_probe(vp, blocks=200, att=400)
+    assert lodestar == "state_unavailable"
+    assert nimbus == "state_unavailable"
+    # Non-2xx + non-2xx must not collapse to route_absent (the 4-row 2xx table trap).
+    both_miss, _ = _run_probe(vp, blocks=404, att=500)
+    nimbus_absent, _ = _run_probe(vp, blocks=404, att=400)
+    assert both_miss == "state_unavailable"
+    assert nimbus_absent == "state_unavailable"
+
+
+def test_probe_issues_exactly_two_requests(vp):
+    verdict, transport = _run_probe(vp, blocks=200, att=200, ids=("1",))
+    assert verdict == "available"
+    assert len(transport.calls) == 2
+    assert [c[1] for c in transport.calls] == ["GET", "POST"]
+    assert transport.calls[0][2] == _BLOCKS_HEAD_PATH
+    assert json.loads(transport.calls[1][3]) == ["1"]
+
+
+def test_probe_empty_ids_skips_attestations_post(vp):
+    # POST [] is the unfiltered rewards form; do not script a POST so a call fails.
+    for blocks, expected in ((200, "state_unavailable"), (404, "route_absent")):
+        transport = FakeTransport(
+            {("GET", _BLOCKS_HEAD_PATH): _status_queue(vp, blocks)}
+        )
+        client, _ = _client(vp, transport)
+        verdict = vp.probe_rewards_api(client, 100, [])
+        assert verdict == expected
+        assert len(transport.calls) == 1
+        assert transport.calls[0][1] == "GET"
+        assert transport.calls[0][2] == _BLOCKS_HEAD_PATH
+        assert transport.calls[0][3] is None
+        assert not any(c[1] == "POST" for c in transport.calls)
+        assert not any(c[3] == b"[]" for c in transport.calls)
+
+
+def test_probe_attestations_204_is_not_2xx(vp):
+    # Teku 204 (store not ready) unwraps to None; that is not a 2xx success.
+    unavailable, t_ok = _run_probe(vp, blocks=200, att=204)
+    assert unavailable == "state_unavailable"
+    assert t_ok.calls[1][1] == "POST"
+    absent, t_404 = _run_probe(vp, blocks=404, att=204)
+    assert absent == "route_absent"
+    assert t_404.calls[1][1] == "POST"
+
+
+def test_probe_body_carries_a_resolved_eb_nonzero_index(vp):
+    payload = {
+        "data": [
+            {
+                "index": "10",
+                "balance": "0",
+                "status": "pending_initialized",
+                "validator": {
+                    "pubkey": PK1,
+                    "withdrawal_credentials": "0x" + "00" * 32,
+                    "effective_balance": "0",
+                    "slashed": False,
+                    "activation_eligibility_epoch": "0",
+                    "activation_epoch": str(_FAR_FUTURE_EPOCH),
+                    "exit_epoch": str(_FAR_FUTURE_EPOCH),
+                    "withdrawable_epoch": str(_FAR_FUTURE_EPOCH),
+                },
+            },
+            {
+                "index": "20",
+                "balance": "32000000000",
+                "status": "active_ongoing",
+                "validator": {
+                    "pubkey": PK2,
+                    "withdrawal_credentials": "0x" + "00" * 32,
+                    "effective_balance": "32000000000",
+                    "slashed": False,
+                    "activation_eligibility_epoch": "0",
+                    "activation_epoch": "0",
+                    "exit_epoch": str(_FAR_FUTURE_EPOCH),
+                    "withdrawable_epoch": str(_FAR_FUTURE_EPOCH),
+                },
+            },
+        ]
+    }
+    head_epoch = 100
+    att_path = _REWARDS_TEMPLATE.format(epoch=head_epoch - 2)
+    transport = FakeTransport(
+        {
+            ("POST", _VALIDATORS_PATH): [
+                _raw(vp, 200, json.dumps(payload).encode())
+            ],
+            ("GET", _BLOCKS_HEAD_PATH): _status_queue(vp, 200),
+            ("POST", att_path): _status_queue(vp, 200),
+        }
+    )
+    client, _ = _client(vp, transport)
+    refs = vp.resolve_validators(client, [PK1, PK2])
+    assert refs[0].rewards_eligible is False
+    assert refs[1].rewards_eligible is True
+    ids = [str(r.index) for r in refs if r.rewards_eligible]
+    assert ids == ["20"]
+    verdict = vp.probe_rewards_api(client, head_epoch, ids)
+    assert verdict == "available"
+    rewards_calls = [c for c in transport.calls if "rewards" in c[2]]
+    assert len(rewards_calls) == 2
+    body = json.loads(rewards_calls[1][3])
+    assert body == ["20"]
+    assert "10" not in body
+
+
+def test_probe_uses_head_minus_two(vp):
+    head_epoch = 101
+    verdict, transport = _run_probe(vp, blocks=200, att=200, head_epoch=head_epoch)
+    assert verdict == "available"
+    assert transport.calls[0][2] == _BLOCKS_HEAD_PATH
+    assert transport.calls[1][2] == _REWARDS_TEMPLATE.format(epoch=99)
+    assert "/100" not in transport.calls[1][2]
+    assert "/101" not in transport.calls[1][2]
+    src = inspect.getsource(vp.probe_rewards_api)
+    assert "head_epoch - 2" in src
+    assert "head_epoch - 1" not in src
+
+
+def test_probe_non_2xx_does_not_raise(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    cases = (
+        (404, 404, "route_absent"),
+        (200, 404, "state_unavailable"),
+        (200, 500, "state_unavailable"),
+        (200, 400, "state_unavailable"),
+        (404, 200, "available"),
+    )
+    for blocks, att, expected in cases:
+        verdict, _ = _run_probe(vp, blocks=blocks, att=att)
+        assert verdict == expected
+        assert verdict in ("available", "route_absent", "state_unavailable")
+
