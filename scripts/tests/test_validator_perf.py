@@ -19,6 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -4562,4 +4563,261 @@ def test_degraded_block_header_present_when_empty(vp, load):
     text = _render_table(vp, run)
     assert "DEGRADED:" in text
     assert text.split("DEGRADED:", 1)[1].strip() == ""
+
+
+# ----- VP-2h: §15 render_json + perf_schema.json + subset walker (D9) -----
+
+PERF_SCHEMA_PATH = Path(__file__).resolve().parent / "perf_schema.json"
+_REASON_ENUM = (
+    "rewards_api_unsupported",
+    "state_unavailable",
+    "inactivity_leak",
+    "proposer_duties_unavailable",
+    "block_reward_unavailable",
+    "ideal_row_missing",
+    "effective_balance_zero",
+    "sync_committees_unavailable",
+    "endpoint_failover",
+)
+
+
+class SchemaMismatch(Exception):
+    pass
+
+
+def _is_json_type(value, name: str) -> bool:
+    if name == "null":
+        return value is None
+    if name == "boolean":
+        return isinstance(value, bool)
+    if name == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if name == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if name == "string":
+        return isinstance(value, str)
+    if name == "array":
+        return isinstance(value, list)
+    if name == "object":
+        return isinstance(value, dict)
+    return False
+
+
+def validate_schema(instance, schema, path="$"):
+    if not isinstance(schema, dict):
+        return
+    expected = schema.get("type")
+    if expected is not None:
+        names = [expected] if isinstance(expected, str) else list(expected)
+        if not any(_is_json_type(instance, name) for name in names):
+            raise SchemaMismatch(
+                f"{path}: expected {'|'.join(names)}, got {type(instance).__name__}"
+            )
+    if "enum" in schema and instance not in schema["enum"]:
+        raise SchemaMismatch(f"{path}: {instance!r} not in enum")
+    if instance is None:
+        # Nullable union already matched; do not apply properties/required/items.
+        return
+    required = schema.get("required")
+    if required:
+        if not isinstance(instance, dict):
+            raise SchemaMismatch(f"{path}: expected object")
+        for key in required:
+            if key not in instance:
+                raise SchemaMismatch(f"{path}: missing required {key}")
+    props = schema.get("properties")
+    if props and isinstance(instance, dict):
+        for key, sub in props.items():
+            if key in instance:
+                validate_schema(instance[key], sub, f"{path}.{key}")
+    items = schema.get("items")
+    if items is not None and isinstance(instance, list):
+        for i, item in enumerate(instance):
+            validate_schema(item, items, f"{path}[{i}]")
+
+
+def _load_perf_schema():
+    return json.loads(PERF_SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _allows_null(node) -> bool:
+    expected = node.get("type")
+    names = [expected] if isinstance(expected, str) else list(expected or [])
+    return "null" in names or None in (node.get("enum") or [])
+
+
+def _json_run(vp, load, *, endpoints_used=None, degradations=None, exit_code=0):
+    ctx = replace(
+        _chain_ctx(vp, load, head_epoch=133, finalized_epoch=131),
+        rewards_api="available",
+        node_version="Lighthouse/v8.2.2",
+        genesis_time=1606824000,
+    )
+    window = _att_window(vp, 100, 131)
+    report = _build_report(
+        vp,
+        load,
+        _active_ref(vp),
+        _n_outcomes(vp, 4, flag_actual_gwei=1_834_000, flag_ideal_gwei=1_834_000),
+        window=window,
+        snap=vp.BalanceSnapshot(
+            _EB_32, _EB_32 + 1_834_000, _EB_32, _EB_32
+        ),
+    )
+    agg = vp.build_aggregate([report], ctx.spec)
+    if endpoints_used is None:
+        endpoints_used = [_SECRET_URL]
+    if degradations is None:
+        degradations = [
+            vp.Degradation("head_rate", "epoch:100", "inactivity_leak", "leak")
+        ]
+    return vp.RunReport(
+        ctx, window, [report], agg, degradations, endpoints_used, exit_code
+    )
+
+
+def _print_json_with_warning(vp, run) -> None:
+    vp.Log(0, sys.stderr).warn("slow bn0")
+    print(vp.render_json(run))
+
+
+def test_json_stdout_is_exactly_one_document(vp, load, capsys):
+    _print_json_with_warning(vp, _json_run(vp, load))
+    captured = capsys.readouterr()
+    json.loads(captured.out)
+    _, end = json.JSONDecoder().raw_decode(captured.out.lstrip())
+    assert captured.out[end:].strip() == ""
+    lines = [ln for ln in captured.out.splitlines() if ln]
+    assert len(lines) == 1
+    assert "slow bn0" in captured.err
+    assert "slow bn0" not in captured.out
+
+
+def test_json_validates_against_perf_schema(vp, load):
+    clock = lambda: datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    doc = json.loads(vp.render_json(_json_run(vp, load), clock=clock))
+    validate_schema(doc, _load_perf_schema())
+    assert doc["generated_at"] == "2026-08-30T12:00:00Z"
+
+
+def test_generated_at_rejects_a_naive_datetime(vp, load):
+    with pytest.raises(TypeError, match="timezone-aware"):
+        vp.render_json(
+            _json_run(vp, load), clock=lambda: datetime(2026, 8, 30, 12, 0)
+        )
+
+
+def test_schema_version_is_1(vp, load):
+    assert vp.SCHEMA_VERSION == 1
+    schema = _load_perf_schema()
+    assert schema["properties"]["schema_version"]["enum"] == [1]
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    assert doc["schema_version"] == 1
+
+
+def test_schema_covers_proposals_sync_and_reward_source_as_nullable():
+    schema = _load_perf_schema()
+    validator = schema["properties"]["validators"]["items"]["properties"]
+    for name in ("proposals", "sync", "reward_source"):
+        assert _allows_null(validator[name]), name
+    assert _allows_null(
+        schema["properties"]["aggregate"]["properties"]["reward_source"]
+    )
+
+
+def test_schema_reason_enum_is_closed_and_has_nine_values():
+    schema = _load_perf_schema()
+    run_enum = schema["properties"]["degradations"]["items"]["properties"][
+        "reason"
+    ]["enum"]
+    val_enum = schema["properties"]["validators"]["items"]["properties"][
+        "degradations"
+    ]["items"]["properties"]["reason"]["enum"]
+    assert list(run_enum) == list(_REASON_ENUM)
+    assert list(val_enum) == list(_REASON_ENUM)
+    assert len(run_enum) == 9
+    assert len(set(run_enum)) == 9
+
+
+def test_walker_rejects_a_wrong_type(vp, load):
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    doc["schema_version"] = "1"
+    with pytest.raises(SchemaMismatch, match="schema_version"):
+        validate_schema(doc, _load_perf_schema())
+
+
+def test_walker_rejects_a_missing_required_field(vp, load):
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    del doc["network"]
+    with pytest.raises(SchemaMismatch, match="network"):
+        validate_schema(doc, _load_perf_schema())
+
+
+def test_walker_accepts_an_explicit_null_in_a_nullable_union(vp, load):
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    row = doc["validators"][0]
+    row["proposals"] = None
+    row["sync"] = None
+    row["reward_source"] = None
+    doc["aggregate"]["reward_source"] = None
+    validate_schema(doc, _load_perf_schema())
+
+
+def test_walker_rejects_an_unknown_reason_enum(vp, load):
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    doc["degradations"][0]["reason"] = "not_a_reason"
+    with pytest.raises(SchemaMismatch, match="reason"):
+        validate_schema(doc, _load_perf_schema())
+
+
+def test_walker_rejects_a_validator_missing_pubkey(vp, load):
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    del doc["validators"][0]["pubkey"]
+    with pytest.raises(SchemaMismatch, match="pubkey"):
+        validate_schema(doc, _load_perf_schema())
+
+
+def test_endpoint_stays_a_string_and_endpoints_used_is_an_array(vp, load):
+    schema = _load_perf_schema()
+    beacon_schema = schema["properties"]["beacon"]["properties"]
+    assert beacon_schema["endpoint"]["type"] == "string"
+    assert beacon_schema["endpoints_used"]["type"] == "array"
+    used = ["http://bn0:5052", "http://bn1:5052"]
+    doc = json.loads(vp.render_json(_json_run(vp, load, endpoints_used=used)))
+    assert isinstance(doc["beacon"]["endpoint"], str)
+    assert isinstance(doc["beacon"]["endpoints_used"], list)
+    assert doc["beacon"]["endpoints_used"] == used
+    assert doc["beacon"]["endpoint"] == used[-1]
+
+
+def test_no_beacon_url_or_secret_in_the_json_document(vp, load):
+    text = vp.render_json(_json_run(vp, load, endpoints_used=[_SECRET_URL]))
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+    assert "user:" not in text
+    shown = "https://bn.example:5052"
+    doc = json.loads(text)
+    assert doc["beacon"]["endpoint"] == shown
+    assert doc["beacon"]["endpoints_used"] == [shown]
+
+
+def test_gwei_emitted_as_numbers_not_strings(vp, load):
+    text = vp.render_json(_json_run(vp, load))
+    assert re.search(r'"start_gwei":\s*\d', text)
+    assert not re.search(r'"start_gwei":\s*"', text)
+    doc = json.loads(text)
+    balance = doc["validators"][0]["balance"]
+    for key in (
+        "start_gwei",
+        "end_gwei",
+        "delta_gwei",
+        "effective_balance_gwei",
+    ):
+        assert type(balance[key]) is int
+    for value in doc["validators"][0]["rewards_gwei"].values():
+        if value is not None:
+            assert type(value) is int
+    reward = doc["aggregate"]["consensus_reward_gwei"]
+    if reward is not None:
+        assert type(reward) is int
 

@@ -21,6 +21,7 @@ import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Literal, TextIO
 from urllib.parse import unquote, urlencode, urlsplit
 
@@ -1802,6 +1803,105 @@ def render_table(run: RunReport, out: TextIO) -> None:
         ]
     )
     out.write("\n".join(lines) + "\n")
+
+
+def _json_default(obj: object) -> object:
+    # Fail closed so dataclasses/datetime cannot silently become strings.
+    raise TypeError(f"{type(obj).__name__} is not JSON serializable")
+
+
+def _degradation_json(d: Degradation) -> dict[str, str]:
+    return {
+        "metric": d.metric,
+        "scope": d.scope,
+        "reason": d.reason,
+        "detail": d.detail,
+    }
+
+
+def _generated_at(clock: Callable[[], datetime] | None) -> str:
+    now = clock() if clock is not None else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise TypeError("generated_at clock must be timezone-aware")
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _redact_endpoint_url(url: str) -> str:
+    # Persist scheme://host:port only; already-redacted URLs round-trip.
+    return redact(parse_endpoint(url, "json"))
+
+
+def _validator_json(report: ValidatorReport, window: Window) -> dict:
+    snap = report.balance
+    eb, changed = effective_balance_for(snap, report.ref)
+    rec = reconcile_balance(snap.delta_gwei, report.rewards_gwei.get("total"))
+    return {
+        "pubkey": report.ref.pubkey,
+        "index": report.ref.index,
+        "status": report.ref.status,
+        "active_epochs": report.active_epochs,
+        "participation_rate": report.participation_rate,
+        "source_rate": report.source_rate,
+        "target_rate": report.target_rate,
+        "head_rate": report.head_rate,
+        "missed_attestations": report.missed_attestations,
+        "attester_effectiveness": report.attester_effectiveness,
+        "effectiveness_method": report.effectiveness_method,
+        "leak_epochs_excluded": report.leak_epochs_excluded,
+        "proposals": report.proposals,
+        "sync": report.sync,
+        "balance": {
+            "start_gwei": snap.start_gwei,
+            "end_gwei": snap.end_gwei,
+            "delta_gwei": snap.delta_gwei,
+            "effective_balance_gwei": eb,
+            "effective_balance_changed": changed,
+            "start_slot": window.start_slot,
+            "end_slot": window.end_slot,
+            "reconciliation": rec.reconciliation,
+        },
+        "rewards_gwei": dict(report.rewards_gwei),
+        "estimated_apr": report.estimated_apr,
+        "reward_source": report.reward_source,
+        "degradations": [_degradation_json(d) for d in report.degradations],
+    }
+
+
+def render_json(
+    run: RunReport, clock: Callable[[], datetime] | None = None
+) -> str:
+    used = [_redact_endpoint_url(ep) for ep in run.endpoints_used]
+    aggregate = dict(run.aggregate)
+    aggregate.setdefault("reward_source", None)
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": _generated_at(clock),
+        "network": {
+            "name": run.ctx.network_name,
+            "genesis_time": run.ctx.genesis_time,
+            "slots_per_epoch": run.ctx.spec.slots_per_epoch,
+            "seconds_per_slot": run.ctx.spec.seconds_per_slot,
+        },
+        "window": {
+            "from_epoch": run.window.from_epoch,
+            "to_epoch": run.window.to_epoch,
+            "epochs": run.window.epochs,
+            "head_epoch": run.window.head_epoch,
+            "finalized_epoch": run.window.finalized_epoch,
+            "finalized_only": run.window.finalized_only,
+        },
+        "beacon": {
+            "endpoint": used[-1] if used else "",
+            "version": run.ctx.node_version,
+            "rewards_api": run.ctx.rewards_api,
+            "endpoints_used": used,
+        },
+        "validators": [_validator_json(v, run.window) for v in run.validators],
+        "aggregate": aggregate,
+        "degradations": [_degradation_json(d) for d in run.degradations],
+        "exit_code": run.exit_code,
+    }
+    return json.dumps(doc, default=_json_default)
 
 
 # ===== § 16. main =====
