@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TextIO
 from urllib.parse import unquote, urlencode, urlsplit
@@ -888,6 +888,93 @@ def load_chain_context(client: BeaconClient) -> ChainContext:
 
 
 # ===== § 8. Window resolution =====
+
+
+@dataclass(frozen=True)
+class Window:
+    from_epoch: int
+    to_epoch: int
+    head_epoch: int
+    finalized_epoch: int
+    finalized_only: bool
+    forced_unsafe: bool
+    start_slot: int
+    end_slot: int
+    end_slot_reachable: bool
+
+    @property
+    def epochs(self) -> int:
+        return self.to_epoch - self.from_epoch + 1
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.from_epoch, self.to_epoch + 1))
+
+
+def resolve_window(
+    opts: Options, ctx: ChainContext, log: Log | None = None
+) -> Window:
+    max_safe_epoch = ctx.head_epoch - 2
+    if opts.to_epoch is None:
+        to_epoch = (
+            max_safe_epoch
+            if opts.allow_unfinalized
+            else min(max_safe_epoch, ctx.finalized_epoch)
+        )
+    else:
+        to_epoch = opts.to_epoch
+    k = DEFAULT_EPOCHS if opts.epochs is None else opts.epochs
+    from_epoch = (
+        to_epoch - k + 1 if opts.from_epoch is None else opts.from_epoch
+    )
+
+    if from_epoch > to_epoch:
+        raise UsageError(
+            f"from-epoch {from_epoch} is greater than to-epoch {to_epoch}"
+        )
+    if from_epoch < 0 or to_epoch < 0:
+        raise UsageError(f"negative epoch: {from_epoch}..{to_epoch}")
+    if from_epoch > ctx.head_epoch or to_epoch > ctx.head_epoch:
+        raise UsageError(
+            f"epoch not yet reached (head_epoch={ctx.head_epoch})"
+        )
+
+    forced_unsafe = False
+    if opts.to_epoch is not None and to_epoch > max_safe_epoch:
+        if not opts.force_unsafe_window:
+            raise UsageError(
+                f"--to-epoch {to_epoch} exceeds MAX_SAFE_EPOCH={max_safe_epoch}"
+            )
+        forced_unsafe = True
+        if log is not None:
+            log.warn(
+                "--to-epoch %s exceeds MAX_SAFE_EPOCH=%s; "
+                "continuing due to --force-unsafe-window",
+                to_epoch,
+                max_safe_epoch,
+            )
+
+    spe = ctx.spec.slots_per_epoch
+    # process_epoch fires on the last slot of E, so S has rewards through E-2.
+    start_slot = (from_epoch + 1) * spe
+    end_slot = (to_epoch + 2) * spe
+    end_slot_reachable = end_slot <= ctx.head_slot
+    if not end_slot_reachable and not opts.force_unsafe_window:
+        raise UsageError(
+            f"end_slot {end_slot} is not reachable from head_slot {ctx.head_slot}"
+        )
+
+    return Window(
+        from_epoch=from_epoch,
+        to_epoch=to_epoch,
+        head_epoch=ctx.head_epoch,
+        finalized_epoch=ctx.finalized_epoch,
+        finalized_only=to_epoch <= ctx.finalized_epoch,
+        forced_unsafe=forced_unsafe,
+        start_slot=start_slot,
+        end_slot=end_slot,
+        end_slot_reachable=end_slot_reachable,
+    )
+
 
 # ===== § 9. Validator resolution =====
 

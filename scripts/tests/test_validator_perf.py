@@ -16,7 +16,7 @@ import socket
 import ssl
 import sys
 import threading
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -1715,3 +1715,157 @@ def test_non_positive_slots_per_epoch_names_the_key(vp, load):
     with pytest.raises(vp.UsageError) as ei:
         vp.load_chain_context(client)
     assert "SLOTS_PER_EPOCH" in str(ei.value)
+
+
+# ----- VP-1k: §8 resolve_window -----
+
+
+def _spec_from_fixture(vp, load, name="spec__mainnet"):
+    raw = load(name)["data"]
+    return vp.Spec(
+        slots_per_epoch=int(raw["SLOTS_PER_EPOCH"]),
+        seconds_per_slot=int(raw["SECONDS_PER_SLOT"]),
+        epochs_per_sync_committee_period=int(raw["EPOCHS_PER_SYNC_COMMITTEE_PERIOD"]),
+        min_epochs_to_inactivity_penalty=int(raw["MIN_EPOCHS_TO_INACTIVITY_PENALTY"]),
+        raw=raw,
+    )
+
+
+def _chain_ctx(
+    vp,
+    load,
+    *,
+    spec="spec__mainnet",
+    head_epoch=100,
+    finalized_epoch=97,
+    head_slot=None,
+):
+    spec_obj = _spec_from_fixture(vp, load, spec)
+    if head_slot is None:
+        head_slot = head_epoch * spec_obj.slots_per_epoch
+    return vp.ChainContext(
+        spec=spec_obj,
+        genesis_time=0,
+        network_name=spec_obj.raw.get("CONFIG_NAME"),
+        head_slot=head_slot,
+        head_epoch=head_epoch,
+        finalized_epoch=finalized_epoch,
+        node_version="",
+        rewards_api="",
+    )
+
+
+def _window_opts(vp, **kw):
+    return replace(vp.build_options(_minimal_opts_argv()), **kw)
+
+
+def test_default_window_is_66_to_97(vp, load):
+    w = vp.resolve_window(_window_opts(vp), _chain_ctx(vp, load))
+    assert (w.from_epoch, w.to_epoch) == (66, 97)
+    assert w.finalized_only is True
+    assert w.epochs == 32
+
+
+def test_allow_unfinalized_gives_67_to_98(vp, load):
+    opts = _window_opts(vp, allow_unfinalized=True)
+    w = vp.resolve_window(opts, _chain_ctx(vp, load))
+    assert (w.from_epoch, w.to_epoch) == (67, 98)
+    assert w.finalized_only is False
+
+
+def test_epochs_4_lookback(vp, load):
+    w = vp.resolve_window(_window_opts(vp, epochs=4), _chain_ctx(vp, load))
+    assert (w.from_epoch, w.to_epoch) == (94, 97)
+    assert w.epochs == 4
+    assert len(list(w)) == 4
+
+
+def test_to_epoch_equal_max_safe_is_allowed(vp, load):
+    ctx = _chain_ctx(vp, load)
+    w = vp.resolve_window(_window_opts(vp, to_epoch=98), ctx)
+    assert w.to_epoch == 98
+    assert w.from_epoch == 67
+    assert w.forced_unsafe is False
+
+
+def test_to_epoch_99_exits_2_naming_max_safe_epoch_98(vp, load):
+    opts = _window_opts(vp, to_epoch=99)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.resolve_window(opts, _chain_ctx(vp, load))
+    assert "MAX_SAFE_EPOCH=98" in str(ei.value)
+    assert vp.EXIT_USAGE == 2
+
+
+def test_force_unsafe_window_downgrades_to_a_warning_and_sets_forced_unsafe(vp, load):
+    ctx = _chain_ctx(vp, load)
+    with pytest.raises(vp.UsageError):
+        vp.resolve_window(_window_opts(vp, to_epoch=99), ctx)
+    buf = io.StringIO()
+    log = vp.Log(0, buf)
+    opts = _window_opts(vp, to_epoch=99, force_unsafe_window=True)
+    w = vp.resolve_window(opts, ctx, log)
+    assert w.forced_unsafe is True
+    assert w.to_epoch == 99
+    assert "MAX_SAFE_EPOCH=98" in buf.getvalue()
+
+
+def test_snapshot_slots_are_3232_and_4256(vp, load):
+    # RD-4: from*SPE / to*SPE would be 3200 / 4192.
+    ctx = _chain_ctx(vp, load, head_epoch=133, finalized_epoch=131)
+    opts = _window_opts(vp, from_epoch=100, to_epoch=131)
+    w = vp.resolve_window(opts, ctx)
+    assert (w.from_epoch, w.to_epoch) == (100, 131)
+    assert w.start_slot == 3232
+    assert w.end_slot == 4256
+
+
+def test_spe8_shifts_every_derived_slot(vp, load):
+    ctx = _chain_ctx(
+        vp, load, spec="spec__spe8", head_epoch=133, finalized_epoch=131
+    )
+    assert ctx.spec.slots_per_epoch == 8
+    opts = _window_opts(vp, from_epoch=100, to_epoch=131)
+    w = vp.resolve_window(opts, ctx)
+    assert w.start_slot == (100 + 1) * 8 == 808
+    assert w.end_slot == (131 + 2) * 8 == 1064
+
+
+def test_from_greater_than_to_exits_2(vp, load):
+    opts = _window_opts(vp, from_epoch=10, to_epoch=5)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.resolve_window(opts, _chain_ctx(vp, load))
+    assert vp.EXIT_USAGE == 2
+    assert ei.type is vp.UsageError
+
+
+def test_negative_epoch_exits_2(vp, load):
+    opts = _window_opts(vp, from_epoch=-1, to_epoch=5)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.resolve_window(opts, _chain_ctx(vp, load))
+    assert vp.EXIT_USAGE == 2
+    assert ei.type is vp.UsageError
+
+
+def test_future_epoch_exits_2(vp, load):
+    opts = _window_opts(vp, from_epoch=90, to_epoch=101)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.resolve_window(opts, _chain_ctx(vp, load))
+    assert vp.EXIT_USAGE == 2
+    assert ei.type is vp.UsageError
+    assert "MAX_SAFE_EPOCH" not in str(ei.value)
+
+
+def test_end_slot_reachable_false_only_under_force_unsafe(vp, load):
+    ctx = _chain_ctx(vp, load)
+    assert vp.resolve_window(_window_opts(vp), ctx).end_slot_reachable is True
+    forced = _window_opts(vp, to_epoch=99, force_unsafe_window=True)
+    w = vp.resolve_window(forced, ctx, vp.Log(0, io.StringIO()))
+    assert w.end_slot_reachable is False
+    assert w.forced_unsafe is True
+
+
+def test_window_iterates_inclusively(vp, load):
+    w = vp.resolve_window(_window_opts(vp), _chain_ctx(vp, load))
+    epochs = list(w)
+    assert epochs == list(range(w.from_epoch, w.to_epoch + 1))
+    assert len(epochs) == w.epochs == w.to_epoch - w.from_epoch + 1
