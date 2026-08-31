@@ -8,13 +8,19 @@
 import argparse
 import base64
 import http.client
+import json
+import math
+import random
 import re
+import socket
+import ssl
 import sys
 import threading
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TextIO
+from typing import Literal, TextIO
 from urllib.parse import unquote, urlsplit
 
 # ===== § 1. Header, constants, exit codes =====
@@ -389,6 +395,7 @@ class RawResponse:
     status: int
     body: bytes
     truncated: bool
+    headers: dict[str, str] = field(default_factory=dict)  # Retry-After (VP-1h)
 
 
 Transport = Callable[[Endpoint, str, str, bytes | None], RawResponse]
@@ -442,7 +449,11 @@ class HttpTransport:
         conn.request(method, ep.base_path + path, body=body, headers=headers)
         resp = conn.getresponse()
         raw = resp.read(MAX_RESPONSE_BYTES + 1)
-        return RawResponse(resp.status, raw, len(raw) > MAX_RESPONSE_BYTES)
+        getheaders = getattr(resp, "getheaders", None)
+        headers = (
+            {k.lower(): v for k, v in getheaders()} if callable(getheaders) else {}
+        )
+        return RawResponse(resp.status, raw, len(raw) > MAX_RESPONSE_BYTES, headers)
 
     def drop(self, ep: Endpoint) -> None:
         conn = self._map().pop(ep, None)
@@ -459,6 +470,144 @@ class HttpTransport:
 
 
 # ===== § 6. BeaconClient =====
+
+_REQUEST_SLOT_LOCK = threading.Lock()
+_next_request_start = 0.0
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE = 0.5
+
+
+def _await_slot(delay: float) -> None:
+    global _next_request_start
+    if delay <= 0:
+        return
+    # Reserve the slot under the lock; sleep after release so workers do not serialize.
+    with _REQUEST_SLOT_LOCK:
+        now = time.monotonic()
+        start = max(now, _next_request_start)
+        _next_request_start = start + delay
+        wait = start - now
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _header(headers: dict[str, str], name: str) -> str | None:
+    want = name.lower()
+    for key, value in headers.items():
+        if key.lower() == want:
+            return value
+    return None
+
+
+def _retry_after_delay(headers: dict[str, str], attempt: int) -> float:
+    raw = _header(headers, "retry-after")
+    if raw is not None:
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = float("nan")
+        if math.isfinite(seconds) and seconds >= 0.0:
+            return min(seconds, MAX_RETRY_AFTER)
+    return _BACKOFF_BASE * (2 ** attempt) * (0.5 + random.random())
+
+
+def _classify(
+    status: int | None,
+    exc: BaseException | None,
+    _is_rewards_route: bool,
+) -> Literal["retry", "fail", "semantic"]:
+    if exc is not None:
+        # SSLError/gaierror subclass OSError; TimeoutError is OSError in 3.10+.
+        if isinstance(exc, (ssl.SSLError, socket.gaierror)):
+            return "fail"
+        if isinstance(exc, (TimeoutError, ConnectionError, http.client.HTTPException)):
+            return "retry"
+        return "fail"
+    if status in (429, 503):
+        return "retry"
+    if status == 500:
+        # Rewards and non-rewards 500 share a one-retry cap in _call.
+        return "retry"
+    if status in (400, 404, 405, 414):
+        return "semantic"
+    return "semantic"
+
+
+class BeaconClient:
+    def __init__(
+        self,
+        endpoints: list[Endpoint],
+        transport: Transport,
+        *,
+        request_delay: float,
+        log: Log,
+    ) -> None:
+        self._endpoints = endpoints
+        self._transport = transport
+        self._request_delay = request_delay
+        self._log = log
+        self._current = 0
+
+    def _endpoint(self) -> Endpoint:
+        return self._endpoints[self._current]
+
+    def _call(
+        self,
+        method: str,
+        template: str,
+        fmt: dict,
+        body: bytes | None,
+        *,
+        retry_500: bool = False,
+    ) -> object:
+        path = template.format(**fmt)
+        ep = self._endpoint()
+        label = ep.label
+        last_exc: BaseException | None = None
+        raw: RawResponse | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            self._log.info("%s %s via %s", method, template, redact(ep))
+            _await_slot(self._request_delay)
+            try:
+                raw = self._transport(ep, method, path, body)
+            except (
+                ssl.SSLError,
+                socket.gaierror,
+                TimeoutError,
+                ConnectionError,
+                http.client.HTTPException,
+            ) as exc:
+                last_exc = exc
+                action = _classify(None, exc, retry_500)
+                if action == "retry" and attempt + 1 < _MAX_ATTEMPTS:
+                    self._transport.drop(ep)
+                    time.sleep(_retry_after_delay({}, attempt))
+                    continue
+                raise BeaconTransport(template, label) from exc
+            if raw.truncated:
+                # Truncation leaves the keep-alive connection in an unknown state.
+                self._transport.drop(ep)
+                raise BeaconStatus(raw.status, template, label)
+            if raw.status == 204:
+                return None
+            if 200 <= raw.status < 300:
+                try:
+                    return json.loads(raw.body)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise BeaconStatus(raw.status, template, label) from exc
+            action = _classify(raw.status, None, retry_500)
+            retry_limit = 2 if raw.status == 500 else _MAX_ATTEMPTS
+            if action == "retry" and attempt + 1 < retry_limit:
+                self._transport.drop(ep)
+                time.sleep(_retry_after_delay(raw.headers, attempt))
+                continue
+            raise BeaconStatus(raw.status, template, label)
+        if last_exc is not None:
+            raise BeaconTransport(template, label) from last_exc
+        if raw is None:
+            raise BeaconTransport(template, label)
+        raise BeaconStatus(raw.status, template, label)
+
 
 # ===== § 7. Chain context and bootstrap =====
 

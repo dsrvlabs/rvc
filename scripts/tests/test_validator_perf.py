@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import ast
 import base64
+import http.client
 import inspect
 import io
 import re
 import socket
+import ssl
 import sys
 import threading
 from dataclasses import FrozenInstanceError
@@ -825,3 +827,294 @@ def test_empty_beacon_url_flag_raises_usage_error(vp):
     assert "--beacon-url" in msg
     assert "beacon" in msg.lower()
 
+
+# ----- VP-1h: §6 _call retry matrix -----
+
+_REWARDS_TEMPLATE = "/eth/v1/beacon/rewards/attestations/{epoch}"
+_SPEC_TEMPLATE = "/eth/v1/config/spec"
+_VERSION_TEMPLATE = "/eth/v1/node/version"
+_SECRET_URL = "https://user:secret@bn.example:5052/abc123SECRET/"
+
+
+def _boom(exc: BaseException):
+    def inner():
+        raise exc
+
+    return inner
+
+
+def _raw(vp, status, body=b"{}", truncated=False, headers=None):
+    return vp.RawResponse(status, body, truncated, headers or {})
+
+
+def _client(vp, transport, *, request_delay=0.0, verbosity=1, ep=None, stream=None):
+    buf = stream if stream is not None else io.StringIO()
+    if ep is None:
+        ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    log = vp.Log(verbosity, buf)
+    return vp.BeaconClient([ep], transport, request_delay=request_delay, log=log), buf
+
+
+def _no_sleep(monkeypatch, vp):
+    slept = []
+    monkeypatch.setattr(vp.time, "sleep", lambda s: slept.append(s))
+    return slept
+
+
+def test_retry_on_429_honours_capped_retry_after(vp, monkeypatch):
+    slept = _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport(
+        {
+            ("GET", path): [
+                _raw(vp, 429, headers={"Retry-After": "7200"}),
+                _raw(vp, 200, b'{"data": true}'),
+            ]
+        }
+    )
+    client, _ = _client(vp, transport)
+    got = client._call("GET", path, {}, None)
+    assert got == {"data": True}
+    assert len(transport.calls) == 2
+    assert slept == [vp.MAX_RETRY_AFTER]
+    assert vp.MAX_RETRY_AFTER == 30.0
+
+
+def test_retry_on_503_backs_off_then_succeeds(vp, monkeypatch):
+    slept = _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    body = b'{"ok": true}'
+    transport = FakeTransport(
+        {("GET", path): [_raw(vp, 503), _raw(vp, 503), _raw(vp, 200, body)]}
+    )
+    client, _ = _client(vp, transport)
+    got = client._call("GET", path, {}, None)
+    assert got == {"ok": True}
+    assert len(transport.calls) == 3
+    assert slept  # exponential backoff, not a real wait
+
+
+def test_500_from_a_rewards_route_retries_exactly_once(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    fmt = {"epoch": 7}
+    path = _REWARDS_TEMPLATE.format(**fmt)
+    transport = FakeTransport(
+        {("POST", path): [_raw(vp, 500), _raw(vp, 500), _raw(vp, 500)]}
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client._call("POST", _REWARDS_TEMPLATE, fmt, b"[]", retry_500=True)
+    assert ei.value.status == 500
+    assert ei.value.template == _REWARDS_TEMPLATE
+    assert len(transport.calls) == 2
+
+
+def test_500_elsewhere_retries_once_then_raises(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport(
+        {("GET", path): [_raw(vp, 500), _raw(vp, 500), _raw(vp, 500)]}
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client._call("GET", path, {}, None, retry_500=False)
+    assert ei.value.status == 500
+    assert len(transport.calls) == 2
+
+
+def test_400_and_404_and_405_and_414_are_never_retried(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    for status in (400, 404, 405, 414):
+        transport = FakeTransport(
+            {("GET", path): [_raw(vp, status), _raw(vp, 200)]}
+        )
+        client, _ = _client(vp, transport)
+        with pytest.raises(vp.BeaconStatus) as ei:
+            client._call("GET", path, {}, None)
+        assert ei.value.status == status
+        assert ei.value.template == path
+        assert len(transport.calls) == 1
+
+
+def test_204_returns_none_before_json_loads(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    loaded = []
+    real = vp.json.loads
+
+    def spy(raw, *a, **k):
+        loaded.append(raw)
+        return real(raw, *a, **k)
+
+    monkeypatch.setattr(vp.json, "loads", spy)
+    path = _VERSION_TEMPLATE
+    transport = FakeTransport({("GET", path): [_raw(vp, 204, b"")]})
+    client, _ = _client(vp, transport)
+    assert client._call("GET", path, {}, None) is None
+    assert loaded == []
+
+
+def test_ssl_error_and_gaierror_fail_fast(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _VERSION_TEMPLATE
+    cases = (
+        ssl.SSLError("certificate verify failed"),
+        socket.gaierror(-2, "Name or service not known"),
+    )
+    for exc in cases:
+        transport = FakeTransport(
+            {("GET", path): [_boom(exc), _boom(exc), _boom(exc)]}
+        )
+        client, _ = _client(vp, transport)
+        with pytest.raises(vp.BeaconTransport):
+            client._call("GET", path, {}, None)
+        assert len(transport.calls) == 1
+        assert transport.drops == []
+
+
+def test_timeout_and_connection_error_retry_to_max_attempts(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _VERSION_TEMPLATE
+    for exc in (
+        TimeoutError("timed out"),
+        ConnectionError("reset"),
+        http.client.IncompleteRead(b""),
+    ):
+        transport = FakeTransport({("GET", path): [_boom(exc) for _ in range(5)]})
+        client, _ = _client(vp, transport)
+        with pytest.raises(vp.BeaconTransport):
+            client._call("GET", path, {}, None)
+        assert len(transport.calls) == 3
+        assert len(transport.drops) == 2
+
+
+def test_drop_called_before_every_retry(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport(
+        {("GET", path): [_raw(vp, 503), _raw(vp, 503), _raw(vp, 200, b"{}")]}
+    )
+    client, _ = _client(vp, transport)
+    client._call("GET", path, {}, None)
+    assert len(transport.calls) == 3
+    assert len(transport.drops) == 2
+
+
+def test_truncated_body_is_a_hard_error(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    loaded = []
+    real = vp.json.loads
+
+    def spy(raw, *a, **k):
+        loaded.append(raw)
+        return real(raw, *a, **k)
+
+    monkeypatch.setattr(vp.json, "loads", spy)
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport(
+        {("GET", path): [_raw(vp, 200, b'{"ok": true}', truncated=True)]}
+    )
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client._call("GET", path, {}, None)
+    assert ei.value.template == path
+    assert loaded == []
+    assert len(transport.calls) == 1
+    assert len(transport.drops) == 1
+
+
+def test_empty_200_body_is_beacon_status(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    path = _SPEC_TEMPLATE
+    transport = FakeTransport({("GET", path): [_raw(vp, 200, b"")]})
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.BeaconStatus) as ei:
+        client._call("GET", path, {}, None)
+    assert ei.value.status == 200
+    assert ei.value.template == path
+    assert len(transport.calls) == 1
+
+
+def test_no_url_or_secret_in_any_retry_log_line(vp, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    ep = vp.parse_endpoint(_SECRET_URL, "bn0")
+    buf = io.StringIO()
+    templates = []
+
+    def run(method, template, fmt, body, queue, **call_kw):
+        path = template.format(**fmt)
+        transport = FakeTransport({(method, path): queue})
+        client, _ = _client(vp, transport, ep=ep, stream=buf)
+        try:
+            client._call(method, template, fmt, body, **call_kw)
+        except (vp.BeaconStatus, vp.BeaconTransport):
+            pass
+        templates.append(template)
+
+    ok = _raw(vp, 200)
+    run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, 429, headers={"Retry-After": "7200"}), ok])
+    run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, 503), _raw(vp, 503), ok])
+    run(
+        "POST",
+        _REWARDS_TEMPLATE,
+        {"epoch": 9},
+        b"[]",
+        [_raw(vp, 500), _raw(vp, 500)],
+        retry_500=True,
+    )
+    run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, 500), _raw(vp, 500)])
+    for status in (400, 404, 405, 414):
+        run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, status)])
+    run("GET", _VERSION_TEMPLATE, {}, None, [_raw(vp, 204, b"")])
+    run("GET", _VERSION_TEMPLATE, {}, None, [_boom(ssl.SSLError("bad cert"))])
+    run(
+        "GET",
+        _VERSION_TEMPLATE,
+        {},
+        None,
+        [_boom(socket.gaierror(-2, "Name or service not known"))],
+    )
+    run("GET", _VERSION_TEMPLATE, {}, None, [_boom(TimeoutError())] * 3)
+    run("GET", _VERSION_TEMPLATE, {}, None, [_boom(ConnectionError())] * 3)
+    run(
+        "GET",
+        _VERSION_TEMPLATE,
+        {},
+        None,
+        [_boom(http.client.IncompleteRead(b""))] * 3,
+    )
+    run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, 200, b"{}", truncated=True)])
+    run("GET", _SPEC_TEMPLATE, {}, None, [_raw(vp, 200, b"")])
+
+    text = buf.getvalue()
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+    assert "user:secret" not in text
+    for template in templates:
+        assert template in text
+    assert _REWARDS_TEMPLATE.format(epoch=9) not in text
+    assert "/abc123SECRET" not in text
+
+
+def test_request_spacing_lock_enforces_minimum_gap(vp, monkeypatch):
+    clock = {"t": 10.0}
+    vp._next_request_start = 0.0
+    monkeypatch.setattr(vp.time, "monotonic", lambda: clock["t"])
+
+    def sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(vp.time, "sleep", sleep)
+    starts = []
+    path = _VERSION_TEMPLATE
+
+    def ok():
+        starts.append(clock["t"])
+        return _raw(vp, 200)
+
+    transport = FakeTransport({("GET", path): [ok, ok]})
+    client, _ = _client(vp, transport, request_delay=0.05)
+    client._call("GET", path, {}, None)
+    client._call("GET", path, {}, None)
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= 0.05

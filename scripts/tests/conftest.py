@@ -63,7 +63,11 @@ class FakeTransport:
             raise KeyError(f"unscripted FakeTransport call: {method} {path}") from None
         if not queue:
             raise IndexError(f"no scripted responses left for {method} {path}")
-        return queue.pop(0)
+        item = queue.pop(0)
+        # Callables inject exceptions (or late RawResponse) without extra FakeTransport fields.
+        if callable(item):
+            return item()
+        return item
 
     def drop(self, ep):
         self.drops.append(ep)
