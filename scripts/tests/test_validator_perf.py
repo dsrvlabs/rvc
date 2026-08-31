@@ -9575,6 +9575,84 @@ def test_liveness_footnote_states_what_it_does_not_mean(vp, load, capsys):
     assert "does not mean" in captured.out.lower()
 
 
+# ----- VP-4f: P1-5 — -q prints nothing on a healthy run -----
+
+
+def test_quiet_healthy_run_prints_nothing_on_stderr(vp, capsys):
+    code, transport = _run_full(vp, "-q")
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    assert transport.calls
+    assert captured.err == ""
+
+
+def test_quiet_still_prints_errors(vp, capsys):
+    code = vp.main(["-q"])
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_USAGE == 2
+    assert captured.err.strip() != ""
+    assert "pubkey" in captured.err.lower()
+
+    transport = FakeTransport({("GET", _VERSION_TEMPLATE): [_raw(vp, 404)]})
+    code = vp.main(_full_argv("-q"), transport=transport)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_NO_BEACON == 5
+    assert captured.err.strip() != ""
+    assert "https://" not in captured.err
+
+
+def test_quiet_does_not_suppress_stdout(vp, capsys):
+    code, _transport = _run_full(vp, "-q")
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    assert captured.err == ""
+    assert "pubkey" in captured.out
+    assert captured.out.strip() != ""
+
+    code, _transport = _run_full(vp, "-q", "--json")
+    doc, captured = _stdout_json(capsys)
+    assert code == vp.EXIT_OK == 0
+    assert captured.err == ""
+    assert doc["exit_code"] == 0
+    assert doc["validators"]
+
+
+def test_verbose_adds_per_request_diagnostics_still_redacted(vp, capsys):
+    code, _transport = _run_full(vp, "-v", "--json", url=_SECRET_URL)
+    captured = capsys.readouterr()
+    assert code == vp.EXIT_OK == 0
+    err = captured.err
+    assert _SPEC_TEMPLATE in err
+    assert _VERSION_TEMPLATE in err
+    assert _REWARDS_TEMPLATE in err
+    assert _REWARDS_TEMPLATE.format(epoch=_FULL_FROM) not in err
+    assert f"via {vp.redact(vp.parse_endpoint(_SECRET_URL, 'bn0'))}" in err
+    assert "https://bn.example:5052" in err
+    text = captured.out + err
+    assert "secret" not in text
+    assert "abc123SECRET" not in text
+
+
+def test_vv_is_accepted_and_more_verbose_than_v(vp, capsys):
+    assert vp.build_options(_minimal_opts_argv("-vv")).verbosity == 2
+    assert (
+        vp.build_options(_minimal_opts_argv("-vv")).verbosity
+        > vp.build_options(_minimal_opts_argv("-v")).verbosity
+    )
+    code_default, _transport = _run_full(vp, "--json")
+    default_err = capsys.readouterr().err
+    code_v, _transport = _run_full(vp, "-v", "--json")
+    v_err = capsys.readouterr().err
+    code_vv, _transport = _run_full(vp, "-vv", "--json")
+    vv_err = capsys.readouterr().err
+    assert code_default == code_v == code_vv == vp.EXIT_OK == 0
+    assert len(v_err) > len(default_err)
+    assert len(vv_err) >= len(v_err)
+    assert _SPEC_TEMPLATE in v_err
+    assert _SPEC_TEMPLATE in vv_err
+    assert vv_err.count(_SPEC_TEMPLATE) >= v_err.count(_SPEC_TEMPLATE)
+
+
 def test_csv_neutralizes_formula_injection(vp, load, tmp_path):
     for raw in ("=cmd|'/C calc'!A0", "+1+1", "-1+1", "@SUM(A1)"):
         report = _table_report(
