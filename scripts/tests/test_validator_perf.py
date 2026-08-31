@@ -12,6 +12,7 @@ import io
 import re
 import socket
 import sys
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -197,7 +198,9 @@ def test_faketransport_records_calls_in_order(vp):
 
 def test_faketransport_raises_on_an_unscripted_call(vp):
     ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
-    transport = FakeTransport({("GET", "/eth/v1/node/syncing"): [vp.RawResponse(200, b"", False)]})
+    transport = FakeTransport(
+        {("GET", "/eth/v1/node/syncing"): [vp.RawResponse(200, b"", False)]}
+    )
     with pytest.raises(KeyError):
         transport(ep, "GET", "/unscripted", None)
     assert transport(ep, "GET", "/eth/v1/node/syncing", None).status == 200
@@ -209,7 +212,12 @@ def test_faketransport_satisfies_the_transport_alias(vp):
     ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
     body = vp.RawResponse(200, b"{}", False)
     transport = FakeTransport({("GET", "/x"): [body]})
-    assert list(inspect.signature(transport).parameters) == ["ep", "method", "path", "body"]
+    assert list(inspect.signature(transport).parameters) == [
+        "ep",
+        "method",
+        "path",
+        "body",
+    ]
     got = transport(ep, "GET", "/x", b"payload")
     assert got is body
     assert isinstance(got, vp.RawResponse)
@@ -325,24 +333,30 @@ def test_pubkey_union_across_three_sources_in_input_order(vp):
     toml = str(FIXTURES / "validators__three_entries.toml")
     pubfile = str(FIXTURES / "pubkeys__two_one_dup.txt")
     expected = [PK4, PK1, PK2, PK3]
-    assert _load_pubkeys(
-        vp,
-        ["--pubkey", PK4, "--pubkeys-file", pubfile, "--validators-config", toml],
-    ) == expected
+    assert (
+        _load_pubkeys(
+            vp,
+            ["--pubkey", PK4, "--pubkeys-file", pubfile, "--validators-config", toml],
+        )
+        == expected
+    )
     # Argv order must not change operand order; second --pubkey is append + de-dup.
-    assert _load_pubkeys(
-        vp,
-        [
-            "--validators-config",
-            toml,
-            "--pubkeys-file",
-            pubfile,
-            "--pubkey",
-            PK4,
-            "--pubkey",
-            PK1,
-        ],
-    ) == expected
+    assert (
+        _load_pubkeys(
+            vp,
+            [
+                "--validators-config",
+                toml,
+                "--pubkeys-file",
+                pubfile,
+                "--pubkey",
+                PK4,
+                "--pubkey",
+                PK1,
+            ],
+        )
+        == expected
+    )
 
 
 def test_short_pubkey_exits_2_naming_source_and_line(vp):
@@ -413,3 +427,231 @@ def test_parser_declares_every_documented_flag(vp):
     assert names - _DOCUMENTED_FLAGS <= {"-h", "--help"}
     assert dests["verbose"] == ["-v"]
     assert dests["quiet"] == ["-q"]
+
+
+def _https_ep(vp, *, label="bn0", host="bn.example", base_path="", auth_header=None):
+    return vp.Endpoint(label, "https", host, 5052, base_path, auth_header)
+
+
+def _patch_https(monkeypatch, vp, *, status=200, body=b"{}"):
+    constructed = []
+
+    class FakeSock:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+    class FakeResp:
+        def __init__(self):
+            self.status = status
+            self.read_amt = None
+
+        def read(self, amt=None):
+            self.read_amt = amt
+            if amt is None:
+                return body
+            return body[:amt]
+
+    class FakeHTTPSConnection:
+        def __init__(self, host, port=None, timeout=None, **_kwargs):
+            constructed.append(self)
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.sock = None
+            self.closed = False
+            self.requests = []
+            self.response = FakeResp()
+
+        def connect(self):
+            self.sock = FakeSock()
+
+        def request(self, method, url, body=None, headers=None, **_kwargs):
+            self.requests.append((method, url, body, dict(headers or {})))
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            self.closed = True
+            self.sock = None
+
+    monkeypatch.setattr(vp.http.client, "HTTPSConnection", FakeHTTPSConnection)
+    return constructed
+
+
+def test_transport_reuses_one_connection_per_thread_per_endpoint(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    for _ in range(5):
+        raw = transport(ep, "GET", "/eth/v1/config/spec", None)
+        assert raw.status == 200
+        assert raw.truncated is False
+    assert len(constructed) == 1
+
+
+def test_transport_opens_separate_connections_per_thread(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            transport(ep, "GET", "/eth/v1/config/spec", None)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(constructed) == 2
+
+
+def test_transport_sets_read_timeout_on_the_socket_after_connect(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    connect_timeout = 1.25
+    read_timeout = 4.5
+    transport = vp.HttpTransport(connect_timeout, read_timeout)
+    transport(_https_ep(vp), "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 1
+    conn = constructed[0]
+    assert conn.timeout == connect_timeout
+    assert conn.sock is not None
+    assert conn.sock.timeouts == [read_timeout]
+
+
+def test_transport_marks_truncated_over_the_cap(vp, monkeypatch):
+    cap = 32
+    monkeypatch.setattr(vp, "MAX_RESPONSE_BYTES", cap)
+    payload = b"x" * (cap + 1)
+    constructed = _patch_https(monkeypatch, vp, body=payload)
+    transport = vp.HttpTransport(1.25, 4.5)
+    raw = transport(_https_ep(vp), "GET", "/eth/v1/config/spec", None)
+    assert raw.truncated is True
+    assert constructed[0].response.read_amt == cap + 1
+
+
+def test_transport_sends_authorization_and_base_path(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    auth = "Basic " + base64.b64encode(b"user:secret").decode("ascii")
+    ep = _https_ep(vp, base_path="/abc123SECRET", auth_header=auth)
+    transport = vp.HttpTransport(1.25, 4.5)
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed[0].requests) == 1
+    method, url, body, headers = constructed[0].requests[0]
+    assert method == "GET"
+    assert url == "/abc123SECRET/eth/v1/config/spec"
+    assert body is None
+    assert headers["Authorization"] == auth
+
+
+def test_drop_closes_and_forgets_the_connection(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 1
+    transport.drop(ep)
+    assert constructed[0].closed is True
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 2
+
+
+def test_close_from_main_thread_closes_worker_connections(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            transport(ep, "GET", "/eth/v1/config/spec", None)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(constructed) == 2
+    assert all(not conn.closed for conn in constructed)
+    transport.close()
+    assert all(conn.closed for conn in constructed)
+
+
+def test_transport_separate_connections_per_endpoint_drop_is_selective(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep0 = _https_ep(vp, label="bn0", host="bn0.example")
+    ep1 = _https_ep(vp, label="bn1", host="bn1.example")
+    transport(ep0, "GET", "/eth/v1/config/spec", None)
+    transport(ep1, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 2
+    transport.drop(ep0)
+    assert constructed[0].closed is True
+    assert constructed[1].closed is False
+    transport(ep1, "GET", "/eth/v1/node/version", None)
+    assert len(constructed) == 2
+    transport(ep0, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 3
+
+
+def test_transport_sets_content_type_only_on_body(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    transport(ep, "POST", "/eth/v1/beacon/states/head/validators", b'{"ids":[]}')
+    get_headers = constructed[0].requests[0][3]
+    post_headers = constructed[0].requests[1][3]
+    assert "Content-Type" not in get_headers
+    assert post_headers["Content-Type"] == "application/json"
+    assert constructed[0].requests[1][2] == b'{"ids":[]}'
+
+
+def test_transport_rebuilds_when_cached_sock_is_none(vp, monkeypatch):
+    constructed = _patch_https(monkeypatch, vp)
+    transport = vp.HttpTransport(1.25, 4.5)
+    ep = _https_ep(vp)
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 1
+    constructed[0].sock = None
+    transport(ep, "GET", "/eth/v1/config/spec", None)
+    assert len(constructed) == 2
+    assert constructed[0].closed is True
+    assert constructed[1].sock is not None
+    assert constructed[1].sock.timeouts == [4.5]
+    assert constructed[1].timeout == 1.25
+
+
+def test_transport_module_contains_no_log_call():
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r"# ===== § 5\. Transport =====(.*?)# ===== § 6\.",
+        source,
+        re.DOTALL,
+    )
+    assert match is not None
+    assert "log." not in match.group(1)
+
+
+def test_socket_blocked(vp):
+    from pytest_socket import SocketBlockedError, disable_socket, enable_socket
+
+    disable_socket()
+    try:
+        transport = vp.HttpTransport(0.1, 0.1)
+        ep = vp.Endpoint("bn0", "https", "example.invalid", 443, "", None)
+        with pytest.raises(SocketBlockedError):
+            transport(ep, "GET", "/eth/v1/config/spec", None)
+    finally:
+        enable_socket()

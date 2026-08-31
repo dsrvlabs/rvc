@@ -7,8 +7,10 @@
 
 import argparse
 import base64
+import http.client
 import re
 import sys
+import threading
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -264,6 +266,71 @@ class RawResponse:
 
 
 Transport = Callable[[Endpoint, str, str, bytes | None], RawResponse]
+
+
+class HttpTransport:
+    def __init__(self, connect_timeout: float, read_timeout: float) -> None:
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        # close() must reach every thread's map; local storage is not shared.
+        self._maps: list[dict[Endpoint, http.client.HTTPConnection]] = []
+
+    def _map(self) -> dict[Endpoint, http.client.HTTPConnection]:
+        conns = getattr(self._local, "conns", None)
+        if conns is None:
+            conns = {}
+            self._local.conns = conns
+            with self._lock:
+                self._maps.append(conns)
+        return conns
+
+    def _conn_for(self, ep: Endpoint) -> http.client.HTTPConnection:
+        conns = self._map()
+        conn = conns.get(ep)
+        if conn is not None and conn.sock is not None:
+            return conn
+        if conn is not None:
+            conn.close()
+        factory = (
+            http.client.HTTPSConnection
+            if ep.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        conn = factory(ep.host, ep.port, timeout=self._connect_timeout)
+        conn.connect()
+        conn.sock.settimeout(self._read_timeout)
+        conns[ep] = conn
+        return conn
+
+    def __call__(
+        self, ep: Endpoint, method: str, path: str, body: bytes | None
+    ) -> RawResponse:
+        conn = self._conn_for(ep)
+        headers: dict[str, str] = {}
+        if ep.auth_header:
+            headers["Authorization"] = ep.auth_header
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        conn.request(method, ep.base_path + path, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        return RawResponse(resp.status, raw, len(raw) > MAX_RESPONSE_BYTES)
+
+    def drop(self, ep: Endpoint) -> None:
+        conn = self._map().pop(ep, None)
+        if conn is not None:
+            conn.close()
+
+    def close(self) -> None:
+        with self._lock:
+            maps = list(self._maps)
+        for conns in maps:
+            for conn in list(conns.values()):
+                conn.close()
+            conns.clear()
+
 
 # ===== § 6. BeaconClient =====
 
