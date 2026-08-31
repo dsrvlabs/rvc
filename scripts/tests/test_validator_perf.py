@@ -5013,6 +5013,7 @@ _G5_KIND_PREFIXES = (
 )
 _G5_SKIP = {
     "failover__midrun_promotion": "scenario descriptor; exercised by VP-4a tests",
+    "failover__first_503": "scenario descriptor; exercised by VP-4b tests",
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
     "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
@@ -8069,6 +8070,173 @@ def test_one_promotion_attempt_per_endpoint(vp, load):
     nxt = client._promote_from(endpoints[1])
     assert nxt is endpoints[2]
     assert client._current == 2
+
+
+# ----- VP-4b: P1-1 selection-time AC + beacon.endpoints_used[] -----
+
+
+def _first_503_spec(load):
+    spec = load("failover__first_503")
+    assert spec["selection_status"] == 503
+    assert len(spec["endpoints"]) == 2
+    return spec
+
+
+def _selection_urls(spec, *, secret=False):
+    urls = list(spec["endpoints"])
+    if secret:
+        urls = [
+            "https://user:secret@" + u.split("://", 1)[1].rstrip("/") + "/hidden/"
+            for u in urls
+        ]
+    return urls
+
+
+def _selection_skip_routes(vp, *, bn0):
+    routes = _full_run_routes(vp)
+    if bn0 == "503":
+        # Exhaust the retry budget so select_endpoint walks on, not _promote_from.
+        routes[("bn0", "GET", _VERSION_TEMPLATE)] = [
+            _raw(vp, 503)
+        ] * vp._MAX_ATTEMPTS
+    elif bn0 == "syncing":
+        routes[("bn0", "GET", _VERSION_TEMPLATE)] = [
+            raw_response(vp, "node_version__lighthouse")
+        ]
+        routes[("bn0", "GET", _SYNCING_PATH)] = [
+            raw_response(vp, "node_syncing__is_syncing")
+        ]
+    else:
+        raise AssertionError(bn0)
+    return routes
+
+
+def _run_selection_failover(vp, load, *extra, bn0="503", secret=False):
+    spec = _first_503_spec(load)
+    urls = _selection_urls(spec, secret=secret)
+    transport = FakeTransport(_selection_skip_routes(vp, bn0=bn0))
+    argv = _full_argv(*extra, "--beacon-url", urls[1], url=urls[0])
+    code = vp.main(argv, transport=transport)
+    return spec, urls, code, transport
+
+
+def _shown_urls(vp, urls):
+    return [vp.redact(vp.parse_endpoint(url, f"bn{i}")) for i, url in enumerate(urls)]
+
+
+def test_first_bn_503_completes_on_the_second(vp, load, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    promoted = []
+    orig = vp.BeaconClient._promote_from
+
+    def wrapped(self, ep):
+        promoted.append(ep.label)
+        return orig(self, ep)
+
+    monkeypatch.setattr(vp.BeaconClient, "_promote_from", wrapped)
+    spec, _urls, code, transport = _run_selection_failover(vp, load, "--json")
+    assert spec["selection_status"] == 503
+    assert code == vp.EXIT_OK == 0
+    assert promoted == []
+    doc, _captured = _stdout_json(capsys)
+    validate_schema(doc, _load_perf_schema())
+    assert doc["exit_code"] == 0
+    assert doc["degradations"] == []
+    row = doc["validators"][0]
+    for name in (
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "attester_effectiveness",
+    ):
+        assert row[name] is not None, name
+    bn0 = [c for c in transport.calls if c[0] == "bn0"]
+    assert bn0
+    assert all(c[2] == _VERSION_TEMPLATE for c in bn0)
+    assert len(bn0) == vp._MAX_ATTEMPTS
+    assert any(c[0] == "bn1" and c[2] == _SPEC_TEMPLATE for c in transport.calls)
+    collect = _REWARDS_TEMPLATE.format(epoch=_FULL_FROM)
+    assert any(c[0] == "bn1" and c[2] == collect for c in transport.calls)
+    assert not any(c[0] == "bn0" and c[2] != _VERSION_TEMPLATE for c in transport.calls)
+
+
+def test_endpoints_used_records_which_endpoint_served_the_run(
+    vp, load, capsys, monkeypatch
+):
+    _no_sleep(monkeypatch, vp)
+    _spec, urls, code, _transport = _run_selection_failover(vp, load, "--json")
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    shown = _shown_urls(vp, urls)
+    assert doc["beacon"]["endpoints_used"] == shown
+    assert doc["beacon"]["endpoint"] == shown[-1]
+    assert shown[-1] == vp.redact(vp.parse_endpoint(urls[1], "bn1"))
+
+
+def test_beacon_endpoint_stays_a_string(vp, load, capsys, monkeypatch):
+    schema = _load_perf_schema()
+    assert schema["properties"]["beacon"]["properties"]["endpoint"]["type"] == "string"
+    _no_sleep(monkeypatch, vp)
+    _spec, _urls, code, _transport = _run_selection_failover(vp, load, "--json")
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    endpoint = doc["beacon"]["endpoint"]
+    assert isinstance(endpoint, str)
+    assert not isinstance(endpoint, list)
+
+
+def test_syncing_node_is_skipped_at_selection(vp, load, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    _spec, _urls, code, transport = _run_selection_failover(
+        vp, load, "--json", bn0="syncing"
+    )
+    assert code == vp.EXIT_OK == 0
+    doc, _captured = _stdout_json(capsys)
+    assert doc["degradations"] == []
+    assert [c[2] for c in transport.calls if c[0] == "bn0"] == [
+        _VERSION_TEMPLATE,
+        _SYNCING_PATH,
+    ]
+    assert any(c[0] == "bn1" and c[2] == _SPEC_TEMPLATE for c in transport.calls)
+    row = doc["validators"][0]
+    assert row["source_rate"] is not None
+    assert row["target_rate"] is not None
+
+
+def test_schema_version_still_1(vp, load, capsys):
+    assert vp.SCHEMA_VERSION == 1
+    schema = _load_perf_schema()
+    assert schema["properties"]["schema_version"]["enum"] == [1]
+    doc = json.loads(vp.render_json(_json_run(vp, load)))
+    assert doc["schema_version"] == 1
+    code, _transport = _run_full(vp, "--json")
+    assert code == vp.EXIT_OK == 0
+    live, _captured = _stdout_json(capsys)
+    assert live["schema_version"] == 1
+
+
+def test_endpoints_used_entries_are_redacted(vp, load, capsys, monkeypatch):
+    _no_sleep(monkeypatch, vp)
+    _spec, urls, code, _transport = _run_selection_failover(
+        vp, load, "--json", secret=True
+    )
+    assert code == vp.EXIT_OK == 0
+    doc, captured = _stdout_json(capsys)
+    used = doc["beacon"]["endpoints_used"]
+    assert used == _shown_urls(vp, urls)
+    blob = " ".join([doc["beacon"]["endpoint"], *used])
+    assert "secret" not in blob
+    assert "user:secret" not in blob
+    assert "hidden" not in blob
+    assert "/hidden" not in blob
+    for entry in used:
+        parsed = urlsplit(entry)
+        assert parsed.username is None
+        assert parsed.password is None
+        assert parsed.path in ("", "/")
+    assert "secret" not in captured.out
+    assert "user:" not in captured.out
 
 
 # ----- VP-4c: §4/§14 --fail-under allowlist + evaluate_thresholds + exit 4 -----
