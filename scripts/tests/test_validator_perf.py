@@ -655,3 +655,173 @@ def test_socket_blocked(vp):
             transport(ep, "GET", "/eth/v1/config/spec", None)
     finally:
         enable_socket()
+
+
+def _load_beacon_urls(vp, argv):
+    return vp.load_beacon_urls(vp.build_parser().parse_args(argv))
+
+
+def _minimal_opts_argv(*extra):
+    return ["--pubkey", PK1, "--beacon-url", "http://h:5052", *extra]
+
+
+def test_beacon_nodes_beats_beacon_url_in_config(vp):
+    path = str(FIXTURES / "config__both_keys.toml")
+    eps = _load_beacon_urls(vp, ["--config", path])
+    assert [e.host for e in eps] == ["alpha.example", "beta.example"]
+    assert all(e.host != "primary.example" for e in eps)
+
+
+def test_beacon_url_flag_beats_the_config_file_entirely(vp):
+    path = str(FIXTURES / "config__both_keys.toml")
+    eps = _load_beacon_urls(
+        vp,
+        ["--config", path, "--beacon-url", "http://flag.example:5052"],
+    )
+    assert [e.host for e in eps] == ["flag.example"]
+
+
+def test_empty_beacon_nodes_falls_through_to_beacon_url(vp):
+    path = str(FIXTURES / "config__empty_nodes.toml")
+    eps = _load_beacon_urls(vp, ["--config", path])
+    assert [e.host for e in eps] == ["only.example"]
+
+
+def test_no_beacon_url_exits_2_not_5(vp, tmp_path):
+    with pytest.raises(vp.UsageError) as ei:
+        vp.build_options(["--pubkey", PK1])
+    assert ei.type is vp.UsageError
+    assert not isinstance(ei.value, vp.NoBeaconAvailable)
+    assert "beacon" in str(ei.value).lower()
+    assert vp.EXIT_USAGE == 2
+    assert vp.EXIT_NO_BEACON == 5
+    assert vp.EXIT_USAGE != vp.EXIT_NO_BEACON
+    empty = tmp_path / "config__no_urls.toml"
+    empty.write_text('network = "hoodi"\n', encoding="utf-8")
+    with pytest.raises(vp.UsageError) as ei:
+        vp.build_options(["--pubkey", PK1, "--config", str(empty)])
+    assert "beacon" in str(ei.value).lower()
+    assert vp.EXIT_USAGE == 2
+
+
+def test_epochs_with_from_epoch_exits_2(vp):
+    with pytest.raises(vp.UsageError) as ei:
+        vp.build_options(_minimal_opts_argv("--epochs", "4", "--from-epoch", "1"))
+    assert "epoch" in str(ei.value).lower()
+    assert vp.EXIT_USAGE == 2
+    with pytest.raises(vp.UsageError):
+        vp.build_options(_minimal_opts_argv("--epochs", "4", "--to-epoch", "10"))
+
+
+def test_verbose_and_quiet_together_exits_2(vp):
+    with pytest.raises(vp.UsageError):
+        vp.build_options(_minimal_opts_argv("-v", "-q"))
+    assert vp.EXIT_USAGE == 2
+
+
+def test_options_is_frozen(vp):
+    opts = vp.build_options(_minimal_opts_argv())
+    with pytest.raises(FrozenInstanceError):
+        opts.verbosity = 1
+    assert isinstance(opts.pubkeys, tuple)
+    assert isinstance(opts.endpoints, tuple)
+    assert isinstance(opts.fail_under, tuple)
+
+
+def test_endpoint_labels_are_bn0_bn1_in_config_order(vp):
+    path = str(FIXTURES / "config__both_keys.toml")
+    eps = _load_beacon_urls(vp, ["--config", path])
+    assert [e.label for e in eps] == ["bn0", "bn1"]
+    assert [e.host for e in eps] == ["alpha.example", "beta.example"]
+
+
+def test_verbosity_tiers(vp):
+    assert vp.build_options(_minimal_opts_argv()).verbosity == 0
+    assert vp.build_options(_minimal_opts_argv("-q")).verbosity == -1
+    assert vp.build_options(_minimal_opts_argv("-v")).verbosity == 1
+    assert vp.build_options(_minimal_opts_argv("-vv")).verbosity == 2
+
+
+def test_unset_window_fields_are_none(vp):
+    opts = vp.build_options(_minimal_opts_argv())
+    assert opts.epochs is None
+    assert opts.from_epoch is None
+    assert opts.to_epoch is None
+
+
+def test_from_and_to_epoch_without_epochs_ok(vp):
+    opts = vp.build_options(
+        _minimal_opts_argv("--from-epoch", "10", "--to-epoch", "20")
+    )
+    assert opts.epochs is None
+    assert opts.from_epoch == 10
+    assert opts.to_epoch == 20
+
+
+def test_two_beacon_url_flags_ignore_config(vp):
+    path = str(FIXTURES / "config__both_keys.toml")
+    eps = _load_beacon_urls(
+        vp,
+        [
+            "--config",
+            path,
+            "--beacon-url",
+            "http://flag0.example:5052",
+            "--beacon-url",
+            "http://flag1.example:5052",
+        ],
+    )
+    assert [e.host for e in eps] == ["flag0.example", "flag1.example"]
+    assert [e.label for e in eps] == ["bn0", "bn1"]
+
+
+def test_beacon_url_only_config(vp):
+    path = str(FIXTURES / "config__beacon_url_only.toml")
+    eps = _load_beacon_urls(vp, ["--config", path])
+    assert [e.host for e in eps] == ["solo.example"]
+    assert [e.label for e in eps] == ["bn0"]
+
+
+def test_non_str_beacon_nodes_entry_raises_usage_error(vp, tmp_path):
+    path = tmp_path / "config__int_node.toml"
+    path.write_text("beacon_nodes = [5052]\n", encoding="utf-8")
+    with pytest.raises(vp.UsageError) as ei:
+        _load_beacon_urls(vp, ["--config", str(path)])
+    msg = str(ei.value)
+    assert "--config" in msg
+    assert "5052" in msg
+    assert "beacon" in msg.lower()
+
+
+def test_non_list_beacon_nodes_raises_usage_error(vp, tmp_path):
+    path = tmp_path / "config__string_nodes.toml"
+    path.write_text(
+        'beacon_nodes = "http://string.example:5052"\n'
+        'beacon_url = "http://fallback.example:5052"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(vp.UsageError) as ei:
+        _load_beacon_urls(vp, ["--config", str(path)])
+    msg = str(ei.value)
+    assert "--config" in msg
+    assert "beacon_nodes" in msg
+
+
+def test_non_str_beacon_url_raises_usage_error(vp, tmp_path):
+    path = tmp_path / "config__int_url.toml"
+    path.write_text("beacon_url = 5052\n", encoding="utf-8")
+    with pytest.raises(vp.UsageError) as ei:
+        _load_beacon_urls(vp, ["--config", str(path)])
+    msg = str(ei.value)
+    assert "--config" in msg
+    assert "5052" in msg
+    assert "beacon_url" in msg
+
+
+def test_empty_beacon_url_flag_raises_usage_error(vp):
+    with pytest.raises(vp.UsageError) as ei:
+        _load_beacon_urls(vp, ["--beacon-url", ""])
+    msg = str(ei.value)
+    assert "--beacon-url" in msg
+    assert "beacon" in msg.lower()
+

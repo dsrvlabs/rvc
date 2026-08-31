@@ -245,6 +245,132 @@ def load_pubkeys(args: argparse.Namespace) -> list[str]:
     return out
 
 
+def _load_toml(path: str) -> dict:
+    try:
+        # tomllib.load requires a binary handle; text mode raises TypeError.
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except OSError as e:
+        raise UsageError(f"{path}: {e.strerror}") from e
+    except tomllib.TOMLDecodeError as e:
+        raise UsageError(f"{path}: {e}") from e
+
+
+def _as_url(raw: object, origin: str) -> str:
+    if not isinstance(raw, str) or not raw:
+        raise UsageError(f"{origin}: invalid beacon URL: {raw!r}")
+    return raw
+
+
+def _urls_from_config(path: str) -> list[str]:
+    data = _load_toml(path)
+    origin = f"--config {path}"
+    if "beacon_nodes" in data:
+        nodes = data["beacon_nodes"]
+        if not isinstance(nodes, list) or not all(
+            isinstance(item, str) for item in nodes
+        ):
+            raise UsageError(
+                f"{origin}: beacon_nodes must be an array of URL strings, got {nodes!r}"
+            )
+        if nodes:
+            return list(nodes)
+        # Empty beacon_nodes is a leftover, not "use nothing".
+    if "beacon_url" in data:
+        url = data["beacon_url"]
+        if not isinstance(url, str):
+            raise UsageError(f"{origin}: beacon_url must be a string, got {url!r}")
+        if url:
+            return [url]
+    return []
+
+
+def load_beacon_urls(args: argparse.Namespace) -> list["Endpoint"]:
+    if args.beacon_url is not None:
+        origin = "--beacon-url"
+        raw = list(args.beacon_url)
+    elif args.config:
+        origin = f"--config {args.config}"
+        raw = _urls_from_config(args.config)
+    else:
+        origin = "--beacon-url"
+        raw = []
+    if not raw:
+        raise UsageError(
+            "no beacon URL: supply --beacon-url or --config with beacon_nodes or beacon_url"
+        )
+    return [
+        parse_endpoint(_as_url(url, origin), f"bn{i}") for i, url in enumerate(raw)
+    ]
+
+
+def _validate_combinations(args: argparse.Namespace) -> None:
+    # Syntactic only; window bounds need chain data (§8).
+    if args.quiet and args.verbose:
+        raise UsageError("-v and -q are mutually exclusive")
+    if args.epochs is not None and (
+        args.from_epoch is not None or args.to_epoch is not None
+    ):
+        raise UsageError("--epochs cannot be combined with --from-epoch/--to-epoch")
+
+
+def _verbosity(args: argparse.Namespace) -> int:
+    return -1 if args.quiet else args.verbose
+
+
+@dataclass(frozen=True)
+class Options:
+    pubkeys: tuple[str, ...]
+    endpoints: tuple["Endpoint", ...]
+    epochs: int | None
+    from_epoch: int | None
+    to_epoch: int | None
+    allow_unfinalized: bool
+    force_unsafe_window: bool
+    verbosity: int
+    connect_timeout: float
+    read_timeout: float
+    concurrency: int
+    request_delay_ms: int
+    dry_run: bool
+    json: bool
+    csv: str | None
+    degraded_ok: bool
+    fail_under: tuple[str, ...]
+    liveness_check: bool
+    no_cache: bool
+
+
+def build_options(argv: list[str] | None = None) -> Options:
+    args = build_parser().parse_args(argv)
+    _validate_combinations(args)
+
+    def pick(value, default):
+        return default if value is None else value
+
+    return Options(
+        pubkeys=tuple(load_pubkeys(args)),
+        endpoints=tuple(load_beacon_urls(args)),
+        epochs=args.epochs,
+        from_epoch=args.from_epoch,
+        to_epoch=args.to_epoch,
+        allow_unfinalized=args.allow_unfinalized,
+        force_unsafe_window=args.force_unsafe_window,
+        verbosity=_verbosity(args),
+        connect_timeout=pick(args.connect_timeout, DEFAULT_CONNECT_TIMEOUT),
+        read_timeout=pick(args.read_timeout, DEFAULT_READ_TIMEOUT),
+        concurrency=pick(args.concurrency, DEFAULT_CONCURRENCY),
+        request_delay_ms=pick(args.request_delay_ms, 0),
+        dry_run=args.dry_run,
+        json=args.json,
+        csv=args.csv,
+        degraded_ok=args.degraded_ok,
+        fail_under=tuple(args.fail_under or []),
+        liveness_check=args.liveness_check,
+        no_cache=args.no_cache,
+    )
+
+
 # ===== § 5. Transport =====
 
 
