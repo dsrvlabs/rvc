@@ -5455,3 +5455,285 @@ def test_duties_dedup_cap_and_drop_slots_outside_epoch(vp):
     assert len(slots) <= 32
     assert len(slots) == 32
 
+
+# ----- VP-3c: §12 sync membership — one request per period, state_id inside (RD-12) -----
+
+_SYNC_MEMBERSHIP_RE = re.compile(
+    r"/eth/v1/beacon/states/([^/]+)/sync_committees\?epoch=(\d+)$"
+)
+
+
+class _SyncMembershipTransport:
+    """Serves membership GETs; rewards/sync_committee stays unscripted."""
+
+    def __init__(self, membership_resp, *, head_resp=None):
+        self.membership_resp = membership_resp
+        self.head_resp = head_resp
+        self.calls: list[tuple[str, str, str, object]] = []
+        self.drops: list = []
+        self.closed = False
+
+    def __call__(self, ep, method, path, body):
+        self.calls.append((ep.label, method, path, body))
+        if "rewards/sync_committee" in path:
+            raise KeyError(f"unscripted FakeTransport call: {method} {path}")
+        if "/sync_committees" not in path:
+            raise KeyError(f"unscripted FakeTransport call: {method} {path}")
+        if self.head_resp is not None and "/states/head/" in path:
+            return self.head_resp
+        return self.membership_resp
+
+    def drop(self, ep):
+        self.drops.append(ep)
+
+    def close(self):
+        self.closed = True
+
+
+def _sync_membership_calls(transport):
+    return [
+        c
+        for c in transport.calls
+        if c[1] == "GET" and "/sync_committees" in c[2]
+    ]
+
+
+def _sync_scan_calls(transport):
+    return [c for c in transport.calls if "rewards/sync_committee" in c[2]]
+
+
+def _parse_sync_membership_path(path: str):
+    match = _SYNC_MEMBERSHIP_RE.search(path)
+    assert match is not None, path
+    return match.group(1), int(match.group(2))
+
+
+def _collect_sync(vp, w, ctx, index_set, transport, *, concurrency=1):
+    client, _ = _client(vp, transport)
+    budget = vp.RequestBudget()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        outcomes, degs = vp.collect_sync(
+            client, w, ctx, index_set, pool, budget
+        )
+    return outcomes, degs, transport, budget
+
+
+def _sync_exit(vp, load, degs):
+    run = _json_run(vp, load, degradations=list(degs))
+    return vp.decide_exit_code(run, vp.build_options(_minimal_opts_argv()))
+
+
+def _assert_state_id_inside_period(ctx, transport, w=None):
+    spec = ctx.spec
+    n = spec.epochs_per_sync_committee_period
+    spe = spec.slots_per_epoch
+    membership = _sync_membership_calls(transport)
+    assert membership
+    for _label, _method, path, _body in membership:
+        state_id, epoch = _parse_sync_membership_path(path)
+        assert state_id != "head"
+        slot = int(state_id)
+        assert slot == epoch * spe
+        period_first = (epoch // n) * n
+        period_last = period_first + n - 1
+        assert period_first <= slot // spe <= period_last
+        if w is not None and epoch == w.from_epoch and w.from_epoch % n == n - 1:
+            assert slot != w.start_slot
+
+
+def test_one_request_per_period_not_per_epoch(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    assert spec.epochs_per_sync_committee_period == 256
+    w32 = _att_window(vp, 66, 97)
+    assert w32.epochs == 32
+    ctx = _chain_ctx(vp, load, head_epoch=101)
+    resp = raw_response(vp, "state_sync_committees__intersect")
+    outcomes, _degs, transport, _budget = _collect_sync(
+        vp, w32, ctx, {1}, _SyncMembershipTransport(resp)
+    )
+    membership = _sync_membership_calls(transport)
+    assert len(membership) == 1
+    assert w32.epochs != len(membership)
+    assert outcomes[1].in_committee is True
+
+    w_straddle = _att_window(vp, 240, 271)
+    assert w_straddle.epochs == 32
+    assert 240 // 256 != 271 // 256
+    ctx_late = _chain_ctx(vp, load, head_epoch=280)
+    outcomes2, _degs, transport2, _budget = _collect_sync(
+        vp,
+        w_straddle,
+        ctx_late,
+        {1},
+        _SyncMembershipTransport(resp),
+    )
+    membership2 = _sync_membership_calls(transport2)
+    assert len(membership2) == 2
+    assert w_straddle.epochs != len(membership2)
+    assert outcomes2[1].in_committee is True
+
+
+def test_state_id_lies_inside_the_period(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    n = spec.epochs_per_sync_committee_period
+    w = _att_window(vp, 66, 97)
+    period = 66 // n
+    # Head lives in a later period so state_id="head" is the silent-null 400.
+    ctx = _chain_ctx(vp, load, head_epoch=300)
+    assert ctx.head_epoch // n != period
+    ok = raw_response(vp, "state_sync_committees__intersect")
+    outside = raw_response(
+        vp, "state_sync_committees__400_outside_period", status=400
+    )
+    outcomes, degs, transport, _budget = _collect_sync(
+        vp,
+        w,
+        ctx,
+        {1},
+        _SyncMembershipTransport(ok, head_resp=outside),
+    )
+    assert degs == []
+    assert 1 in outcomes
+    _assert_state_id_inside_period(ctx, transport, w)
+
+    # Last epoch of a 256-period: start_slot is already period 1.
+    w_edge = _att_window(vp, 255, 286)
+    assert w_edge.start_slot // spec.slots_per_epoch == 256
+    ctx_edge = _chain_ctx(vp, load, head_epoch=400)
+    assert ctx_edge.head_epoch // n != 0
+    _outcomes, degs_edge, transport_edge, _budget = _collect_sync(
+        vp,
+        w_edge,
+        ctx_edge,
+        {1},
+        _SyncMembershipTransport(ok, head_resp=outside),
+    )
+    assert degs_edge == []
+    _assert_state_id_inside_period(ctx_edge, transport_edge, w_edge)
+
+    spec64 = replace(spec, epochs_per_sync_committee_period=64)
+    ctx64 = replace(ctx_edge, spec=spec64)
+    _outcomes, degs64, transport64, _budget = _collect_sync(
+        vp,
+        w_edge,
+        ctx64,
+        {1},
+        _SyncMembershipTransport(ok, head_resp=outside),
+    )
+    assert degs64 == []
+    _assert_state_id_inside_period(ctx64, transport64, w_edge)
+
+
+def test_state_id_clamped_to_head_when_future(vp, load):
+    spec = _spec_from_fixture(vp, load)
+    w = _att_window(vp, 66, 97)
+    slot = w.from_epoch * spec.slots_per_epoch
+    ctx = _chain_ctx(vp, load, head_epoch=50, head_slot=slot - 1)
+    assert slot > ctx.head_slot
+    ok = raw_response(vp, "state_sync_committees__intersect")
+    _outcomes, degs, transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, _SyncMembershipTransport(ok)
+    )
+    assert degs == []
+    membership = _sync_membership_calls(transport)
+    assert membership
+    for _label, _method, path, _body in membership:
+        state_id, _epoch = _parse_sync_membership_path(path)
+        assert state_id == "head"
+
+
+def test_400_outside_period_is_reported_as_sync_committees_unavailable(
+    vp, load
+):
+    w = _att_window(vp, 66, 97)
+    ctx = _chain_ctx(vp, load, head_epoch=101)
+    outside = raw_response(
+        vp, "state_sync_committees__400_outside_period", status=400
+    )
+    message = load("state_sync_committees__400_outside_period")["message"]
+    outcomes, degs, _transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, _SyncMembershipTransport(outside)
+    )
+    assert degs
+    assert all(d.reason == "sync_committees_unavailable" for d in degs)
+    assert all(
+        d.scope.startswith("epoch:") or d.scope == "run" for d in degs
+    )
+    assert not any(d.scope.startswith("period:") for d in degs)
+    assert any(message in d.detail for d in degs)
+    assert all(not o.in_committee for o in outcomes.values())
+    assert all(o.participation_rate is None for o in outcomes.values())
+
+
+def test_empty_intersection_gives_null_m8_with_no_degradation_and_exit_0(
+    vp, load
+):
+    w = _att_window(vp, 66, 97)
+    ctx = _chain_ctx(vp, load, head_epoch=101)
+    empty = raw_response(vp, "state_sync_committees__empty")
+    outcomes, degs, _transport, _budget = _collect_sync(
+        vp, w, ctx, {1, 2}, _SyncMembershipTransport(empty)
+    )
+    assert degs == []
+    assert set(outcomes) == {1, 2}
+    for outcome in outcomes.values():
+        assert outcome.in_committee is False
+        assert outcome.participation_rate is None
+    assert _sync_exit(vp, load, degs) == vp.EXIT_OK == 0
+
+
+def test_empty_intersection_skips_the_per_slot_scan_entirely(vp, load):
+    w = _att_window(vp, 66, 97)
+    ctx = _chain_ctx(vp, load, head_epoch=101)
+    empty = raw_response(vp, "state_sync_committees__empty")
+    _outcomes, degs, transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, _SyncMembershipTransport(empty)
+    )
+    assert degs == []
+    assert _sync_scan_calls(transport) == []
+    assert not any(
+        "rewards/sync_committee" in c[2] for c in transport.calls
+    )
+
+
+def test_epochs_per_sync_committee_period_read_from_spec_not_hardcoded(
+    vp, load
+):
+    src = inspect.getsource(vp.sync_periods)
+    assert "256" not in src
+    assert "epochs_per_sync_committee_period" in src
+    w = _att_window(vp, 50, 81)
+    assert w.epochs == 32
+    spec256 = _spec_from_fixture(vp, load)
+    spec64 = replace(spec256, epochs_per_sync_committee_period=64)
+    assert spec64.epochs_per_sync_committee_period == 64
+    assert vp.sync_periods(w, spec256) == [0]
+    assert vp.sync_periods(w, spec64) == [0, 1]
+    ctx = replace(
+        _chain_ctx(vp, load, head_epoch=101),
+        spec=spec64,
+    )
+    ok = raw_response(vp, "state_sync_committees__empty")
+    _outcomes, _degs, transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, _SyncMembershipTransport(ok)
+    )
+    assert len(_sync_membership_calls(transport)) == 2
+
+
+def test_sync_committees_failure_degrades_and_exits_3(vp, load):
+    w = _att_window(vp, 66, 97)
+    ctx = _chain_ctx(vp, load, head_epoch=101)
+    missing = _raw(vp, 404)
+    outcomes, degs, _transport, _budget = _collect_sync(
+        vp, w, ctx, {1}, _SyncMembershipTransport(missing)
+    )
+    assert degs
+    assert all(d.reason == "sync_committees_unavailable" for d in degs)
+    assert all(
+        d.scope.startswith("epoch:") or d.scope == "run" for d in degs
+    )
+    assert not any(d.scope.startswith("period:") for d in degs)
+    assert all(o.participation_rate is None for o in outcomes.values())
+    assert _sync_exit(vp, load, degs) == vp.EXIT_DEGRADED == 3
+    assert vp.EXIT_ERROR == 1
+

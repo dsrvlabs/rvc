@@ -1485,6 +1485,115 @@ def collect_proposals(
 
 # ===== § 12. Sync committee — M8 =====
 
+
+@dataclass(frozen=True)
+class SyncOutcome:
+    in_committee: bool
+    slots_eligible: int
+    slots_signed: int
+    reward_gwei: int
+
+    @property
+    def participation_rate(self) -> float | None:
+        if not self.in_committee or self.slots_eligible <= 0:
+            return None
+        return self.slots_signed / self.slots_eligible
+
+
+def sync_periods(w: Window, spec: Spec) -> list[int]:
+    n = spec.epochs_per_sync_committee_period
+    return list(range(w.from_epoch // n, w.to_epoch // n + 1))
+
+
+def sync_period_state_id(
+    w: Window, spec: Spec, period: int, head_slot: int
+) -> str:
+    # Query epoch, not w.start_slot: start_slot is (from_epoch+1)*SPE (RD-4)
+    # and already sits in the next period when from_epoch is a period's last.
+    slot = _sync_query_epoch(w, spec, period) * spec.slots_per_epoch
+    return "head" if slot > head_slot else str(slot)
+
+
+def _sync_query_epoch(w: Window, spec: Spec, period: int) -> int:
+    return max(w.from_epoch, period * spec.epochs_per_sync_committee_period)
+
+
+def _sync_member_indices(raw: object, ours: set[int]) -> set[int]:
+    rows = raw if isinstance(raw, list) else []
+    found: set[int] = set()
+    for item in rows:
+        if isinstance(item, int):
+            idx = item
+        else:
+            try:
+                idx = parse_uint(item, "index")
+            except UsageError:
+                continue
+        if idx in ours:
+            found.add(idx)
+    return found
+
+
+def _empty_sync(indices: set[int]) -> dict[int, SyncOutcome]:
+    blank = SyncOutcome(False, 0, 0, 0)
+    return {idx: blank for idx in indices}
+
+
+def collect_sync(
+    client: BeaconClient,
+    w: Window,
+    ctx: ChainContext,
+    index_set,
+    pool,
+    budget,
+) -> tuple[dict[int, SyncOutcome], list[Degradation]]:
+    indices = set(index_set)
+    if not indices:
+        return {}, []
+    spec = ctx.spec
+    degs: list[Degradation] = []
+    members: set[int] = set()
+
+    def worker(period: int) -> set[int]:
+        epoch = _sync_query_epoch(w, spec, period)
+        state_id = sync_period_state_id(w, spec, period, ctx.head_slot)
+        return _sync_member_indices(
+            client.sync_committee(state_id, epoch), indices
+        )
+
+    futs = {
+        pool.submit(worker, period): period for period in sync_periods(w, spec)
+    }
+    for fut in as_completed(futs):
+        period = futs[fut]
+        try:
+            members.update(fut.result())
+        except (BeaconStatus, BeaconTransport) as exc:
+            epoch = _sync_query_epoch(w, spec, period)
+            if isinstance(exc, BeaconStatus) and exc.status == 400:
+                detail = (
+                    f"HTTP {exc.status} Epoch is outside the sync committee "
+                    "period of the state (state_id must sit inside the period)"
+                )
+            elif isinstance(exc, BeaconStatus):
+                detail = f"HTTP {exc.status}"
+            else:
+                detail = "transport"
+            degs.append(
+                Degradation(
+                    "sync",
+                    f"epoch:{epoch}",
+                    "sync_committees_unavailable",
+                    detail,
+                )
+            )
+    if degs:
+        return _empty_sync(indices), degs
+    return {
+        idx: SyncOutcome(idx in members, 0, 0, 0) for idx in indices
+    }, []
+
+
 # ===== § 13. Balances and effective balance =====
 
 
