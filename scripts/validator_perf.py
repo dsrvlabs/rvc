@@ -7,6 +7,7 @@
 
 import argparse
 import base64
+import csv
 import http.client
 import json
 import math
@@ -2851,6 +2852,91 @@ def render_json(
     return json.dumps(doc, default=_json_default)
 
 
+def _flatten(d: object, prefix: str = "") -> dict[str, object]:
+    if not isinstance(d, dict):
+        return {prefix: d} if prefix else {}
+    out: dict[str, object] = {}
+    for key, value in d.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def _csv_template_report() -> ValidatorReport:
+    # In-committee sync so the header always has dotted sync.* (A7 first row).
+    return ValidatorReport(
+        ref=ValidatorRef("", None, "", None, None, None, False),
+        active_epochs=0,
+        participation_rate=None,
+        source_rate=None,
+        target_rate=None,
+        head_rate=None,
+        missed_attestations=None,
+        attester_effectiveness=None,
+        effectiveness_method="reward_ratio",
+        leak_epochs_excluded=0,
+        proposals=_proposal_counts((), True),
+        sync=SyncOutcome(True, 0, 0, 0),
+        balance=BalanceSnapshot(None, None, None, None),
+        rewards_gwei=_assemble_rewards(
+            (),
+            delta_gwei=None,
+            proposer_gwei=None,
+            sync_gwei=0,
+            use_api=True,
+        )[0],
+        reward_source=None,
+        estimated_apr=None,
+        window_epochs=0,
+        degradations=[],
+    )
+
+
+def _csv_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        text = ";".join(
+            f"{item.get('reason', '')}@{item.get('scope', '')}"
+            if isinstance(item, dict)
+            else str(item)
+            for item in value
+        )
+    elif isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, str):
+        text = value
+    else:
+        return str(value)
+    # BN-controlled strings (=cmd|…) must not become spreadsheet formulas.
+    if text and text[0] in "=+-@":
+        return "'" + text
+    return text
+
+
+def render_csv(run: RunReport, path: str) -> None:
+    """Write one CSV row per validator.
+
+    Nested objects flatten with a dotted prefix. The degradations column is a
+    `;`-joined reason@scope summary; JSON is authoritative for the detail.
+    None renders as an empty cell, never 0.
+    """
+    fieldnames = list(
+        _flatten(_validator_json(_csv_template_report(), run.window))
+    )
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for report in run.validators:
+            row = _flatten(
+                _validator_json(report, run.window, run.threshold_breaches)
+            )
+            writer.writerow({k: _csv_cell(row.get(k)) for k in fieldnames})
+
+
 # ===== § 16. main =====
 
 
@@ -3024,6 +3110,8 @@ def main(
             print(render_json(run))
         else:
             render_table(run, sys.stdout)
+        if opts.csv:
+            render_csv(run, opts.csv)
         return code
     except UsageError as exc:
         log.error("%s", exc)

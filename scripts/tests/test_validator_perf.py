@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import csv
 import http.client
 import inspect
 import io
@@ -3270,6 +3271,7 @@ def test_main_body_has_no_metric_logic():
         "decide_exit_code",
         "render_json",
         "render_table",
+        "render_csv",
         "_render_dry_run",
         "replace(",
         "ThreadPoolExecutor",
@@ -3293,6 +3295,7 @@ def test_main_body_has_no_metric_logic():
         "decide_exit_code",
         "render_json",
         "render_table",
+        "render_csv",
     ]
     positions = [body.index(name) for name in order]
     assert positions == sorted(positions)
@@ -9092,5 +9095,273 @@ def test_non_hex_genesis_root_is_a_cache_miss(vp, tmp_path, monkeypatch):
     assert vp._cache_read("0x" + "aa" * 32 + "/../x", [PK1], None) is None
     vp._cache_write("not-a-root", {PK1: 1}, None)
     assert list((tmp_path / "xdg").rglob("*.json")) == []
+
+
+# ----- VP-5a: §15 render_csv — same fields as validators[] (P2-1) -----
+
+# Hand-written full JSON validator leaf list (in-committee sync.*). Drift
+# against the renderer is the failure this test exists for.
+_HANDWRITTEN_CSV_FIELDS = (
+    "pubkey",
+    "index",
+    "status",
+    "active_epochs",
+    "participation_rate",
+    "source_rate",
+    "target_rate",
+    "head_rate",
+    "missed_attestations",
+    "attester_effectiveness",
+    "effectiveness_method",
+    "leak_epochs_excluded",
+    "proposals.scheduled",
+    "proposals.included",
+    "proposals.missed",
+    "sync.in_committee",
+    "sync.participation_rate",
+    "sync.slots_eligible",
+    "sync.slots_signed",
+    "sync.reward_gwei",
+    "balance.start_gwei",
+    "balance.end_gwei",
+    "balance.delta_gwei",
+    "balance.effective_balance_gwei",
+    "balance.effective_balance_changed",
+    "balance.start_slot",
+    "balance.end_slot",
+    "balance.reconciliation",
+    "rewards_gwei.source",
+    "rewards_gwei.target",
+    "rewards_gwei.head",
+    "rewards_gwei.inactivity",
+    "rewards_gwei.proposer",
+    "rewards_gwei.sync",
+    "rewards_gwei.total",
+    "estimated_apr",
+    "reward_source",
+    "degradations",
+    "threshold_breaches",
+)
+
+
+def _flatten_json(d, prefix=""):
+    if not isinstance(d, dict):
+        return {prefix: d} if prefix else {}
+    out = {}
+    for key, value in d.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            out.update(_flatten_json(value, path))
+        else:
+            out[path] = value
+    return out
+
+
+def _write_csv(vp, run, tmp_path, name="out.csv"):
+    path = tmp_path / name
+    vp.render_csv(run, str(path))
+    return path
+
+
+def _csv_rows(path: Path):
+    with path.open(encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        return reader.fieldnames, list(reader)
+
+
+def test_csv_columns_match_the_json_validator_fields(vp, load, tmp_path):
+    run = _table_run(vp, load, _golden_reports(vp))
+    header, _rows = _csv_rows(_write_csv(vp, run, tmp_path))
+    complete = next(
+        row
+        for row in json.loads(vp.render_json(run))["validators"]
+        if isinstance(row.get("sync"), dict)
+    )
+    json_keys = set(_flatten_json(complete))
+    assert set(header) == json_keys
+    assert json_keys == set(_HANDWRITTEN_CSV_FIELDS)
+    assert "sync" not in header
+
+
+def test_csv_null_renders_empty_never_zero(vp, load, tmp_path):
+    report = _table_report(
+        vp,
+        ref=_active_ref(vp, index=7, pubkey=PK1),
+        head_rate=None,
+        missed_attestations=0,
+    )
+    _header, rows = _csv_rows(
+        _write_csv(vp, _table_run(vp, load, [report]), tmp_path)
+    )
+    cell = rows[0]["head_rate"]
+    assert cell == ""
+    assert "0" not in cell
+    assert rows[0]["missed_attestations"] == "0"
+
+
+def test_csv_golden_matches(vp, load, tmp_path):
+    run = _table_run(vp, load, _golden_reports(vp))
+    text = _write_csv(vp, run, tmp_path).read_text(encoding="utf-8")
+    expected = (FIXTURES / "csv__golden.csv").read_text(encoding="utf-8")
+    assert text == expected
+
+
+def test_csv_header_stable_when_unknown_is_first(vp, load, tmp_path):
+    unknown = _table_report(
+        vp,
+        ref=vp._unknown_ref(PK1),
+        active_epochs=0,
+        participation_rate=None,
+        source_rate=None,
+        target_rate=None,
+        head_rate=None,
+        missed_attestations=None,
+        attester_effectiveness=None,
+        estimated_apr=None,
+        reward_source=None,
+        balance=vp.BalanceSnapshot(None, None, None, None),
+    )
+    outsider = _table_report(
+        vp, ref=_active_ref(vp, index=2, pubkey=PK2)
+    )
+    member = _table_report(
+        vp,
+        ref=_active_ref(vp, index=3, pubkey=PK3),
+        sync=vp.SyncOutcome(True, 32, 16, 0),
+    )
+    run = _table_run(vp, load, [unknown, outsider, member])
+    header, rows = _csv_rows(_write_csv(vp, run, tmp_path))
+    for name in (
+        "sync.in_committee",
+        "sync.participation_rate",
+        "sync.slots_eligible",
+        "sync.slots_signed",
+        "sync.reward_gwei",
+    ):
+        assert name in header
+    assert "sync" not in header
+    assert len(rows) == 3
+    assert rows[0]["index"] == ""
+    assert rows[0]["sync.in_committee"] == ""
+    assert rows[1]["sync.in_committee"] == ""
+    assert rows[2]["sync.in_committee"] == "true"
+    assert rows[2]["sync.participation_rate"] == "0.5"
+
+
+def test_one_row_per_validator_including_unknown_keys(vp, load, tmp_path):
+    known = _table_report(vp, ref=_active_ref(vp, index=1, pubkey=PK1))
+    unknown = _table_report(
+        vp,
+        ref=vp._unknown_ref(PK2),
+        active_epochs=0,
+        participation_rate=None,
+        source_rate=None,
+        target_rate=None,
+        head_rate=None,
+        missed_attestations=None,
+        attester_effectiveness=None,
+        estimated_apr=None,
+        reward_source=None,
+        balance=vp.BalanceSnapshot(None, None, None, None),
+    )
+    run = _table_run(vp, load, [known, unknown])
+    _header, rows = _csv_rows(_write_csv(vp, run, tmp_path))
+    assert len(rows) == len(run.validators) == 2
+    assert rows[1]["status"] == "unknown"
+    assert rows[1]["index"] == ""
+    assert rows[0]["index"] == "1"
+
+
+def test_csv_and_json_together_are_legal(vp, tmp_path, capsys):
+    dest = tmp_path / "together.csv"
+    code, _transport = _run_full(vp, "--json", "--csv", str(dest))
+    assert code == vp.EXIT_OK
+    doc, captured = _stdout_json(capsys)
+    assert dest.is_file()
+    header, rows = _csv_rows(dest)
+    assert header
+    assert len(rows) == len(doc["validators"])
+    assert "DEGRADED:" not in captured.out
+    assert dest.read_text(encoding="utf-8") not in captured.out
+
+
+def test_csv_written_only_to_the_named_path(vp, tmp_path, capsys):
+    repo = SCRIPT.resolve().parent.parent
+    dest = tmp_path / "operator-named.csv"
+    before = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+    )
+    before_csv = {p for p in (repo / "scripts").rglob("*.csv")}
+    code, _transport = _run_full(vp, "--csv", str(dest))
+    capsys.readouterr()
+    assert code == vp.EXIT_OK
+    assert dest.is_file()
+    after = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repo,
+    )
+    added = set(after.splitlines()) - set(before.splitlines())
+    assert added == set()
+    after_csv = {p for p in (repo / "scripts").rglob("*.csv")}
+    assert after_csv == before_csv
+    assert dest.resolve() not in after_csv
+
+
+def test_degradations_column_documented_as_a_summary(vp, load, tmp_path):
+    doc = inspect.getdoc(vp.render_csv)
+    assert doc is not None
+    lower = doc.lower()
+    assert "summary" in lower
+    assert "json" in lower
+    assert "authoritative" in lower
+    deg = vp.Degradation(
+        "head_rate", "epoch:100", "inactivity_leak", "full leak detail"
+    )
+    extra = vp.Degradation(
+        "balance", "validator:1", "state_unavailable", "slot missing"
+    )
+    report = _table_report(vp, degradations=[deg, extra])
+    _header, rows = _csv_rows(
+        _write_csv(vp, _table_run(vp, load, [report]), tmp_path)
+    )
+    assert (
+        rows[0]["degradations"]
+        == "inactivity_leak@epoch:100;state_unavailable@validator:1"
+    )
+    assert "full leak detail" not in rows[0]["degradations"]
+    assert "slot missing" not in rows[0]["degradations"]
+
+
+def test_csv_quotes_fields_containing_separators(vp, load, tmp_path):
+    report = _table_report(
+        vp,
+        ref=_active_ref(vp, index=1, pubkey=PK1, status="active,ongoing"),
+    )
+    path = _write_csv(vp, _table_run(vp, load, [report]), tmp_path)
+    text = path.read_text(encoding="utf-8")
+    assert '"active,ongoing"' in text
+    _header, rows = _csv_rows(path)
+    assert rows[0]["status"] == "active,ongoing"
+
+
+def test_csv_neutralizes_formula_injection(vp, load, tmp_path):
+    for raw in ("=cmd|'/C calc'!A0", "+1+1", "-1+1", "@SUM(A1)"):
+        report = _table_report(
+            vp,
+            ref=_active_ref(vp, index=1, pubkey=PK1, status=raw),
+        )
+        path = _write_csv(vp, _table_run(vp, load, [report]), tmp_path)
+        text = path.read_text(encoding="utf-8")
+        _header, rows = _csv_rows(path)
+        assert rows[0]["status"] == "'" + raw
+        assert "'" + raw in text
+    rewards = _rewards_gwei(0)
+    rewards["inactivity"] = -100
+    numeric = _table_report(vp, rewards_gwei=rewards)
+    _header, rows = _csv_rows(
+        _write_csv(vp, _table_run(vp, load, [numeric]), tmp_path)
+    )
+    assert rows[0]["rewards_gwei.inactivity"] == "-100"
 
 
