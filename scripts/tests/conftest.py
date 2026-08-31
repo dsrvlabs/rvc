@@ -1,0 +1,69 @@
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import pytest
+from pytest_socket import disable_socket
+
+SCRIPT = Path(__file__).resolve().parents[1] / "validator_perf.py"
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _no_network():
+    disable_socket()  # no ini file exists, so no addopts; do it here
+
+
+def load_script(name: str = "validator_perf"):
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)  # requires the __main__ guard in §16
+    return mod
+
+
+@pytest.fixture(scope="session")
+def vp():
+    return load_script()
+
+
+@pytest.fixture
+def load():
+    return lambda name: json.loads((_FIXTURES / f"{name}.json").read_text())
+
+
+def raw_response(vp, name: str, status: int = 200, truncated: bool = False):
+    body = (_FIXTURES / f"{name}.json").read_bytes()
+    return vp.RawResponse(status, body, truncated)
+
+
+def route_map(**scenarios):
+    """Build FakeTransport routes. Keys are 'METHOD path'."""
+    routes: dict[tuple[str, str], list] = {}
+    for key, responses in scenarios.items():
+        method, path = key.split(None, 1)
+        routes[(method, path)] = list(responses)
+    return routes
+
+
+class FakeTransport:
+    def __init__(self, routes: dict[tuple[str, str], list]):
+        self.routes = {key: list(queue) for key, queue in routes.items()}
+        self.calls: list[tuple[str, str, str, object]] = []
+        self.drops: list = []
+
+    def __call__(self, ep, method, path, body):
+        self.calls.append((ep.label, method, path, body))
+        try:
+            queue = self.routes[(method, path)]
+        except KeyError:
+            raise KeyError(f"unscripted FakeTransport call: {method} {path}") from None
+        if not queue:
+            raise IndexError(f"no scripted responses left for {method} {path}")
+        return queue.pop(0)
+
+    def drop(self, ep):
+        self.drops.append(ep)

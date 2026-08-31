@@ -1,4 +1,4 @@
-"""Prelude tests for scripts/validator_perf.py (VP-1a).
+"""Tests for scripts/validator_perf.py.
 
 Pytest prepends this directory, not scripts/, so the script is loaded by path.
 """
@@ -6,30 +6,17 @@ Pytest prepends this directory, not scripts/, so the script is loaded by path.
 from __future__ import annotations
 
 import ast
-import importlib.util
+import inspect
 import io
 import re
+import socket
 import sys
 from pathlib import Path
 
 import pytest
+from pytest_socket import SocketBlockedError
 
-SCRIPT = Path(__file__).resolve().parents[1] / "validator_perf.py"
-
-
-def load_vp():
-    spec = importlib.util.spec_from_file_location("validator_perf", SCRIPT)
-    if spec is None or spec.loader is None:
-        raise FileNotFoundError(SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture
-def vp():
-    return load_vp()
+from conftest import FakeTransport, SCRIPT, load_script, route_map
 
 
 def test_exit_codes_are_the_six_documented_values(vp):
@@ -157,3 +144,70 @@ def test_normalize_pubkey_rejects_47_bytes_naming_origin(vp):
     with pytest.raises(vp.UsageError) as ei:
         vp.normalize_pubkey("ab" * 47, origin)
     assert origin in str(ei.value)
+
+
+def test_network_is_blocked():
+    with pytest.raises(SocketBlockedError, match="getaddrinfo"):
+        socket.getaddrinfo("example.com", 80)
+
+
+def test_vp_fixture_loads_the_script_by_path(vp):
+    assert vp.SCHEMA_VERSION == 1
+    assert Path(vp.__file__).resolve() == SCRIPT.resolve()
+
+
+def test_script_does_not_run_main_on_import(capsys):
+    source = SCRIPT.read_text(encoding="utf-8")
+    guard_at = source.index('if __name__ == "__main__":')
+    assert "sys.exit(main())" in source[guard_at:]
+    # session-scoped vp already ran; load again here so capsys sees import I/O
+    mod = load_script("validator_perf_guard")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert mod.SCHEMA_VERSION == 1
+
+
+def test_faketransport_records_calls_in_order(vp):
+    ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    first = vp.RawResponse(503, b"retry", False)
+    second = vp.RawResponse(200, b"ok", False)
+    other = vp.RawResponse(200, b"spec", False)
+    transport = FakeTransport(
+        route_map(
+            **{
+                "GET /eth/v1/node/syncing": [first, second],
+                "GET /eth/v1/config/spec": [other],
+            }
+        )
+    )
+    assert transport(ep, "GET", "/eth/v1/node/syncing", None) is first
+    assert transport(ep, "GET", "/eth/v1/config/spec", b"") is other
+    assert transport(ep, "GET", "/eth/v1/node/syncing", None) is second
+    assert transport.calls == [
+        ("bn0", "GET", "/eth/v1/node/syncing", None),
+        ("bn0", "GET", "/eth/v1/config/spec", b""),
+        ("bn0", "GET", "/eth/v1/node/syncing", None),
+    ]
+    transport.drop(ep)
+    assert transport.drops == [ep]
+
+
+def test_faketransport_raises_on_an_unscripted_call(vp):
+    ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    transport = FakeTransport({("GET", "/eth/v1/node/syncing"): [vp.RawResponse(200, b"", False)]})
+    with pytest.raises(KeyError):
+        transport(ep, "GET", "/unscripted", None)
+    assert transport(ep, "GET", "/eth/v1/node/syncing", None).status == 200
+    with pytest.raises(IndexError):
+        transport(ep, "GET", "/eth/v1/node/syncing", None)
+
+
+def test_faketransport_satisfies_the_transport_alias(vp):
+    ep = vp.Endpoint("bn0", "http", "127.0.0.1", 5052, "", None)
+    body = vp.RawResponse(200, b"{}", False)
+    transport = FakeTransport({("GET", "/x"): [body]})
+    assert list(inspect.signature(transport).parameters) == ["ep", "method", "path", "body"]
+    got = transport(ep, "GET", "/x", b"payload")
+    assert got is body
+    assert isinstance(got, vp.RawResponse)
