@@ -1,5 +1,7 @@
 # Running rvc - Rust Validator Client
 
+To estimate consensus-layer performance of a validator set from a beacon node (without running `rvc`), see [validator-perf.md](validator-perf.md).
+
 ## Prerequisites
 
 - Rust toolchain (edition 2021, MSRV 1.92)

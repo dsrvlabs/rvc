@@ -48,6 +48,8 @@ network = "mainnet"
 
 See `config.example.toml` for all options including multi-BN failover, Keymanager API, remote signing, secret providers, and tracing.
 
+To estimate consensus-layer performance of a key set from a beacon node (without running `rvc`), see [docs/validator-perf.md](docs/validator-perf.md).
+
 ## Binaries
 
 | Binary | Description |

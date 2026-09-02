@@ -195,3 +195,4 @@ pubkey = "0xa1b2c3...another-pubkey..."
 - [`docs/keymanager-api.openapi.yaml`](./keymanager-api.openapi.yaml) — OpenAPI 3.0 spec for the same HTTP API
 - [`docs/running-guide.md`](./running-guide.md) — CLI flags and general operation
 - [`validators.example.toml`](../validators.example.toml) — copy-and-edit sample file
+- [`validator-perf.md`](validator-perf.md) — estimate consensus-layer performance of these pubkeys from a beacon node
