@@ -108,9 +108,7 @@ fn strip_comments_and_strings(src: &str) -> String {
             if j < bytes.len() && bytes[j] == b'"' {
                 let hashes = j - (i + 1);
                 // blank `r###"`
-                for _ in i..=j {
-                    out.push(b' ');
-                }
+                out.extend(std::iter::repeat_n(b' ', j - i + 1));
                 i = j + 1;
                 loop {
                     if i >= bytes.len() {
@@ -122,10 +120,7 @@ fn strip_comments_and_strings(src: &str) -> String {
                             k += 1;
                         }
                         if k == hashes {
-                            out.push(b' '); // "
-                            for _ in 0..hashes {
-                                out.push(b' ');
-                            }
+                            out.extend(std::iter::repeat_n(b' ', hashes + 1)); // "###
                             i += 1 + hashes;
                             break;
                         }
@@ -652,8 +647,8 @@ fn find_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
         return None;
     }
     let mut depth = 0i32;
-    for i in open..bytes.len() {
-        match bytes[i] {
+    for (i, &byte) in bytes.iter().enumerate().skip(open) {
+        match byte {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;

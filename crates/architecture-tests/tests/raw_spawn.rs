@@ -113,7 +113,7 @@ fn is_src_tests_path(rel: &str) -> bool {
         return false;
     };
     let after = &parts[src_i + 1..];
-    if after.iter().any(|&p| p == "tests") {
+    if after.contains(&"tests") {
         return true;
     }
     after.last().is_some_and(|p| *p == "tests.rs")

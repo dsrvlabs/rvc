@@ -40,12 +40,7 @@ const MIN_RESOLVED_FROM_NON_EXEMPT: usize = 1;
 // ---------------------------------------------------------------------------
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
 }
 
 /// Tracked markdown under `docs/` (includes top-level `docs/*.md` and nested paths).
@@ -192,23 +187,17 @@ fn dead_paths_in_doc(
 }
 
 /// Scan all tracked docs; returns (dead paths, count of resolved tokens from non-exempt docs).
-fn scan_tracked_docs(
-    root: &Path,
-    exempt_docs: &HashSet<&str>,
-) -> (Vec<DeadPath>, usize) {
+fn scan_tracked_docs(root: &Path, exempt_docs: &HashSet<&str>) -> (Vec<DeadPath>, usize) {
     let docs = tracked_docs_markdown(root);
-    assert!(
-        !docs.is_empty(),
-        "git ls-files returned no docs/**/*.md; workspace walk likely broke"
-    );
+    assert!(!docs.is_empty(), "git ls-files returned no docs/**/*.md; workspace walk likely broke");
 
     let mut dead = Vec::new();
     let mut resolved_non_exempt = 0usize;
 
     for doc in &docs {
         let abs = root.join(doc);
-        let body = std::fs::read_to_string(&abs)
-            .unwrap_or_else(|e| panic!("read {}: {e}", abs.display()));
+        let body =
+            std::fs::read_to_string(&abs).unwrap_or_else(|e| panic!("read {}: {e}", abs.display()));
         if exempt_docs.contains(doc.as_str()) {
             continue;
         }
@@ -236,21 +225,14 @@ fn scan_tracked_docs(
 fn test_docs_reference_only_existing_paths() {
     let root = workspace_root();
     let exempt: HashSet<&str> = STALE_DOC_EXEMPTIONS.iter().map(|(p, _)| *p).collect();
-    assert_eq!(
-        exempt.len(),
-        STALE_DOC_EXEMPTIONS.len(),
-        "duplicate STALE_DOC_EXEMPTIONS paths"
-    );
+    assert_eq!(exempt.len(), STALE_DOC_EXEMPTIONS.len(), "duplicate STALE_DOC_EXEMPTIONS paths");
     assert_eq!(
         STALE_DOC_EXEMPTIONS.len(),
         1,
         "STALE_DOC_EXEMPTIONS must stay a single NG8 entry until docs/architecture.md moves"
     );
     assert_eq!(STALE_DOC_EXEMPTIONS[0].0, "docs/architecture.md");
-    assert!(
-        STALE_DOC_EXEMPTIONS[0].1.contains("NG8"),
-        "exemption reason must cite NG8"
-    );
+    assert!(STALE_DOC_EXEMPTIONS[0].1.contains("NG8"), "exemption reason must cite NG8");
     assert!(
         STALE_DOC_EXEMPTIONS[0].1.contains("plan/test-architecture-audit.md"),
         "exemption reason must name the removal trigger path"
@@ -264,10 +246,7 @@ fn test_docs_reference_only_existing_paths() {
          Fix the citation in the doc. Do not grow STALE_DOC_EXEMPTIONS (shrinking-only; the \
          one-entry NG8 ratchet is intentional).\n\
          Offenders:\n  {}",
-        dead.iter()
-            .map(|d| format!("{}: `{}`", d.doc, d.path))
-            .collect::<Vec<_>>()
-            .join("\n  ")
+        dead.iter().map(|d| format!("{}: `{}`", d.doc, d.path)).collect::<Vec<_>>().join("\n  ")
     );
     assert!(
         resolved >= MIN_RESOLVED_FROM_NON_EXEMPT,
@@ -294,8 +273,8 @@ fn test_docs_freshness_rejects_a_dead_path() {
 fn test_empty_exemption_flags_architecture_md_dead_paths() {
     let root = workspace_root();
     let abs = root.join("docs/architecture.md");
-    let body = std::fs::read_to_string(&abs)
-        .unwrap_or_else(|e| panic!("read {}: {e}", abs.display()));
+    let body =
+        std::fs::read_to_string(&abs).unwrap_or_else(|e| panic!("read {}: {e}", abs.display()));
     let empty: HashSet<&str> = HashSet::new();
     let dead = dead_paths_in_doc(&root, "docs/architecture.md", &body, &empty);
     assert!(

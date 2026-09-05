@@ -9,6 +9,8 @@
 //! the row is only committed if `signer.sign` succeeds; on signer failure
 //! `discard()` rolls the transaction back, leaving the DB pristine.
 
+#![allow(deprecated)]
+
 mod common;
 
 use std::sync::Arc;

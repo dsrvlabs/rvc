@@ -15,6 +15,8 @@
 //! `set_default` subscriber — so lock-free / count assertions must not depend on
 //! capturing events from that pool.
 
+#![allow(deprecated)]
+
 mod common;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

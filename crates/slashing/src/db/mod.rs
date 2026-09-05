@@ -118,6 +118,17 @@ impl SlashingDb {
         self.fail_next_commits.store(n, Ordering::SeqCst);
     }
 
+    /// Whether the connection mutex is free right now (`try_lock` succeeds).
+    ///
+    /// # Test-only
+    ///
+    /// Lets a tracing subscriber prove an audit event was emitted after the
+    /// staged guard released the connection (ADR-006 / G-7 behavioural proof).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn try_lock_free(&self) -> bool {
+        self.conn.try_lock().is_some()
+    }
+
     /// Take one injected commit failure for this DB (used when building a staged guard).
     pub(crate) fn take_injected_commit_failure(&self) -> bool {
         loop {

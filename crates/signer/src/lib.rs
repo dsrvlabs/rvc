@@ -1068,7 +1068,7 @@ mod tests {
         // (1) Re-entry: the attestation blocking-thread marker carries the span.
         let att_scope = events
             .iter()
-            .find(|e| e.message.contains("staging attestation slashing-protection record"))
+            .find(|e| e.message.contains("reserving attestation slashing-protection record"))
             .map(|e| e.scope.clone())
             .expect("attestation blocking-section marker must be captured");
         assert!(
