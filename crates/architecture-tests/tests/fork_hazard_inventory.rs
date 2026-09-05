@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 14),
+    (Class::GeForkName, 6),
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
     (Class::StringDispatch, 6),
@@ -153,15 +153,6 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/aggregation.rs",
-        82,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::MustBound,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/aggregation.rs",
         88,
         Class::GeForkName,
         false,
@@ -179,24 +170,6 @@ const INVENTORY: &[Inv] = &[
         "phase-6",
     ),
     inv(
-        "crates/rvc/src/orchestrator/aggregation.rs",
-        238,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::MustBound,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/attestation.rs",
-        320,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::MustBound,
-        "2.3",
-    ),
-    inv(
         "crates/rvc/src/orchestrator/attestation.rs",
         423,
         Class::GeForkName,
@@ -204,51 +177,6 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Fulu",
         Verdict::DecidedNotInherited,
         "phase-6",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        16,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::TestOnly,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        20,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::TestOnly,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        491,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::TestOnly,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        613,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::TestOnly,
-        "2.3",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/utils.rs",
-        143,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Electra",
-        Verdict::MustBound,
-        "2.3",
     ),
     // Class 2
     inv(
@@ -262,7 +190,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        495,
+        513,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -271,7 +199,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        618,
+        636,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -280,7 +208,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        647,
+        665,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -289,7 +217,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        655,
+        673,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -298,7 +226,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/utils.rs",
-        144,
+        152,
         Class::IndexZero,
         false,
         ".index = 0",

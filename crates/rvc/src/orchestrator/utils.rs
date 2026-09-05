@@ -126,9 +126,17 @@ pub(crate) fn find_pubkey_bytes(
     pubkey_map.read().get(duty_pubkey).cloned()
 }
 
+/// Whether EIP-7549 zeroes `AttestationData.index` at this fork.
+///
+/// Closed `Electra..=Fulu` so a later arm cannot inherit zeroing. 2.8 flips
+/// the upper bound once `ForkName::Gloas` exists.
+pub(crate) fn zeroes_committee_index(fork: ForkName) -> bool {
+    (ForkName::Electra..=ForkName::Fulu).contains(&fork)
+}
+
 /// Converts BN-supplied attestation data and normalizes it per-fork.
 ///
-/// Per EIP-7549 (active in Electra+): `AttestationData.index` must be set to 0
+/// Per EIP-7549 (Electra through Fulu): `AttestationData.index` must be set to 0
 /// before computing the tree-hash root or signing. The BN still returns the
 /// real committee index in the response, so callers must zero it explicitly.
 /// Pre-Electra forks keep the original index intact.
@@ -140,7 +148,7 @@ pub(crate) fn convert_and_normalize_attestation_data(
     fork_name: ForkName,
 ) -> Result<eth_types::AttestationData, OrchestratorError> {
     let mut data = convert_attestation_data(beacon_data)?;
-    if fork_name >= ForkName::Electra {
+    if zeroes_committee_index(fork_name) {
         data.index = 0;
     }
     Ok(data)
@@ -385,6 +393,27 @@ mod tests {
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
             },
+        }
+    }
+
+    #[test]
+    fn test_zeroes_committee_index_false_phase0_through_deneb_true_electra_and_fulu() {
+        let table = [
+            (ForkName::Phase0, false),
+            (ForkName::Altair, false),
+            (ForkName::Bellatrix, false),
+            (ForkName::Capella, false),
+            (ForkName::Deneb, false),
+            (ForkName::Electra, true),
+            (ForkName::Fulu, true),
+        ];
+        assert_eq!(table.len(), ForkName::COUNT, "table must cover every ForkName");
+        for (fork, expected) in table {
+            assert_eq!(
+                zeroes_committee_index(fork),
+                expected,
+                "{fork:?}: zeroes_committee_index is false Phase0..=Deneb, true Electra..=Fulu"
+            );
         }
     }
 

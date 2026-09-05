@@ -9,15 +9,15 @@ fn test_fork_name_electra_detection() {
 
     // Pre-Electra (Deneb)
     let fork_name = ForkName::from_epoch(49, &schedule);
-    assert!(fork_name < ForkName::Electra);
+    assert!(!utils::zeroes_committee_index(fork_name));
 
     // Electra boundary
     let fork_name = ForkName::from_epoch(50, &schedule);
-    assert!(fork_name >= ForkName::Electra);
+    assert!(utils::zeroes_committee_index(fork_name));
 
     // Post-Electra
     let fork_name = ForkName::from_epoch(100, &schedule);
-    assert!(fork_name >= ForkName::Electra);
+    assert!(utils::zeroes_committee_index(fork_name));
 }
 
 /// Builds an orchestrator with a CapturingSubmitter for fork transition tests.
@@ -25,6 +25,24 @@ fn test_fork_name_electra_detection() {
 async fn build_fork_transition_orchestrator(
     mock_server_uri: &str,
     slot: u64,
+) -> (
+    DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    String,
+    Arc<CapturingSubmitter>,
+) {
+    build_fork_transition_orchestrator_with_schedule(
+        mock_server_uri,
+        slot,
+        create_test_fork_schedule(),
+    )
+    .await
+}
+
+async fn build_fork_transition_orchestrator_with_schedule(
+    mock_server_uri: &str,
+    slot: u64,
+    schedule: Arc<ForkSchedule>,
 ) -> (
     DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
     OrchestratorHandle,
@@ -53,7 +71,7 @@ async fn build_fork_transition_orchestrator(
     let capturing_submitter = Arc::new(CapturingSubmitter::new());
     let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
-    let config = create_test_config();
+    let config = OrchestratorConfig::new([0xaa; 32], schedule);
     let pubkey_bytes = pubkey.to_bytes();
     let mut pubkey_map_inner = HashMap::new();
     pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
@@ -488,7 +506,7 @@ fn test_electra_crypto_attestation_data_index_zeroed() {
     let schedule = create_test_fork_schedule();
     let target_epoch = crypto_data.target.epoch;
     let fork_name = ForkName::from_epoch(target_epoch, &schedule);
-    let is_electra = fork_name >= ForkName::Electra;
+    let is_electra = utils::zeroes_committee_index(fork_name);
     assert!(is_electra, "epoch 50 should be Electra");
 
     if is_electra {
@@ -610,7 +628,7 @@ fn test_pre_electra_data_index_preserved() {
     let schedule = create_test_fork_schedule();
     let target_epoch = crypto_data.target.epoch;
     let fork_name = ForkName::from_epoch(target_epoch, &schedule);
-    let is_electra = fork_name >= ForkName::Electra;
+    let is_electra = utils::zeroes_committee_index(fork_name);
     assert!(!is_electra, "epoch 3 should be pre-Electra");
 
     // Apply the same logic as process_attestation_duty
@@ -791,5 +809,184 @@ async fn test_electra_attestation_unchanged() {
                 std::mem::discriminant(other)
             );
         }
+    }
+}
+
+/// `eth-types` `fork.rs` `test_schedule()`: Electra 364544, Fulu 500000 (finite).
+/// The builder fixture pins Fulu at `u64::MAX` and cannot drive a Fulu epoch.
+fn mainnet_shaped_fork_schedule() -> Arc<ForkSchedule> {
+    Arc::new(ForkSchedule {
+        genesis_fork_version: [0, 0, 0, 0],
+        altair_fork_epoch: 74240,
+        altair_fork_version: [1, 0, 0, 0],
+        bellatrix_fork_epoch: 144896,
+        bellatrix_fork_version: [2, 0, 0, 0],
+        capella_fork_epoch: 194048,
+        capella_fork_version: [3, 0, 0, 0],
+        deneb_fork_epoch: 269568,
+        deneb_fork_version: [4, 0, 0, 0],
+        electra_fork_epoch: 364544,
+        electra_fork_version: [5, 0, 0, 0],
+        fulu_fork_epoch: 500000,
+        fulu_fork_version: [6, 0, 0, 0],
+    })
+}
+
+const B1_ELECTRA_EPOCH: u64 = 364544;
+const B1_FULU_EPOCH: u64 = 500000;
+const B1_GVR: Root = [0xaa; 32];
+
+/// B1 (D18): Electra and Fulu still zero `data.index` through the attestation
+/// call sites (`from_epoch` → signing via `convert_and_normalize` and
+/// submission `SingleAttestation.data.index`), not by calling the helper.
+#[tokio::test]
+async fn test_attestation_still_zeroes_index_at_electra_and_fulu() {
+    use crypto::{signing_root_for, DutyRef, Signature, SigningCtx};
+
+    let schedule = mainnet_shaped_fork_schedule();
+    for (label, epoch, expected_fork) in
+        [("electra", B1_ELECTRA_EPOCH, ForkName::Electra), ("fulu", B1_FULU_EPOCH, ForkName::Fulu)]
+    {
+        let fork_name = ForkName::from_epoch(epoch, &schedule);
+        assert_eq!(fork_name, expected_fork, "{label}: from_epoch on mainnet-shaped schedule");
+
+        let slot = epoch * SLOTS_PER_EPOCH;
+        let mock_server = wiremock::MockServer::start().await;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator_with_schedule(
+                &mock_server.uri(),
+                slot,
+                schedule.clone(),
+            )
+            .await;
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1, "{label}: one submission");
+        let att = match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                assert_eq!(expected_fork, ForkName::Electra, "{label}: Electra wrapper");
+                assert_eq!(atts.len(), 1);
+                &atts[0]
+            }
+            VersionedAttestation::Fulu(atts) => {
+                assert_eq!(expected_fork, ForkName::Fulu, "{label}: Fulu wrapper");
+                assert_eq!(atts.len(), 1);
+                &atts[0]
+            }
+            other => panic!(
+                "{label}: expected {expected_fork:?} wrapper, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(
+            att.data.index, "0",
+            "{label}: submission-path SingleAttestation.data.index must be \"0\" \
+             (BN data.index was non-zero)"
+        );
+        assert_ne!(att.data.index, "3", "{label}: BN mock index must not leak onto the wire");
+
+        let signed = utils::convert_attestation_data(&att.data).unwrap();
+        assert_eq!(signed.index, 0, "{label}: signed AttestationData.index must be 0");
+
+        let pk_bytes = hex::decode(pubkey_hex.trim_start_matches("0x")).expect("pubkey hex");
+        let pk = PublicKey::from_bytes(&pk_bytes).expect("pubkey");
+        let sig_bytes = hex::decode(att.signature.trim_start_matches("0x")).expect("sig hex");
+        let sig = Signature::from_bytes(&sig_bytes).expect("signature");
+        let ctx = SigningCtx { fork_schedule: schedule.as_ref(), genesis_validators_root: B1_GVR };
+        let root = signing_root_for(&DutyRef::Attestation(&signed), &ctx);
+        sig.verify(&pk, &root).unwrap_or_else(|e| {
+            panic!("{label}: signature must verify over index=0 signing path: {e}")
+        });
+
+        let mut bn_index = signed.clone();
+        bn_index.index = 3;
+        let bn_root = signing_root_for(&DutyRef::Attestation(&bn_index), &ctx);
+        assert!(
+            sig.verify(&pk, &bn_root).is_err(),
+            "{label}: signature must not verify over the BN's non-zero index"
+        );
+    }
+}
+
+/// B1 (D18): aggregation call sites (`aggregation.rs` `is_electra` +
+/// `convert_and_normalize`) still zero the aggregate-query root at Electra
+/// and Fulu on a mainnet-shaped schedule.
+#[tokio::test]
+async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
+    use eth_types::{AttestationData, Checkpoint};
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let schedule = mainnet_shaped_fork_schedule();
+    for (label, epoch, expected_fork) in
+        [("electra", B1_ELECTRA_EPOCH, ForkName::Electra), ("fulu", B1_FULU_EPOCH, ForkName::Fulu)]
+    {
+        let fork_name = ForkName::from_epoch(epoch, &schedule);
+        assert_eq!(fork_name, expected_fork, "{label}: from_epoch on mainnet-shaped schedule");
+
+        let slot = epoch * SLOTS_PER_EPOCH;
+        let expected = AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: [0x11; 32],
+            source: Checkpoint { epoch: epoch.saturating_sub(1), root: [0x22; 32] },
+            target: Checkpoint { epoch, root: [0x33; 32] },
+        };
+        let expected_root = format!("0x{}", hex::encode(expected.tree_hash_root().0));
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, pubkey_hex, _capturing) =
+            build_fork_transition_orchestrator_with_schedule(
+                &mock_server.uri(),
+                slot,
+                schedule.clone(),
+            )
+            .await;
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("committee_index", "3"))
+            .and(query_param("attestation_data_root", expected_root.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "0",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": epoch.saturating_sub(1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "committee_bits": "0x0800000000000000"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 }

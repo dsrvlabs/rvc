@@ -317,7 +317,7 @@ where
         })?;
 
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
-        let is_electra = fork_name >= ForkName::Electra;
+        let is_electra = utils::zeroes_committee_index(fork_name);
 
         debug!(
             validator_index = %validator_index,
@@ -327,7 +327,7 @@ where
             "Fork derived for attestation"
         );
 
-        // EIP-7549: For Electra+, `AttestationData.index` must be zeroed before
+        // EIP-7549: Electra through Fulu zero `AttestationData.index` before
         // signing. `convert_and_normalize_attestation_data` handles this centrally
         // so both the attestation and aggregation paths stay in sync.
         let crypto_attestation_data =

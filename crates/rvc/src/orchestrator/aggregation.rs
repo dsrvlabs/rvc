@@ -79,7 +79,7 @@ impl AggregationService {
         }
 
         let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
-        let is_electra = fork_name >= ForkName::Electra;
+        let is_electra = utils::zeroes_committee_index(fork_name);
 
         let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
         let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
@@ -235,7 +235,7 @@ impl AggregationService {
         selection_proof: Vec<u8>,
         agg_span: Span,
     ) -> Option<ProducedAggregate> {
-        let is_electra = fork_name >= ForkName::Electra;
+        let is_electra = utils::zeroes_committee_index(fork_name);
         let committee_index: u64 = duty.committee_index.parse().ok()?;
 
         let attestation_data_response = match utils::timed(
