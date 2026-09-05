@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eth_types::Slot;
 
 use crate::error::TimingError;
-use crate::{due_ms, ATTESTATION_DUE_BPS, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use crate::{due_ms, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 
 /// Slot timing source.
 ///
@@ -99,7 +99,7 @@ impl SystemSlotClock {
     }
 
     pub fn new_mainnet(genesis_time: u64) -> Result<Self, TimingError> {
-        Self::new(genesis_time, Duration::from_secs(SECONDS_PER_SLOT), SLOTS_PER_EPOCH)
+        Self::new(genesis_time, Duration::from_millis(SLOT_DURATION_MS), SLOTS_PER_EPOCH)
     }
 
     fn current_unix_time(&self) -> u64 {
