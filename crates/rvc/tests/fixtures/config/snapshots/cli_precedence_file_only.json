@@ -8,8 +8,6 @@
   "allow_unsupported_fork": false,
   "metrics_address": "127.0.0.1",
   "metrics_port": 9090,
-  "grpc_port": 50051,
-  "grpc_address": "127.0.0.1",
   "network": "mainnet",
   "graffiti": "from-file",
   "log_level": "debug",

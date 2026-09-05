@@ -1,11 +1,15 @@
 //! RF5-12: production-config fixture + nested/flat alias parity.
 
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
+use tempfile::NamedTempFile;
+
 use rvc::config::{
-    BroadcastTopic, BuilderLimits, Config, GrpcSignerConfig, KeymanagerConfig, LogfileConfig,
-    MonitoringConfig, Network, ProposerConfigSource, SlashedAction, TracingConfig, TracingExporter,
+    BroadcastTopic, BuilderLimits, Config, ConfigError, GrpcSignerConfig, KeymanagerConfig,
+    LogfileConfig, MonitoringConfig, Network, ProposerConfigSource, SlashedAction, StartArgs,
+    TracingConfig, TracingExporter,
 };
 
 fn production_fixture_path() -> PathBuf {
@@ -25,8 +29,6 @@ fn expected_production_config() -> Config {
         allow_fresh_db: false,
         metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         metrics_port: 8080,
-        grpc_port: 50051,
-        grpc_address: "127.0.0.1".to_string(),
         network: Network::Mainnet,
         graffiti: Some("rvc-prod".to_string()),
         log_level: "info".to_string(),
@@ -199,7 +201,6 @@ fn test_default_config_field_values_unchanged() {
     let c = Config::default();
     assert_eq!(c.beacon_url, "http://localhost:5052");
     assert_eq!(c.metrics_port, 8080);
-    assert_eq!(c.grpc_port, 50051);
     assert_eq!(c.network, Network::Mainnet);
     assert!(c.doppelganger_detection);
     assert!(!c.keymanager.enabled);
@@ -229,4 +230,85 @@ this_key_has_never_existed = "still-ok"
 "#;
     let config: Config = toml::from_str(toml).expect("unknown keys must still be ignored");
     assert_eq!(config.beacon_url, "http://localhost:5052");
+}
+
+const REMOVED_GRPC_TOML: &str = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+network = "mainnet"
+grpc_port = 50051
+"#;
+
+fn write_toml(contents: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("temp config");
+    file.write_all(contents.as_bytes()).expect("write config");
+    file
+}
+
+fn assert_removed_grpc_key(err: ConfigError, key: &str) {
+    let msg = err.to_string();
+    assert!(
+        matches!(err, ConfigError::RemovedKey { key: k, .. } if k == key),
+        "expected RemovedKey({key}), got {err:?}"
+    );
+    assert!(msg.contains(key), "{msg}");
+    assert!(msg.contains("/health"), "{msg}");
+    assert!(msg.contains("/readyz"), "{msg}");
+}
+
+#[test]
+fn test_removed_grpc_keys_are_rejected_at_startup() {
+    let file = write_toml(REMOVED_GRPC_TOML);
+    let err = Config::from_file(file.path()).expect_err("grpc_port must fail startup");
+    assert_removed_grpc_key(err, "grpc_port");
+
+    let err = Config::load(Some(file.path()), StartArgs::default())
+        .expect_err("Config::load must not wrap RemovedKey away");
+    assert_removed_grpc_key(err, "grpc_port");
+
+    let file = write_toml(
+        r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+network = "mainnet"
+grpc_address = "127.0.0.1"
+"#,
+    );
+    let err = Config::from_file(file.path()).expect_err("grpc_address must fail startup");
+    assert_removed_grpc_key(err, "grpc_address");
+
+    let file = write_toml(
+        r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+network = "mainnet"
+
+[server]
+grpc_port = 50051
+"#,
+    );
+    let err = Config::from_file(file.path()).expect_err("nested [server] grpc_port must fail");
+    assert_removed_grpc_key(err, "grpc_port");
+}
+
+#[test]
+fn test_config_without_grpc_keys_starts_clean() {
+    let file = write_toml(
+        r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+network = "mainnet"
+metrics_port = 8080
+"#,
+    );
+    let loaded = Config::from_file(file.path()).expect("config without grpc keys must load");
+    loaded.validate().expect("config without grpc keys must validate");
+    Config::load(Some(file.path()), StartArgs::default())
+        .expect("Config::load without grpc keys must succeed")
+        .validate()
+        .expect("loaded config must validate");
 }

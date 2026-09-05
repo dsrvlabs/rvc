@@ -69,8 +69,6 @@ validators_config = "/tmp/top/validators.toml"
 [server]
 metrics_address = "0.0.0.0"
 metrics_port = 9091
-grpc_port = 50052
-grpc_address = "0.0.0.0"
 
 [network]
 network = "hoodi"
@@ -226,7 +224,7 @@ disable_keystore_locking = false
 // M4: exactly one clap/section declaration per knob across rvc-config (+ leftover cli groups)
 // ---------------------------------------------------------------------------
 
-const KNOBS_69: &[&str] = &[
+const KNOBS_67: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
     "keystore_path",
@@ -236,8 +234,6 @@ const KNOBS_69: &[&str] = &[
     "allow_unsupported_fork",
     "metrics_address",
     "metrics_port",
-    "grpc_port",
-    "grpc_address",
     "network",
     "genesis_time",
     "genesis_validators_root",
@@ -400,10 +396,10 @@ fn leaf_declarations(src: &str, struct_name: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
-    assert_eq!(KNOBS_69.len(), 69);
-    let unique: BTreeSet<_> = KNOBS_69.iter().copied().collect();
-    assert_eq!(unique.len(), 69);
+fn every_one_of_the_67_knobs_has_exactly_one_declaration() {
+    assert_eq!(KNOBS_67.len(), 67);
+    let unique: BTreeSet<_> = KNOBS_67.iter().copied().collect();
+    assert_eq!(unique.len(), 67);
 
     let root = workspace_root();
     let section_dir = root.join("crates/rvc-config/src/sections");
@@ -441,7 +437,7 @@ fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
     ];
 
     let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for k in KNOBS_69 {
+    for k in KNOBS_67 {
         counts.insert(*k, Vec::new());
     }
     let mut extras = Vec::new();
@@ -465,7 +461,7 @@ fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
         counts.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (*k, v)).collect();
     assert!(
         extras.is_empty(),
-        "scanner found clap fields that are not in the 69 knobs or NOT_A_KNOB: {extras:?}"
+        "scanner found clap fields that are not in the 67 knobs or NOT_A_KNOB: {extras:?}"
     );
     assert!(missing.is_empty(), "knobs with zero clap/section declarations: {missing:?}");
     assert!(dupes.is_empty(), "knobs with more than one declaration: {dupes:?}");

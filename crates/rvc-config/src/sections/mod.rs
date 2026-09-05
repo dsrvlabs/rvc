@@ -84,8 +84,6 @@ mod tests {
         "--genesis-time",
         "--genesis-validators-root",
         "--graffiti",
-        "--grpc-address",
-        "--grpc-port",
         "--init-slashing-db",
         "--metrics-address",
         "--metrics-port",

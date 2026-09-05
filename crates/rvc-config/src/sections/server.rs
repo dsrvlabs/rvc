@@ -1,9 +1,9 @@
-//! Metrics HTTP and gRPC bind section (ARCH-4h).
+//! Metrics HTTP bind section (ARCH-4h).
 //!
-//! Invented `[server]` table. Four ADR-009 fields live here (`metrics_address`,
-//! `metrics_port`, `grpc_port`, `grpc_address`) and must not regain clap
-//! `default_value`. Nested tables accept section-relative names only (4f SEC).
-//! Flat top-level keys stay on `ConfigWire`.
+//! Invented `[server]` table. ADR-009 fields live here (`metrics_address`,
+//! `metrics_port`) and must not regain clap `default_value`. Nested tables
+//! accept section-relative names only (4f SEC). Flat top-level keys stay on
+//! `ConfigWire`. Leftover healthz bind knobs are rejected at load.
 
 use std::net::IpAddr;
 
@@ -25,16 +25,6 @@ pub struct ServerArgs {
     #[arg(long = "metrics-port")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics_port: Option<u16>,
-
-    /// Port for the gRPC server (default: 50051)
-    #[arg(long = "grpc-port")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub grpc_port: Option<u16>,
-
-    /// Bind address for the gRPC server (default: 127.0.0.1)
-    #[arg(long = "grpc-address")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub grpc_address: Option<String>,
 }
 
 impl ServerArgs {
@@ -42,12 +32,7 @@ impl ServerArgs {
     ///
     /// Defaults live on `rvc::config::Config`; load overlays Option fields.
     pub fn resolved(&self) -> ServerConfig {
-        ServerConfig {
-            metrics_address: self.metrics_address,
-            metrics_port: self.metrics_port,
-            grpc_port: self.grpc_port,
-            grpc_address: self.grpc_address.clone(),
-        }
+        ServerConfig { metrics_address: self.metrics_address, metrics_port: self.metrics_port }
     }
 }
 
@@ -59,8 +44,4 @@ pub struct ServerConfig {
     pub metrics_address: Option<IpAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grpc_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grpc_address: Option<String>,
 }

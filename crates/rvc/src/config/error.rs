@@ -67,6 +67,19 @@ pub enum ConfigError {
     #[error("invalid port number: {0}")]
     InvalidPort(u16),
 
+    /// Leftover `grpc_port` / `grpc_address` after the healthz listener was
+    /// removed. Presence must fail startup; otherwise leftover TOML is ignored.
+    #[error(
+        "`{key}` was removed in this release (gRPC healthz listener is gone). \
+         Use {replacement} instead"
+    )]
+    RemovedKey {
+        /// Operator-facing key (`grpc_port` or `grpc_address`).
+        key: &'static str,
+        /// Probe that replaces the removed listener.
+        replacement: &'static str,
+    },
+
     #[error("invalid graffiti: {0}")]
     InvalidGraffiti(String),
 

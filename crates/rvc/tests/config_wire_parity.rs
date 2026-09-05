@@ -1,8 +1,9 @@
 //! ARCH-4d: freeze the current TOML wire surface before any section collapse.
 //!
 //! Parsed [`Config`] snapshots in `tests/fixtures/config/snapshots/` are the
-//! binding contract for later Stream-A issues. ARCH-4j extends the corpus with
-//! the four BN timeout knobs (65 → 69); earlier snapshots stay byte-identical.
+//! binding contract for later Stream-A issues. ARCH-4j extended the corpus with
+//! the four BN timeout knobs (65 → 69); ARCH-7e disposed the healthz bind knobs
+//! (69 → 67). Remaining snapshots stay byte-identical aside from that removal.
 //!
 //! KAT-first: no test name here ends in `_root` / `tree_hash` / `signing_root`
 //! (the knob `genesis_validators_root` is in the corpus).
@@ -133,9 +134,9 @@ const REQUIRED_CORPUS: &[&str] = &[
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 69, "operator knob count is 69 after ARCH-4j");
+    assert_eq!(names.len(), 67, "operator knob count is 67 after ARCH-7e");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 69, "operator knob names must be unique");
+    assert_eq!(unique.len(), 67, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);
@@ -303,8 +304,6 @@ fn top_level_bare_knobs_still_parse() {
     assert!(config.allow_unsupported_fork);
     assert_eq!(config.metrics_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     assert_eq!(config.metrics_port, 9091);
-    assert_eq!(config.grpc_port, 50052);
-    assert_eq!(config.grpc_address, "0.0.0.0");
     assert_eq!(config.network, Network::Hoodi);
     assert_eq!(config.genesis_time, Some(1_606_824_023));
     assert_eq!(config.graffiti.as_deref(), Some("top-level"));

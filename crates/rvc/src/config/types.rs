@@ -119,10 +119,6 @@ pub struct Config {
 
     pub metrics_port: u16,
 
-    pub grpc_port: u16,
-
-    pub grpc_address: String,
-
     pub network: Network,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,8 +259,6 @@ impl Default for Config {
             allow_unsupported_fork: false,
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
-            grpc_port: 50051,
-            grpc_address: "127.0.0.1".to_string(),
             network: Network::Mainnet,
             genesis_time: None,
             genesis_validators_root: None,
@@ -311,6 +305,22 @@ struct BeaconSection {
     beacon_nodes_config: Vec<BeaconNodeEntry>,
 }
 
+/// `[server]` table plus leftover-key sentinels.
+///
+/// Without these fields a leftover `[server] grpc_port` would parse silently
+/// (`#[serde(default)]`, no `deny_unknown_fields`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServerSection {
+    #[serde(flatten)]
+    inner: ServerConfig,
+    grpc_port: Option<toml::Value>,
+    grpc_address: Option<toml::Value>,
+}
+
+/// Replacement probes named in `ConfigError::RemovedKey`.
+const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics HTTP server";
+
 /// Intermediate wire format that accepts **both** nested tables and legacy flat
 /// keys. Flat keys fill fields that the corresponding nested table left at
 /// default; when both spellings set the same logical field, the **flat** key
@@ -333,8 +343,9 @@ struct ConfigWire {
     allow_unsupported_fork: Option<bool>,
     metrics_address: Option<IpAddr>,
     metrics_port: Option<u16>,
-    grpc_port: Option<u16>,
-    grpc_address: Option<String>,
+    /// Presence must fail startup; otherwise leftover TOML is ignored.
+    grpc_port: Option<toml::Value>,
+    grpc_address: Option<toml::Value>,
     // `network` as a flat string is pulled in Config's custom Deserialize
     // (dual-shape with `[network]` — same class as `logfile`).
     genesis_time: Option<u64>,
@@ -367,7 +378,7 @@ struct ConfigWire {
     #[serde(default)]
     keys: KeysConfig,
     #[serde(default)]
-    server: ServerConfig,
+    server: ServerSection,
     /// Table half of the `network` dual-shape (string pulled in Deserialize).
     #[serde(default)]
     network: NetworkConfig,
@@ -424,8 +435,21 @@ struct ConfigWire {
     logfile_level: Option<String>,
 }
 
-impl From<ConfigWire> for Config {
-    fn from(w: ConfigWire) -> Self {
+fn removed_grpc_key(w: &ConfigWire) -> Option<&'static str> {
+    if w.grpc_port.is_some() || w.server.grpc_port.is_some() {
+        Some("grpc_port")
+    } else if w.grpc_address.is_some() || w.server.grpc_address.is_some() {
+        Some("grpc_address")
+    } else {
+        None
+    }
+}
+
+impl Config {
+    fn from_wire(w: ConfigWire) -> Result<Self, ConfigError> {
+        if let Some(key) = removed_grpc_key(&w) {
+            return Err(ConfigError::RemovedKey { key, replacement: GRPC_KEY_REPLACEMENT });
+        }
         let mut logfile = w.logfile;
         if let Some(v) = w.logfile_max_size {
             logfile.max_size = v;
@@ -538,7 +562,7 @@ impl From<ConfigWire> for Config {
         // Flat-wins lift (VD-4.1): nested 4h tables fill only when the flat
         // key is absent. The `network` string-or-table split is applied in
         // Deserialize (same class as `logfile`).
-        Config {
+        Ok(Config {
             beacon_url: if !w.beacon_url.is_empty() {
                 w.beacon_url
             } else {
@@ -570,11 +594,12 @@ impl From<ConfigWire> for Config {
                 .unwrap_or(def.allow_unsupported_fork),
             metrics_address: w
                 .metrics_address
-                .or(w.server.metrics_address)
+                .or(w.server.inner.metrics_address)
                 .unwrap_or(def.metrics_address),
-            metrics_port: w.metrics_port.or(w.server.metrics_port).unwrap_or(def.metrics_port),
-            grpc_port: w.grpc_port.or(w.server.grpc_port).unwrap_or(def.grpc_port),
-            grpc_address: w.grpc_address.or(w.server.grpc_address).unwrap_or(def.grpc_address),
+            metrics_port: w
+                .metrics_port
+                .or(w.server.inner.metrics_port)
+                .unwrap_or(def.metrics_port),
             network: w.network.network.unwrap_or(def.network),
             genesis_time: w.genesis_time.or(w.network.genesis_time),
             genesis_validators_root: w
@@ -633,7 +658,65 @@ impl From<ConfigWire> for Config {
             attestation_timeout: w.attestation_timeout.or(w.beacon.inner.attestation_timeout),
             aggregate_timeout: w.aggregate_timeout.or(w.beacon.inner.aggregate_timeout),
             duty_fetch_timeout: w.duty_fetch_timeout.or(w.beacon.inner.duty_fetch_timeout),
+        })
+    }
+
+    fn from_toml_value(value: toml::Value) -> Result<Self, ConfigError> {
+        let mut map = match value {
+            toml::Value::Table(t) => t,
+            other => {
+                return Err(ConfigError::Invalid {
+                    field: "config",
+                    message: format!("config must be a TOML table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+        };
+
+        let flat_logfile_path = match map.remove("logfile") {
+            Some(toml::Value::String(s)) => Some(PathBuf::from(s)),
+            Some(toml::Value::Table(t)) => {
+                map.insert("logfile".into(), toml::Value::Table(t));
+                None
+            }
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    field: "logfile",
+                    message: format!("logfile must be a string path or a table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+            None => None,
+        };
+
+        let flat_network = match map.remove("network") {
+            Some(toml::Value::String(s)) => Some(
+                Network::deserialize(toml::Value::String(s)).map_err(ConfigError::ParseError)?,
+            ),
+            Some(toml::Value::Table(t)) => {
+                map.insert("network".into(), toml::Value::Table(t));
+                None
+            }
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    field: "network",
+                    message: format!("network must be a string preset or a table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+            None => None,
+        };
+
+        let wire: ConfigWire =
+            ConfigWire::deserialize(toml::Value::Table(map)).map_err(ConfigError::ParseError)?;
+        let mut cfg = Self::from_wire(wire)?;
+        if let Some(path) = flat_logfile_path {
+            cfg.logfile.path = Some(path);
         }
+        if let Some(net) = flat_network {
+            cfg.network = net;
+        }
+        Ok(cfg)
     }
 }
 
@@ -642,62 +725,8 @@ impl<'de> Deserialize<'de> for Config {
     where
         D: serde::Deserializer<'de>,
     {
-        // Parse as toml-compatible Value first so we can accept both a flat
-        // `logfile = "path"` string and a `[logfile]` table (same key, different
-        // shapes — not co-representable in one derive struct).
         let value = toml::Value::deserialize(deserializer)?;
-        let mut map = match value {
-            toml::Value::Table(t) => t,
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "config must be a TOML table, got {other:?}"
-                )));
-            }
-        };
-
-        // Pull flat logfile path string before nested table deserialize.
-        let flat_logfile_path = match map.remove("logfile") {
-            Some(toml::Value::String(s)) => Some(PathBuf::from(s)),
-            Some(toml::Value::Table(t)) => {
-                // Put nested table back under a private key for ConfigWire
-                map.insert("logfile".into(), toml::Value::Table(t));
-                None
-            }
-            Some(other) => {
-                return Err(serde::de::Error::custom(format!(
-                    "logfile must be a string path or a table, got {other:?}"
-                )));
-            }
-            None => None,
-        };
-
-        // `network` is either a preset string or a `[network]` table (ARCH-4h).
-        let flat_network = match map.remove("network") {
-            Some(toml::Value::String(s)) => Some(
-                Network::deserialize(toml::Value::String(s)).map_err(serde::de::Error::custom)?,
-            ),
-            Some(toml::Value::Table(t)) => {
-                map.insert("network".into(), toml::Value::Table(t));
-                None
-            }
-            Some(other) => {
-                return Err(serde::de::Error::custom(format!(
-                    "network must be a string preset or a table, got {other:?}"
-                )));
-            }
-            None => None,
-        };
-
-        let wire: ConfigWire =
-            ConfigWire::deserialize(toml::Value::Table(map)).map_err(serde::de::Error::custom)?;
-        let mut cfg = Config::from(wire);
-        if let Some(path) = flat_logfile_path {
-            cfg.logfile.path = Some(path);
-        }
-        if let Some(net) = flat_network {
-            cfg.network = net;
-        }
-        Ok(cfg)
+        Config::from_toml_value(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -713,8 +742,8 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+        let value: toml::Value = toml::from_str(&content)?;
+        Self::from_toml_value(value)
     }
 
     pub fn effective_genesis_time(&self) -> Result<u64, ConfigError> {
@@ -765,10 +794,6 @@ impl Config {
 
         if self.metrics_port == 0 {
             return Err(ConfigError::InvalidPort(self.metrics_port));
-        }
-
-        if self.grpc_port == 0 {
-            return Err(ConfigError::InvalidPort(self.grpc_port));
         }
 
         if let Some(ref graffiti) = self.graffiti {
@@ -978,10 +1003,13 @@ impl Config {
     /// stay unset so they cannot invert ConfigWire's flat-wins lift.
     pub fn load(file: Option<&Path>, cli: StartArgs) -> Result<Self, ConfigError> {
         let mut config = match file {
-            Some(path) => Self::from_file(path).map_err(|err| ConfigError::Invalid {
-                field: "config",
-                message: err.to_string(),
-                source_layer: ConfigSource::File(path.to_path_buf()),
+            Some(path) => Self::from_file(path).map_err(|err| match err {
+                removed @ ConfigError::RemovedKey { .. } => removed,
+                err => ConfigError::Invalid {
+                    field: "config",
+                    message: err.to_string(),
+                    source_layer: ConfigSource::File(path.to_path_buf()),
+                },
             })?,
             None => Self::default(),
         };
@@ -1069,12 +1097,6 @@ impl Config {
         }
         if let Some(v) = server.metrics_port {
             self.metrics_port = v;
-        }
-        if let Some(v) = server.grpc_port {
-            self.grpc_port = v;
-        }
-        if let Some(v) = &server.grpc_address {
-            self.grpc_address = v.clone();
         }
 
         if let Some(v) = network.network {
@@ -1275,8 +1297,6 @@ mod tests {
         assert_eq!(config.keystore_path, PathBuf::from("./keystores"));
         assert_eq!(config.metrics_port, 8080);
         assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        assert_eq!(config.grpc_port, 50051);
-        assert_eq!(config.grpc_address, "127.0.0.1");
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
@@ -1309,7 +1329,6 @@ beacon_url = "http://beacon:5052"
 keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 metrics_port = 9090
-grpc_port = 50052
 network = "hoodi"
 log_level = "debug"
 "#
@@ -1322,7 +1341,6 @@ log_level = "debug"
         assert_eq!(config.slashing_db_path, PathBuf::from("/data/slashing.db"));
         assert!(!config.allow_fresh_db, "SEC-3: allow_fresh_db defaults false");
         assert_eq!(config.metrics_port, 9090);
-        assert_eq!(config.grpc_port, 50052);
         assert_eq!(config.network, Network::Hoodi);
         assert_eq!(config.log_level, "debug");
     }
@@ -1573,37 +1591,6 @@ allow_fresh_db = true
         assert_eq!(config.beacon_url, "http://custom:5052");
         assert_eq!(config.metrics_port, 9999);
         assert_eq!(config.network, Network::Hoodi);
-        assert_eq!(config.grpc_port, 50051);
-        assert_eq!(config.grpc_address, "127.0.0.1");
-    }
-
-    #[test]
-    fn test_merge_with_cli_grpc_address() {
-        let config = overlay(|cli| {
-            cli.server.grpc_address = Some("0.0.0.0".to_string());
-        });
-
-        assert_eq!(config.grpc_address, "0.0.0.0");
-    }
-
-    #[test]
-    fn test_config_from_file_with_grpc_address() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-beacon_url = "http://beacon:5052"
-keystore_path = "/data/keystores"
-slashing_db_path = "/data/slashing.db"
-grpc_address = "192.168.1.1"
-network = "hoodi"
-log_level = "debug"
-"#
-        )
-        .unwrap();
-
-        let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.grpc_address, "192.168.1.1");
     }
 
     #[test]

@@ -95,16 +95,18 @@ size **below** it because of VD-7A and VD-7G.
 - [ ] **The `signer-registry` enumeration gate passes under `--features dvt`** as a **new CI step**
       (`cargo nextest run -p rvc-signer-server --features dvt`), and a test asserts a DVT partial
       signature cannot be produced outside the registered contract.
-- [ ] **Healthz removed with its knobs disposed** — no `DutyTrackerServer`, no gRPC `select!` arm, and
+- [x] **Healthz removed with its knobs disposed** — no `DutyTrackerServer`, no gRPC `select!` arm, and
       a TOML carrying `grpc_port` / `grpc_address` is **rejected at startup** with a message naming
       `/health` and `/readyz` (never accepted-and-ignored — that is PB-B1's failure mode inside the
       change meant to end it).
+      *Closure note (2026-09-06): ARCH-7d removed the listener (`32e8a44`); ARCH-7e rejects leftover keys.*
 - [ ] **A documented 200-key / 200 ms run is checked into `plan/architecture-2026-08-12/`** — zero
       missed attestation deadlines, `rvc_signer_slashing_tx_hold_duration_ms` p99 recorded, and the
       scope stated honestly (this validates the `signer-server` path — A-A8).
-- [ ] **M7 = 0** — `BnRole` broadcast routing is honoured or the surface is rejected (`ARCH-7k`); with
+- [x] **M7 = 0** — `BnRole` broadcast routing is honoured or the surface is rejected (`ARCH-7k`); with
       the four closed in Phase 1 and healthz's two knobs disposed in `ARCH-7e`, no inert config
       surface remains.
+      *Closure note (2026-09-06): ARCH-7k (`e14afba`) honours `BnRole`; ARCH-7e rejects `grpc_*` keys.*
 - [ ] **M5 reached, in M5's own enumeration** (`prd.md:995`): `ARCH-7a` lands the **7th** of the +7
       gates (KM-2 teardown), and `ARCH-7j` lands the **third and last** of the +3 CI checks
       (`--features dvt` enumeration run); the other two (docs-freshness, unused-deps) landed in
@@ -660,17 +662,17 @@ it is shrinking-only, and these two knobs were 2 of its 9 seed entries
 
 **Acceptance criteria.**
 
-- [ ] `rg 'grpc_port|grpc_address'` under `crates/` and `bin/` returns only the rejection sentinel and
+- [x] `rg 'grpc_port|grpc_address'` under `crates/` and `bin/` returns only the rejection sentinel and
       its tests.
-- [ ] A TOML setting either key **fails startup** with a message naming the key and the `/health` +
+- [x] A TOML setting either key **fails startup** with a message naming the key and the `/health` +
       `/readyz` replacement — never accepted-and-ignored.
-- [ ] `config.example.toml` and `docs/running-guide.md` no longer advertise the knobs; the
+- [x] `config.example.toml` and `docs/running-guide.md` no longer advertise the knobs; the
       docs-freshness scan (Phase 0, ARCH-P2-5) is green.
-- [ ] G-2's counted arithmetic is updated in its post-Phase-4 form and the gate is green;
+- [x] G-2's counted arithmetic is updated in its post-Phase-4 form and the gate is green;
       `CLAP_DEFAULT_CLOBBERS` is still empty.
-- [ ] **M7 = 0** — with Phase 1's four surfaces and `ARCH-7k`, no inert config surface remains
+- [x] **M7 = 0** — with Phase 1's four surfaces and `ARCH-7k`, no inert config surface remains
       (`prd.md:997`).
-- [ ] No new `.unwrap()`; `thiserror` used for the new error variant (library crate — `CLAUDE.md`).
+- [x] No new `.unwrap()`; `thiserror` used for the new error variant (library crate — `CLAUDE.md`).
 
 ---
 

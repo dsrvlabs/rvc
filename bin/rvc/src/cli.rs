@@ -374,8 +374,6 @@ mod tests {
         "--validators-config",
         "--metrics-address",
         "--metrics-port",
-        "--grpc-port",
-        "--grpc-address",
         "--network",
         "--genesis-time",
         "--genesis-validators-root",
@@ -464,10 +462,6 @@ mod tests {
             "0.0.0.0",
             "--metrics-port",
             "9090",
-            "--grpc-port",
-            "60051",
-            "--grpc-address",
-            "0.0.0.0",
             "--network",
             "hoodi",
             "--genesis-time",
@@ -585,8 +579,6 @@ mod tests {
         assert!(cfg.allow_unsupported_fork);
         assert_eq!(cfg.metrics_address, "0.0.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(cfg.metrics_port, 9090);
-        assert_eq!(cfg.grpc_port, 60051);
-        assert_eq!(cfg.grpc_address, "0.0.0.0");
         assert_eq!(cfg.network, Network::Hoodi);
         assert_eq!(cfg.genesis_time, Some(1));
         assert_eq!(cfg.genesis_validators_root.as_deref(), Some("0xabc"));
@@ -676,8 +668,6 @@ mod tests {
         // ADR-009 / ARCH-6b: former clap-default fields stay at Config defaults.
         assert_eq!(cfg.metrics_address, defaults.metrics_address);
         assert_eq!(cfg.metrics_port, defaults.metrics_port);
-        assert_eq!(cfg.grpc_port, defaults.grpc_port);
-        assert_eq!(cfg.grpc_address, defaults.grpc_address);
         assert_eq!(cfg.log_level, defaults.log_level);
         assert_eq!(cfg.tracing.exporter, defaults.tracing.exporter);
         assert_eq!(cfg.keymanager.body_limit, defaults.keymanager.body_limit);
@@ -765,12 +755,10 @@ beacon_url = "http://beacon:5052"
 keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 metrics_port = 9090
-grpc_port = 60051
 keymanager_body_limit = 2048
 beacon_max_body_bytes = 1024
 log_level = "debug"
 metrics_address = "0.0.0.0"
-grpc_address = "0.0.0.0"
 tracing_exporter = "gcp"
 slashed_validators_action = "shutdown"
 "#
@@ -787,7 +775,6 @@ slashed_validators_action = "shutdown"
             cfg.metrics_port, 9090,
             "TOML metrics_port must not be clobbered by clap default"
         );
-        assert_eq!(cfg.grpc_port, 60051, "TOML grpc_port must not be clobbered by clap default");
         assert_eq!(
             cfg.keymanager.body_limit, 2048,
             "TOML keymanager_body_limit must not be clobbered by clap default"
@@ -802,7 +789,6 @@ slashed_validators_action = "shutdown"
             "0.0.0.0".parse::<IpAddr>().unwrap(),
             "TOML metrics_address must not be clobbered"
         );
-        assert_eq!(cfg.grpc_address, "0.0.0.0");
         assert_eq!(cfg.tracing.exporter, TracingExporter::Gcp);
         assert_eq!(cfg.slashed_validators_action, SlashedAction::Shutdown);
     }
@@ -821,21 +807,18 @@ beacon_url = "http://beacon:5052"
 keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 metrics_port = 9090
-grpc_port = 60051
 "#
         )
         .unwrap();
 
-        let cli =
-            Cli::try_parse_from(["rvc", "start", "--metrics-port", "7000", "--grpc-port", "7001"])
-                .expect("argv should parse");
+        let cli = Cli::try_parse_from(["rvc", "start", "--metrics-port", "7000"])
+            .expect("argv should parse");
         let Commands::Start(args) = cli.command else {
             panic!("expected Start");
         };
         let cfg = Config::load(Some(file.path()), *args).expect("load");
 
         assert_eq!(cfg.metrics_port, 7000);
-        assert_eq!(cfg.grpc_port, 7001);
     }
 
     #[test]

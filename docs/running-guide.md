@@ -69,9 +69,7 @@ rvc start [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metrics-port <PORT>` | `8080` | Prometheus metrics HTTP port |
-| `--grpc-port <PORT>` | `50051` | gRPC server port |
-| `--grpc-address <ADDR>` | `127.0.0.1` | gRPC bind address |
+| `--metrics-port <PORT>` | `8080` | Prometheus metrics HTTP port (`/metrics`, `/health`, `/livez`, `/readyz`) |
 
 #### Validator Options
 
@@ -185,7 +183,6 @@ keystore_path = "./keystores"
 slashing_db_path = "./slashing_protection.sqlite"
 # allow_fresh_db = true   # only for genuine first deploy (prefer --init-slashing-db once)
 metrics_port = 8080
-grpc_port = 50051
 network = "mainnet"
 log_level = "info"
 
@@ -278,13 +275,13 @@ Set restrictive permissions: `chmod 600 passwords.txt`
 | Path | Description |
 |------|-------------|
 | `/metrics` | Prometheus metrics |
-| `/health` | Health check |
-| `/livez` | Kubernetes liveness |
+| `/health` | JSON diagnostic (`200` when ready, `503` otherwise). Same readiness predicate as `/readyz`. Not a Kubernetes probe. |
+| `/livez` | Kubernetes liveness (always process-up) |
 | `/readyz` | Kubernetes readiness |
 
-### gRPC (default port 50051)
-
-DutyTracker service.
+The gRPC healthz / DutyTracker listener is gone. Leftover `grpc_port` /
+`grpc_address` keys fail startup. Point probes at `/health`, `/livez`, and
+`/readyz` on this metrics port.
 
 ### Keymanager API (default port 5062, when enabled)
 

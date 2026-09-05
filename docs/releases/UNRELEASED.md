@@ -22,12 +22,14 @@ roots, request bodies, and URL gating are unchanged.
 
 ---
 
-## Breaking: gRPC healthz endpoint removed
+## Breaking: gRPC healthz endpoint removed; leftover keys fail startup
 
-Nothing listens on `{grpc_address}:{grpc_port}`. Default **`grpc_port` is
-50051; it is not a server.** `grpc_address` and `grpc_port` still parse on
-the CLI and in TOML; they bind no socket. Any probe, monitor, or healthcheck
-still aimed at that port will fail.
+Nothing listens on the old healthz gRPC bind. **`grpc_address` and
+`grpc_port` are rejected at startup** (`ConfigError::RemovedKey`). A TOML
+file or `--grpc-port` / `--grpc-address` flag that still names them fails
+rather than parsing and doing nothing.
+
+Any probe, monitor, or healthcheck still aimed at that port will fail.
 
 **Replacement pair** on the metrics HTTP server (`metrics_address` /
 `metrics_port`):
@@ -51,9 +53,6 @@ restart the pod in a loop.
 **Action required:** finish the [probe-migration checklist](#probe-migration-checklist)
 if you have not already. Move **liveness → `/livez`** and **readiness →
 `/readyz`** on the metrics port before upgrade.
-
-A later release will reject `grpc_address` / `grpc_port` at startup. Until
-then they still parse and do nothing.
 
 **Metrics bind defaults (probe reachability):**
 
@@ -199,16 +198,22 @@ keep working even if an example snippet later adds a nested table beside them.
 
 ---
 
-## Config: no knob removed, renamed, or re-defaulted
+## Config: no knob removed, renamed, or re-defaulted (section collapse)
 
-**No operator knob was removed, renamed, or given a new default.** The
-collapse is one declaration per knob, not a schema break.
+**The section-table collapse did not remove, rename, or re-default a knob.**
+That collapse is one declaration per knob, not a schema break.
 
 Evidence is the parity harness `crates/rvc/tests/config_wire_parity.rs`:
-`every_knob_appears_in_the_parity_corpus` asserts the full 69-knob set, and
-`flat_legacy_keys_still_parse` / `nested_tables_match_flat_legacy_snapshot`
-require the pre-migration snapshots to stay byte-identical. If a knob had
-been dropped, renamed, or re-defaulted, that suite would fail.
+`every_knob_appears_in_the_parity_corpus` asserts the live operator-knob
+set, and `flat_legacy_keys_still_parse` /
+`nested_tables_match_flat_legacy_snapshot` require the pre-migration
+snapshots to stay byte-identical aside from the healthz bind knobs
+disposed later in this file.
+
+## Config: leftover healthz bind knobs fail startup
+
+See the breaking section at the top of this file. The live operator-knob
+inventory is **67** after disposing `grpc_port` / `grpc_address`.
 
 ---
 

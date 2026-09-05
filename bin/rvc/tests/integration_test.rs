@@ -13,7 +13,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -59,12 +59,11 @@ fn free_port() -> u16 {
 
 struct TestPorts {
     metrics: u16,
-    grpc: u16,
 }
 
 impl TestPorts {
     fn allocate() -> Self {
-        Self { metrics: free_port(), grpc: free_port() }
+        Self { metrics: free_port() }
     }
 }
 
@@ -120,8 +119,6 @@ validators_config = "{validators}"
 password_file = "{password_file}"
 metrics_address = "127.0.0.1"
 metrics_port = {metrics}
-grpc_address = "127.0.0.1"
-grpc_port = {grpc}
 network = "mainnet"
 log_level = "info"
 keymanager_enabled = false
@@ -132,7 +129,6 @@ keymanager_enabled = false
         validators = validators_config.display(),
         password_file = password_file.display(),
         metrics = ports.metrics,
-        grpc = ports.grpc,
     )
     .unwrap();
     file
@@ -154,11 +150,7 @@ fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
             "--init-slashing-db",
             "--metrics-port",
             &ports.metrics.to_string(),
-            "--grpc-port",
-            &ports.grpc.to_string(),
             "--metrics-address",
-            "127.0.0.1",
-            "--grpc-address",
             "127.0.0.1",
         ])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -456,18 +448,13 @@ async fn test_graceful_shutdown_sigterm_exit_code_zero() {
     }
 }
 
-/// ARCH-7d: the configured gRPC port must not be bound after startup.
+/// ARCH-7e: healthz gRPC is gone; leftover bind knobs are rejected, so this
+/// only asserts the process never logs a gRPC listener start.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_no_grpc_listener_on_startup() {
     let mut harness = SmokeHarness::start().await;
     harness.wait_until_ready().await;
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], harness.ports.grpc));
-    let connected = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
-    assert!(
-        connected.is_err(),
-        "configured gRPC port must have no listener after startup; connect succeeded on {addr}"
-    );
     let logs = harness.logs.snapshot();
     assert!(
         !logs.contains("Starting gRPC server"),

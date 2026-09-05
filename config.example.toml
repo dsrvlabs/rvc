@@ -77,9 +77,8 @@ doppelganger_detection = true
 # Prometheus metrics HTTP server (/metrics, /health, /livez, /readyz)
 metrics_port = 8080
 
-# gRPC server for duty tracker service
-grpc_port = 50051
-grpc_address = "127.0.0.1"
+# The gRPC healthz listener is gone. Leftover grpc_port / grpc_address keys
+# fail startup. Probe GET /health and GET /readyz on this metrics port.
 
 # ---------------------------------------------------------------------------
 # Keymanager API (runtime key management via Beacon APIs)

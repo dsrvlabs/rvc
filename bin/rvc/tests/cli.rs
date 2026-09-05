@@ -108,8 +108,6 @@ fn start_help_exits_zero_and_lists_flags() {
         "--allow-unsupported-fork",
         "--metrics-address",
         "--metrics-port",
-        "--grpc-address",
-        "--grpc-port",
         "--network",
         "--genesis-time",
         "--genesis-validators-root",
@@ -197,6 +195,29 @@ fn unknown_flag_exits_nonzero_with_usage() {
 }
 
 #[test]
+fn test_unknown_grpc_cli_flag_is_rejected() {
+    for args in [
+        ["start", "--grpc-port", "1"].as_slice(),
+        ["start", "--grpc-address", "127.0.0.1"].as_slice(),
+    ] {
+        let output = run_with_timeout(Command::new(rvc_bin()).args(args), Duration::from_secs(10));
+        assert!(
+            !output.status.success(),
+            "{args:?} must exit non-zero after the flags were removed; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected")
+                || stderr.contains("Usage")
+                || stderr.contains("usage")
+                || stderr.contains("error"),
+            "expected clap rejection for {args:?}, got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn start_unknown_flag_exits_nonzero_with_usage() {
     let output = run_with_timeout(
         Command::new(rvc_bin()).args(["start", "--definitely-not-a-flag"]),
@@ -237,7 +258,6 @@ fn write_start_config(
     slashing_db_path: &Path,
     beacon_url: &str,
     metrics_port: u16,
-    grpc_port: u16,
     extra_toml: &str,
 ) -> NamedTempFile {
     let keystore = dir.path().join("keystores");
@@ -251,8 +271,6 @@ keystore_path = "{keystore}"
 slashing_db_path = "{slashing}"
 metrics_address = "127.0.0.1"
 metrics_port = {metrics_port}
-grpc_address = "127.0.0.1"
-grpc_port = {grpc_port}
 network = "mainnet"
 log_level = "info"
 keymanager_enabled = false
@@ -262,7 +280,6 @@ keymanager_enabled = false
         keystore = keystore.display(),
         slashing = slashing_db_path.display(),
         metrics_port = metrics_port,
-        grpc_port = grpc_port,
         extra = extra_toml,
     )
     .expect("write config");
@@ -278,13 +295,11 @@ fn missing_slashing_db_refuses_start() {
     assert!(!slashing_path.exists());
 
     let metrics = free_port();
-    let grpc = free_port();
     let config = write_start_config(
         &dir,
         &slashing_path,
         "http://127.0.0.1:9", // unreachable; open fails before BN connect
         metrics,
-        grpc,
         "",
     );
 
@@ -297,8 +312,6 @@ fn missing_slashing_db_refuses_start() {
                 // deliberately NO --init-slashing-db
                 "--metrics-port",
                 &metrics.to_string(),
-                "--grpc-port",
-                &grpc.to_string(),
             ])
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_TRACES_SAMPLER_ARG"),
@@ -334,13 +347,12 @@ fn tracing_sample_rate_cli_survives_otel_env() {
     let dir = TempDir::new().expect("temp dir");
     let slashing_path = dir.path().join("missing-slashing.db");
     let metrics = free_port();
-    let grpc = free_port();
     // Point OTLP at a closed local port so exporter construction is cheap and
     // does not require a real collector. init_tracing typically succeeds; if it
     // fails we still assert the sample_rate appeared in the enable line or the
     // failure path still exercised merge (test will fail loudly either way).
     let otlp = format!("http://127.0.0.1:{}", free_port());
-    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, grpc, "");
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
 
     let output = run_with_timeout(
         Command::new(rvc_bin())
@@ -354,8 +366,6 @@ fn tracing_sample_rate_cli_survives_otel_env() {
                 "0.01",
                 "--metrics-port",
                 &metrics.to_string(),
-                "--grpc-port",
-                &grpc.to_string(),
             ])
             // Env would win under the pre-F20 bug when the explicit value was 0.01.
             .env("OTEL_TRACES_SAMPLER_ARG", "0.5")
