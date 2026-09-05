@@ -13,10 +13,12 @@ use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use beacon::{
-    AttestationData, BeaconClient, BeaconClientConfig, BeaconCommitteeSubscription, BeaconError,
-    Checkpoint, LegacyAttestation, ProposerPreparation, SingleAttestation,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    parse_slot_duration_ms, AttestationData, BeaconClient, BeaconClientConfig,
+    BeaconCommitteeSubscription, BeaconError, Checkpoint, LegacyAttestation, ProposerPreparation,
+    SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
+use timing::{SlotClock, SystemSlotClock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TestData {
@@ -1246,6 +1248,87 @@ async fn test_get_config_spec_success() {
     assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), &json!("12"));
     assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), &json!("32"));
     assert_eq!(result.data.len(), 11);
+}
+
+fn slot_clock_from_spec_data(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+) -> SystemSlotClock {
+    let slot_duration_ms = parse_slot_duration_ms(data).unwrap();
+    SystemSlotClock::new(1_606_824_023, Duration::from_millis(slot_duration_ms), 32).unwrap()
+}
+
+#[tokio::test]
+async fn test_get_config_spec_slot_duration_master_keyset() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "data": {
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "SLOT_DURATION_MS": "12000",
+            "SLOTS_PER_EPOCH": "32"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/config/spec"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let spec = client.get_config_spec().await.unwrap();
+    assert!(!spec.data.contains_key("SECONDS_PER_SLOT"));
+    assert!(!spec.data.contains_key("INTERVALS_PER_SLOT"));
+    let clock = slot_clock_from_spec_data(&spec.data);
+    assert_eq!(clock.slot_duration(), Duration::from_secs(12));
+}
+
+#[tokio::test]
+async fn test_get_config_spec_slot_duration_legacy_keyset() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "data": {
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "SECONDS_PER_SLOT": "12",
+            "INTERVALS_PER_SLOT": "3",
+            "SLOTS_PER_EPOCH": "32"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/config/spec"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let spec = client.get_config_spec().await.unwrap();
+    assert!(!spec.data.contains_key("SLOT_DURATION_MS"));
+    let clock = slot_clock_from_spec_data(&spec.data);
+    assert_eq!(clock.slot_duration(), Duration::from_secs(12));
 }
 
 #[tokio::test]

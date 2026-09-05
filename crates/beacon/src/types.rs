@@ -255,6 +255,65 @@ pub fn parse_fork_schedule(
     })
 }
 
+/// Parses slot duration in milliseconds from a `/eth/v1/config/spec` map.
+///
+/// Accepts either BN wire spelling:
+///
+/// - `SLOT_DURATION_MS` (milliseconds, used as-is)
+/// - `SECONDS_PER_SLOT` (seconds, converted as `seconds * 1000`)
+///
+/// Exactly one key is sufficient. Both may be present during a deprecation
+/// window and are accepted when they agree exactly. Neither key, or both
+/// present with unequal values, is a parse error. Extra keys such as
+/// `INTERVALS_PER_SLOT` are ignored.
+pub fn parse_slot_duration_ms(
+    spec: &HashMap<String, serde_json::Value>,
+) -> Result<u64, BeaconError> {
+    const SLOT_DURATION_MS_KEY: &str = "SLOT_DURATION_MS";
+    const SECONDS_PER_SLOT_KEY: &str = "SECONDS_PER_SLOT";
+
+    match (spec.get(SLOT_DURATION_MS_KEY), spec.get(SECONDS_PER_SLOT_KEY)) {
+        (None, None) => Err(BeaconError::ParseError(format!(
+            "missing config keys: {SLOT_DURATION_MS_KEY} and {SECONDS_PER_SLOT_KEY}"
+        ))),
+        (Some(value), None) => parse_positive_u64(value, SLOT_DURATION_MS_KEY),
+        (None, Some(value)) => seconds_per_slot_to_ms(value),
+        (Some(ms_value), Some(seconds_value)) => {
+            let slot_duration_ms = parse_positive_u64(ms_value, SLOT_DURATION_MS_KEY)?;
+            let from_seconds = seconds_per_slot_to_ms(seconds_value)?;
+            if slot_duration_ms == from_seconds {
+                Ok(slot_duration_ms)
+            } else {
+                let ms_raw = value_to_string(ms_value, SLOT_DURATION_MS_KEY)?;
+                let seconds_raw = value_to_string(seconds_value, SECONDS_PER_SLOT_KEY)?;
+                Err(BeaconError::ParseError(format!(
+                    "conflicting slot duration: {SECONDS_PER_SLOT_KEY}={seconds_raw} {SLOT_DURATION_MS_KEY}={ms_raw}"
+                )))
+            }
+        }
+    }
+}
+
+fn parse_positive_u64(value: &serde_json::Value, key: &str) -> Result<u64, BeaconError> {
+    let s = value_to_string(value, key)?;
+    let n = s
+        .parse::<u64>()
+        .map_err(|e| BeaconError::ParseError(format!("invalid slot duration for {key}: {e}")))?;
+    if n == 0 {
+        return Err(BeaconError::ParseError(format!(
+            "slot duration must be greater than zero for {key}"
+        )));
+    }
+    Ok(n)
+}
+
+fn seconds_per_slot_to_ms(value: &serde_json::Value) -> Result<u64, BeaconError> {
+    let seconds = parse_positive_u64(value, "SECONDS_PER_SLOT")?;
+    seconds.checked_mul(1000).ok_or_else(|| {
+        BeaconError::ParseError(format!("slot duration overflow for SECONDS_PER_SLOT: {seconds}"))
+    })
+}
+
 fn value_to_string(value: &serde_json::Value, key: &str) -> Result<String, BeaconError> {
     match value {
         serde_json::Value::String(s) => Ok(s.clone()),
@@ -779,6 +838,91 @@ mod tests {
         spec.insert("GENESIS_FORK_VERSION".to_string(), json!("00000000"));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
+    }
+
+    fn assert_parse_error_contains(result: Result<u64, BeaconError>, needles: &[&str]) {
+        let err = result.expect_err("expected BeaconError::ParseError");
+        assert!(matches!(err, BeaconError::ParseError(_)), "expected ParseError, got {err:?}");
+        let msg = err.to_string();
+        for needle in needles {
+            assert!(msg.contains(needle), "error {msg:?} should contain {needle:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_master_keyset() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("12000"));
+        assert!(!spec.contains_key("SECONDS_PER_SLOT"));
+        assert!(!spec.contains_key("INTERVALS_PER_SLOT"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_legacy_keyset() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("INTERVALS_PER_SLOT".to_string(), json!("3"));
+        assert!(!spec.contains_key("SLOT_DURATION_MS"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_both_agreeing() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("12000"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_conflicting_keys_error() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("13000"));
+        assert_parse_error_contains(
+            parse_slot_duration_ms(&spec),
+            &["SECONDS_PER_SLOT", "SLOT_DURATION_MS", "12", "13000"],
+        );
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_neither_key() {
+        let spec = mainnet_config_spec();
+        assert_parse_error_contains(
+            parse_slot_duration_ms(&spec),
+            &["SECONDS_PER_SLOT", "SLOT_DURATION_MS"],
+        );
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_zero() {
+        let mut spec = HashMap::new();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!(0));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SLOT_DURATION_MS"]);
+
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!(0));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SECONDS_PER_SLOT"]);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_non_numeric() {
+        let mut spec = HashMap::new();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("abc"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SLOT_DURATION_MS"]);
+
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("abc"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SECONDS_PER_SLOT"]);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_numeric_values() {
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!(12));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!(12000));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
     }
 
     #[test]

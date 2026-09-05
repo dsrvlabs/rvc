@@ -130,7 +130,15 @@ pub async fn build_services(
         enablement.pubkey_index.read().indices().cloned().collect();
     let duty_tracker = builder.build_duty_tracker(main_beacon.clone(), validator_indices);
 
-    let slot_clock = match builder.build_slot_clock() {
+    let slot_duration_ms = match builder.resolve_slot_duration_ms(main_beacon.as_ref()).await {
+        Ok(ms) => ms,
+        Err(e) => {
+            error!("Failed to resolve slot duration from beacon node: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    let slot_clock = match builder.build_slot_clock(slot_duration_ms) {
         Ok(clock) => clock,
         Err(e) => {
             error!("Failed to create slot clock: {}", e);

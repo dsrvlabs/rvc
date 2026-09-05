@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use observability::logging::RedactedUrl;
 
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
-use beacon::{BeaconClient, BeaconClientConfig};
+use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
@@ -482,15 +482,30 @@ impl ServiceBuilder {
         Arc::new(tracker)
     }
 
-    pub fn build_slot_clock(&self) -> Result<Arc<SystemSlotClock>, ConfigError> {
+    pub async fn resolve_slot_duration_ms(
+        &self,
+        beacon: &dyn BeaconNodeClient,
+    ) -> Result<u64, ConfigError> {
+        info!("Fetching slot duration from beacon node config spec");
+        let spec = beacon.get_config_spec().await?;
+        let slot_duration_ms = parse_slot_duration_ms(&spec.data)?;
+        info!(slot_duration_ms, "Resolved slot duration from beacon node spec");
+        Ok(slot_duration_ms)
+    }
+
+    pub fn build_slot_clock(
+        &self,
+        slot_duration_ms: u64,
+    ) -> Result<Arc<SystemSlotClock>, ConfigError> {
         let genesis_time = self.config.effective_genesis_time()?;
-        let slot_duration = Duration::from_millis(self.config.network.slot_duration_ms());
+        let slot_duration = Duration::from_millis(slot_duration_ms);
         let slots_per_epoch = self.config.network.slots_per_epoch();
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
             .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?;
         info!(
             genesis_time = genesis_time,
+            slot_duration_ms,
             slot_duration_secs = slot_duration.as_secs(),
             slots_per_epoch = slots_per_epoch,
             "Created slot clock"
@@ -935,11 +950,12 @@ mod tests {
     fn test_build_slot_clock() {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
-        let result = builder.build_slot_clock();
+        let result = builder.build_slot_clock(6_000);
 
         assert!(result.is_ok());
         let clock = result.unwrap();
         assert_eq!(clock.genesis_time(), 1606824023);
+        assert_eq!(clock.slot_duration(), Duration::from_secs(6));
     }
 
     #[test]

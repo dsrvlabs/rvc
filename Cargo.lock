@@ -654,6 +654,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-observability",
  "rvc-telemetry",
+ "rvc-timing",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
