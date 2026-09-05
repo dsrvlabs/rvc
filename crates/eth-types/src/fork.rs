@@ -64,7 +64,10 @@ impl ForkSchedule {
     /// When several forks share an activation epoch, reverse iteration over this
     /// table selects the latest fork — matching the historical descending
     /// if-else chain (including keygen's EIP-7044 Capella-cap schedule).
-    pub fn entries(&self) -> [(ForkName, Epoch, Version); 7] {
+    ///
+    /// The per-fork field list stays here; `ForkSchedule` remains a flat struct
+    /// and is not reshaped. Length is [`ForkName::COUNT`].
+    pub fn entries(&self) -> [(ForkName, Epoch, Version); ForkName::COUNT] {
         [
             (ForkName::Phase0, 0, self.genesis_fork_version),
             (ForkName::Altair, self.altair_fork_epoch, self.altair_fork_version),
@@ -79,15 +82,11 @@ impl ForkSchedule {
 
 impl AsRef<str> for ForkName {
     fn as_ref(&self) -> &str {
-        match self {
-            Self::Phase0 => "phase0",
-            Self::Altair => "altair",
-            Self::Bellatrix => "bellatrix",
-            Self::Capella => "capella",
-            Self::Deneb => "deneb",
-            Self::Electra => "electra",
-            Self::Fulu => "fulu",
-        }
+        Self::NAMES
+            .iter()
+            .find(|(name, _, _)| name == self)
+            .map(|(_, s, _)| *s)
+            .expect("all ForkName variants appear in NAMES")
     }
 }
 
@@ -95,16 +94,11 @@ impl FromStr for ForkName {
     type Err = ParseForkNameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "phase0" => Ok(Self::Phase0),
-            "altair" => Ok(Self::Altair),
-            "bellatrix" => Ok(Self::Bellatrix),
-            "capella" => Ok(Self::Capella),
-            "deneb" => Ok(Self::Deneb),
-            "electra" => Ok(Self::Electra),
-            "fulu" => Ok(Self::Fulu),
-            _ => Err(ParseForkNameError),
-        }
+        Self::NAMES
+            .iter()
+            .find(|(_, name, _)| *name == s)
+            .map(|(fork, _, _)| *fork)
+            .ok_or(ParseForkNameError)
     }
 }
 
@@ -112,16 +106,11 @@ impl TryFrom<u32> for ForkName {
     type Error = UnknownForkIdError;
 
     fn try_from(id: u32) -> Result<Self, Self::Error> {
-        match id {
-            0 => Ok(Self::Phase0),
-            1 => Ok(Self::Altair),
-            2 => Ok(Self::Bellatrix),
-            3 => Ok(Self::Capella),
-            4 => Ok(Self::Deneb),
-            5 => Ok(Self::Electra),
-            6 => Ok(Self::Fulu),
-            other => Err(UnknownForkIdError(other)),
-        }
+        Self::NAMES
+            .iter()
+            .find(|(_, _, n)| *n == id)
+            .map(|(fork, _, _)| *fork)
+            .ok_or(UnknownForkIdError(id))
     }
 }
 
@@ -137,7 +126,22 @@ impl ForkName {
         Self::Fulu,
     ];
 
+    /// Number of known forks; equal to [`Self::ALL`] length.
+    pub const COUNT: usize = Self::ALL.len();
+
+    const NAMES: [(ForkName, &str, u32); Self::COUNT] = [
+        (Self::Phase0, "phase0", 0),
+        (Self::Altair, "altair", 1),
+        (Self::Bellatrix, "bellatrix", 2),
+        (Self::Capella, "capella", 3),
+        (Self::Deneb, "deneb", 4),
+        (Self::Electra, "electra", 5),
+        (Self::Fulu, "fulu", 6),
+    ];
+
     /// Stable numeric id (PHASE0=0 … FULU=6), matching signer SSZ `fork_id`.
+    ///
+    /// Exhaustive `match self` with no `_ =>` arm: the fork-addition tripwire.
     pub fn id(self) -> u32 {
         match self {
             Self::Phase0 => 0,
@@ -547,6 +551,23 @@ mod tests {
         assert_eq!(entries.len(), 7);
         for (i, (name, epoch, version)) in expected.into_iter().enumerate() {
             assert_eq!(entries[i], (name, epoch, version));
+        }
+    }
+
+    /// Every `ForkName::ALL` variant appears exactly once in `entries()`, and
+    /// `entries().len() == ForkName::COUNT`.
+    ///
+    /// `ForkName::id` is the deliberate fork-addition tripwire: an exhaustive
+    /// `match self` with no `_ =>` arm, so adding a variant without updating
+    /// `id()` (and `ALL`) is a compile error.
+    #[test]
+    fn test_entries_contains_each_all_variant_exactly_once() {
+        let schedule = test_schedule();
+        let entries = schedule.entries();
+        assert_eq!(entries.len(), ForkName::COUNT);
+        for name in ForkName::ALL {
+            let count = entries.iter().filter(|(n, _, _)| *n == name).count();
+            assert_eq!(count, 1, "{name:?} must appear exactly once in entries()");
         }
     }
 }
