@@ -21,6 +21,7 @@ use super::error::ConfigError;
 use super::network::Network;
 use super::start::StartArgs;
 use rvc_config::ConfigSource;
+use slashing::GroupCommitConfig;
 
 pub use rvc_config::{
     BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig,
@@ -105,6 +106,14 @@ pub struct Config {
     /// error regardless of this flag. Never wipes a non-empty DB.
     #[serde(default)]
     pub allow_fresh_db: bool,
+
+    /// Max slashing-DB reserve checks per COMMIT. `None` uses the measured default of 50.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_batch_size: Option<usize>,
+
+    /// Milliseconds to wait for a group-commit batch to fill. `None` uses 1 ms; 0 disables wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_wait_to_fill_ms: Option<u64>,
 
     /// Allow startup when the beacon node's current fork version is not in the
     /// client's fork schedule (SEC-9 / M-15).
@@ -256,6 +265,8 @@ impl Default for Config {
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
             allow_fresh_db: false,
+            group_commit_batch_size: None,
+            group_commit_wait_to_fill_ms: None,
             allow_unsupported_fork: false,
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
@@ -588,6 +599,8 @@ impl Config {
                 .allow_fresh_db
                 .or(w.slashing.allow_fresh_db)
                 .unwrap_or(def.allow_fresh_db),
+            group_commit_batch_size: w.slashing.group_commit_batch_size,
+            group_commit_wait_to_fill_ms: w.slashing.group_commit_wait_to_fill_ms,
             allow_unsupported_fork: w
                 .allow_unsupported_fork
                 .or(w.safety.allow_unsupported_fork)
@@ -862,6 +875,12 @@ impl Config {
             return Err(ConfigError::MissingField(
                 "--duty-fetch-timeout must be greater than 0".to_string(),
             ));
+        }
+        if let Err(e) = GroupCommitConfig::try_from_knobs(
+            self.group_commit_batch_size,
+            self.group_commit_wait_to_fill_ms,
+        ) {
+            return Err(ConfigError::MissingField(e.to_string()));
         }
 
         // Validate proposer node URLs
@@ -1256,6 +1275,12 @@ impl Config {
         }
         if slashing.init_slashing_db {
             self.allow_fresh_db = true;
+        }
+        if let Some(v) = slashing.group_commit_batch_size {
+            self.group_commit_batch_size = Some(v);
+        }
+        if let Some(v) = slashing.group_commit_wait_to_fill_ms {
+            self.group_commit_wait_to_fill_ms = Some(v);
         }
     }
 }

@@ -91,6 +91,8 @@ mod tests {
         "--no-doppelganger-detection",
         "--slashed-validators-action",
         "--slashing-db-path",
+        "--slashing-group-commit-batch-size",
+        "--slashing-group-commit-wait-to-fill-ms",
         "--strict-permissions",
         "--strict-slashing-semantics",
     ];

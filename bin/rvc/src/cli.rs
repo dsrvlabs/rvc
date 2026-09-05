@@ -850,7 +850,15 @@ metrics_port = 9090
                     "--builder-circuit-breaker-epoch-limit",
                 ],
             ),
-            ("SlashingArgs", &["--slashing-db-path", "--init-slashing-db"]),
+            (
+                "SlashingArgs",
+                &[
+                    "--slashing-db-path",
+                    "--init-slashing-db",
+                    "--slashing-group-commit-batch-size",
+                    "--slashing-group-commit-wait-to-fill-ms",
+                ],
+            ),
             ("BeaconArgs", &["--beacon-url", "--beacon-nodes", "--beacon-max-body-bytes"]),
         ];
 

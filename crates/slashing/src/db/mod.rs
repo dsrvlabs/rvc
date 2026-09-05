@@ -36,7 +36,8 @@ mod open;
 mod records;
 pub mod watermarks;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -91,16 +92,55 @@ pub struct SlashingDb {
     ///
     /// Scoped to this `SlashingDb` so parallel tests with separate in-memory DBs
     /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`;
-    /// consumed inside `reserve_*` immediately before INSERT, and inside
+    /// consumed inside `Staged*::commit` (snapshotted at `stage_*`), inside
+    /// group-commit immediately before `COMMIT`, and inside
     /// `reconcile_unsigned` immediately before the compensating DELETE.
     pub(crate) fail_next_commits: AtomicU32,
+    /// Group-commit knobs. Replaced at startup from operator config.
+    pub(crate) group_commit: Mutex<crate::group_commit::GroupCommitConfig>,
+    pub(crate) pending: Mutex<VecDeque<crate::group_commit::QueuedReserve>>,
+    pub(crate) pending_cv: Condvar,
+    /// Serialises the flusher so wait-to-fill does not hold `conn`.
+    pub(crate) flush_lock: Mutex<()>,
+    /// True while a flusher is responsible for the queue. Enqueue claims it;
+    /// the flusher clears it under `pending` when the queue is empty.
+    pub(crate) leader_active: AtomicBool,
+    /// Test-only: block the next in-txn eval until the release sender fires.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) eval_gate:
+        Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Skip this many in-txn eval stalls before honouring `eval_gate`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) eval_skip: AtomicU32,
+}
+
+impl SlashingDb {
+    pub(crate) fn from_connection(conn: Connection, path: Option<PathBuf>) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            path,
+            strict_semantics: AtomicBool::new(false),
+            gvr_cache: OnceLock::new(),
+            gvr_skip_warned: OnceLock::new(),
+            fail_next_commits: AtomicU32::new(0),
+            group_commit: Mutex::new(crate::group_commit::GroupCommitConfig::default()),
+            pending: Mutex::new(VecDeque::new()),
+            pending_cv: Condvar::new(),
+            flush_lock: Mutex::new(()),
+            leader_active: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            eval_gate: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            eval_skip: AtomicU32::new(0),
+        }
+    }
 }
 
 impl SlashingDb {
     /// Force the next `n` persist operations on **this** DB to fail:
-    /// `Staged*::commit` (snapshotted at `stage_*`), `reserve_*` (consumed
-    /// immediately before INSERT), and `reconcile_unsigned` (consumed
-    /// immediately before DELETE). Drop of a staged guard still rolls back.
+    /// `Staged*::commit` (snapshotted at `stage_*`), group-commit `COMMIT`
+    /// (consumed immediately before `COMMIT`), and `reconcile_unsigned`
+    /// (consumed immediately before DELETE). Drop of a staged guard still rolls back.
     /// Per-instance — safe under parallel tests with separate
     /// `open_in_memory()` DBs.
     ///

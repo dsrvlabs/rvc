@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError};
 use eth_types::Root;
 use rvc_signer::{NoopSignHooks, SlashableSignSession, TimeoutPolicy, ValidatorLockMap};
-use slashing::{BlockSlashingViolation, SlashingDb, SlashingError};
+use slashing::{BlockSlashingViolation, GroupCommitConfig, SlashingDb, SlashingError};
 use tokio::sync::{oneshot, Notify};
 
 const GVR: Root = [0xc0; 32];
@@ -515,4 +515,59 @@ async fn test_reserve_then_sign_future_is_send() {
     assert_send(&fut);
     // Mirror core.rs's tokio::spawn of the slashable future.
     tokio::spawn(fut).await.expect("join").expect("blocking").expect("reserve_then_sign");
+}
+
+/// Batch-boundary (#205): dropping one waiter must not stall the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn test_cancelled_batch_member_does_not_block_the_others() {
+    let mut fixture = ReopenableDb::new();
+    fixture.db().set_group_commit(GroupCommitConfig {
+        batch_size: 3,
+        wait_to_fill: Duration::from_millis(80),
+    });
+    let abandoned = hex::encode(SecretKey::generate().public_key().to_bytes());
+    fixture
+        .db()
+        .enqueue_and_abandon_block(&abandoned, SLOT, Some(root_hex(CONFLICT_ROOT)), &GVR)
+        .expect("abandon");
+
+    let mut joins = Vec::new();
+    let mut pubkeys = Vec::new();
+    for _ in 0..2 {
+        let (pubkey, signer) = make_local(SecretKey::generate());
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        pubkeys.push(pubkey_hex.clone());
+        let sess = session(
+            signer,
+            &pubkey,
+            fixture.db(),
+            Duration::from_secs(4),
+            TimeoutPolicy::RetainStagedRow,
+            "test_cancel_batch_member",
+        );
+        let db_blocking = fixture.db();
+        let pk = pubkey_hex;
+        joins.push(tokio::task::spawn_blocking(move || {
+            sess.reserve_then_sign(|| {
+                db_blocking.reserve_block(&pk, SLOT, Some(root_hex(SIGNING_ROOT)), &GVR)
+            })
+        }));
+    }
+
+    for join in joins {
+        join.await.expect("join").expect("other members must still sign");
+    }
+    fixture.drop_writer();
+    let reopened = fixture.reopen();
+    assert!(
+        reopened.get_blocks(&abandoned).expect("abandoned").is_empty(),
+        "cancelled member must not insert"
+    );
+    for pk in &pubkeys {
+        assert_eq!(
+            reopened.get_blocks(pk).expect("get").len(),
+            1,
+            "surviving member {pk} must have a reserved row"
+        );
+    }
 }

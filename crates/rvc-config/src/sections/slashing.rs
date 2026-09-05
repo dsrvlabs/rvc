@@ -39,6 +39,16 @@ pub struct SlashingArgs {
     #[arg(long = "strict-slashing-semantics")]
     #[serde(skip)]
     pub strict_slashing_semantics: bool,
+
+    /// Max slashing-DB reserve checks per COMMIT (group commit). Default 50.
+    #[arg(id = "group_commit_batch_size", long = "slashing-group-commit-batch-size")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_batch_size: Option<usize>,
+
+    /// Milliseconds to wait for a group-commit batch to fill. Default 1. 0 = no wait.
+    #[arg(id = "group_commit_wait_to_fill_ms", long = "slashing-group-commit-wait-to-fill-ms")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_wait_to_fill_ms: Option<u64>,
 }
 
 impl SlashingArgs {
@@ -49,6 +59,8 @@ impl SlashingArgs {
         SlashingConfig {
             slashing_db_path: self.slashing_db_path.clone(),
             allow_fresh_db: if self.init_slashing_db { Some(true) } else { None },
+            group_commit_batch_size: self.group_commit_batch_size,
+            group_commit_wait_to_fill_ms: self.group_commit_wait_to_fill_ms,
         }
     }
 }
@@ -61,4 +73,8 @@ pub struct SlashingConfig {
     pub slashing_db_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_fresh_db: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_commit_batch_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_commit_wait_to_fill_ms: Option<u64>,
 }

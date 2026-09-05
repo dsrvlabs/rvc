@@ -22,7 +22,9 @@ use crypto::{PublicKey, SecretKey, Signature, Signer, SigningError};
 use eth_types::Root;
 use rvc_signer::{NoopSignHooks, SigningGateError, SlashableSignSession, TimeoutPolicy};
 use slashing::metrics::{reconcile_outcome, tx_hold_kind, RVC_SLASHING_RECONCILE_TOTAL};
-use slashing::{BlockSlashingViolation, CommittedReservation, SlashingDb, SlashingError};
+use slashing::{
+    BlockSlashingViolation, CommittedReservation, GroupCommitConfig, SlashingDb, SlashingError,
+};
 
 use common::{
     AmbiguousErrorSigner, HangingSigner, KeyNotFoundSigner, LocalRejectedSigner, PanickingSigner,
@@ -987,4 +989,43 @@ async fn test_today_panic_retain_rolls_back() {
     assert_task_panicked(&err);
     assert_no_row(&db, &pubkey_hex);
     assert_reconcile_delta(before, 0, 0, 0);
+}
+
+/// Batch-boundary (#205): a failed group COMMIT rejects every member before
+/// any backend sign. Same-root retry stays mapped to `CommitFailed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn test_batch_commit_failure_rejects_every_member_without_signing() {
+    let db = common::open_db();
+    db.set_group_commit(GroupCommitConfig {
+        batch_size: 3,
+        wait_to_fill: Duration::from_millis(80),
+    });
+    db.fail_next_commits(1);
+
+    let mut joins = Vec::new();
+    let mut pubkeys = Vec::new();
+    let mut attempts = Vec::new();
+    for _ in 0..3 {
+        let (pubkey, signer) = succeeding_pair();
+        let (signer, counted) = wrap_recorded(signer);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        pubkeys.push(pubkey_hex.clone());
+        attempts.push(Arc::clone(&counted));
+        let session = make_session(
+            signer,
+            &pubkey,
+            TimeoutPolicy::RetainStagedRow,
+            SIGN_TIMEOUT,
+            Arc::clone(&db),
+            "batch_commit_fail",
+        );
+        joins.push(tokio::spawn(run_reserve(session, Arc::clone(&db), pubkey_hex, Inject::None)));
+    }
+
+    for ((join, pk), counted) in joins.into_iter().zip(pubkeys.iter()).zip(attempts.iter()) {
+        let err = join.await.expect("join").expect_err("batch COMMIT fail must reject");
+        assert_commit_failed(&err);
+        assert_eq!(counted.load(Ordering::SeqCst), 0, "no member may sign before COMMIT");
+        assert_no_row(&db, pk);
+    }
 }

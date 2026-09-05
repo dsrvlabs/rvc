@@ -168,6 +168,21 @@ fn zero_timeout_rejected_from_toml_as_well_as_cli() {
 }
 
 #[test]
+fn group_commit_batch_size_zero_is_rejected() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(file, "[slashing]\ngroup_commit_batch_size = 0").unwrap();
+    let from_toml = Config::load(Some(file.path()), StartArgs::default()).expect("load toml 0");
+    let err = from_toml.validate().expect_err("batch_size 0");
+    assert!(err.to_string().contains("group-commit batch_size must be greater than 0"), "{err}");
+
+    let mut cli = StartArgs::default();
+    cli.slashing.group_commit_batch_size = Some(0);
+    let from_cli = Config::load(None, cli).expect("load cli 0");
+    let err = from_cli.validate().expect_err("cli batch_size 0");
+    assert!(err.to_string().contains("group-commit batch_size must be greater than 0"), "{err}");
+}
+
+#[test]
 fn aggregate_timeout_sets_both_fetch_and_submit() {
     let mut file = NamedTempFile::new().unwrap();
     writeln!(file, "aggregate_timeout = 17").unwrap();

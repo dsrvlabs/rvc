@@ -14,6 +14,10 @@ Checked-in baselines for success metrics that later phases must improve against.
   `41e7646` against the same ARCH-5a profile. Cites
   [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) and
   [`m3-post-adr005.md`](./m3-post-adr005.md).
+- **M3 post-group-commit (issue #205):** recorded on
+  `feature/205-slashing-db-group-commit`. Cites
+  [`m3-post-adr005.md`](./m3-post-adr005.md) and
+  [`m3-scale-200keys-200ms.md`](./m3-scale-200keys-200ms.md).
 
 | File | Metric | Role |
 |---|---|---|
@@ -23,6 +27,7 @@ Checked-in baselines for success metrics that later phases must improve against.
 | [`m3-baseline-0ae9a09.md`](./m3-baseline-0ae9a09.md) | **M3** slashing tx-hold (ARCH-5a / ARCH-5b) | Three-run median; concurrency = 1; observation-window decision (keep current series, add reserve-tx in 5l); per-sign budget = 3999/200 = 19.995 ms |
 | [`m3-post-adr005.md`](./m3-post-adr005.md) | **M3 after ADR-005** (ARCH-5m) | Three-run median under **both** windows; X6 unmet (reserve-tx p99 917 ms ≫ 19.995 ms); fsync named; group commit filed; X7 rollback; X8 no G6 |
 | [`m3-scale-200keys-200ms.md`](./m3-scale-200keys-200ms.md) | **M3 scale 200×200 ms** (ARCH-7m) | Post-ADR-005 tree; 0 missed deadlines; p99 1131 ms vs 19.995 ms; fsync still binds; no group commit; A-A8 signer-server only |
+| [`m3-post-group-commit.md`](./m3-post-group-commit.md) | **M3 after group commit** (#205) | Three-run median under **both** windows; reserve-tx p99 **24.070 ms** (was 917 ms); 0 missed deadlines; X6 still unmet (~1.20×); next wall = remaining 4 fsyncs/wave |
 | [`wire-twins-spike.md`](./wire-twins-spike.md) | **ARCH-7f** `Wire*` collapse spike | **Path C**; docs only — prototype must not merge |
 
 ---

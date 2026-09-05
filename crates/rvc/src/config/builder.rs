@@ -21,7 +21,7 @@ use doppelganger::{
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root};
 use signer::{SignerService, ValidatorSigner};
-use slashing::SlashingDb;
+use slashing::{GroupCommitConfig, SlashingDb};
 use timing::SystemSlotClock;
 use validator_store::ValidatorStore;
 
@@ -375,6 +375,13 @@ impl ServiceBuilder {
         } else {
             info!(path = ?path, "Opened slashing protection database");
         }
+        db.set_group_commit(
+            GroupCommitConfig::try_from_knobs(
+                self.config.group_commit_batch_size,
+                self.config.group_commit_wait_to_fill_ms,
+            )
+            .map_err(|e| ConfigError::MissingField(e.to_string()))?,
+        );
         Ok(Arc::new(db))
     }
 

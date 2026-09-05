@@ -131,6 +131,11 @@ pub struct SignerSection {
     /// Opt-in Web3Signer HTTP API listener block (FR-25/27/28/30). Absent =
     /// HTTP disabled; gRPC stays default-on.
     pub http: Option<HttpSection>,
+    /// Max slashing-DB reserve checks per COMMIT (`[signer] group_commit_batch_size`).
+    pub group_commit_batch_size: Option<usize>,
+    /// Milliseconds to wait for a group-commit batch to fill
+    /// (`[signer] group_commit_wait_to_fill_ms`).
+    pub group_commit_wait_to_fill_ms: Option<u64>,
 }
 
 /// Opt-in `[signer.http]` config block for the Web3Signer HTTP API.
@@ -202,6 +207,10 @@ pub struct ResolvedConfig {
     pub disable_slashing_protection: bool,
     /// Allow creating a fresh empty slashing DB when the path is missing.
     pub init_slashing_db: bool,
+    /// Max slashing-DB reserve checks per COMMIT. `None` = default 50.
+    pub group_commit_batch_size: Option<usize>,
+    /// Milliseconds to wait for a group-commit batch to fill. `None` = default 1.
+    pub group_commit_wait_to_fill_ms: Option<u64>,
     /// Prometheus metrics listen address.
     pub metrics_address: String,
     /// Opt-in SIGHUP log-level reload (owned by `main` / `init_logging`).
@@ -307,6 +316,14 @@ pub struct ServeArgs {
     /// error regardless of this flag.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub init_slashing_db: bool,
+
+    /// Max slashing-DB reserve checks per COMMIT [default: 50].
+    #[arg(long)]
+    pub slashing_group_commit_batch_size: Option<usize>,
+
+    /// Milliseconds to wait for a group-commit batch to fill [default: 1]. 0 = no wait.
+    #[arg(long)]
+    pub slashing_group_commit_wait_to_fill_ms: Option<u64>,
 
     /// Signing backend to use [default: basic]
     #[arg(long, value_enum)]
@@ -540,6 +557,12 @@ pub fn merge_with_cli(
         data_dir: cli.data_dir.clone(),
         disable_slashing_protection: cli.disable_slashing_protection,
         init_slashing_db: cli.init_slashing_db,
+        group_commit_batch_size: cli
+            .slashing_group_commit_batch_size
+            .or(section.group_commit_batch_size),
+        group_commit_wait_to_fill_ms: cli
+            .slashing_group_commit_wait_to_fill_ms
+            .or(section.group_commit_wait_to_fill_ms),
         metrics_address: cli
             .metrics_address
             .clone()

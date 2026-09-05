@@ -3,6 +3,26 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Slashing-DB group commit (issue #205)
+
+Concurrent `reserve_*` checks share one `BEGIN IMMEDIATE` → rule check →
+INSERT → `COMMIT` (one fsync), then all members are released to sign.
+Commit-before-sign is unchanged. Per-pubkey connections stay rejected.
+
+Operator knobs (defaults from the measured ~4.5 ms fullfsync quantum).
+`rvc` reads the `[slashing]` table; `rvc-signer` reads `[signer]`. Copying
+`[slashing] group_commit_*` into a signer TOML is a no-op.
+
+| Knob | Default |
+|---|---|
+| `rvc`: `[slashing] group_commit_batch_size` / `--slashing-group-commit-batch-size` | 50 |
+| `rvc`: `[slashing] group_commit_wait_to_fill_ms` / `--slashing-group-commit-wait-to-fill-ms` | 1 (0 disables wait) |
+| `rvc-signer`: `[signer] group_commit_batch_size` / `--slashing-group-commit-batch-size` | 50 |
+| `rvc-signer`: `[signer] group_commit_wait_to_fill_ms` / `--slashing-group-commit-wait-to-fill-ms` | 1 (0 disables wait) |
+
+A slashable rule-check rejects only that member. A failed `COMMIT` rejects
+every member of the batch. A cancelled waiter does not stall the others.
+
 ## API: Web3Signer HTTP client path (`crypto::remote_signer::*`)
 
 The Web3Signer HTTP client has moved out of `rvc-crypto` into crate
@@ -213,7 +233,8 @@ disposed later in this file.
 ## Config: leftover healthz bind knobs fail startup
 
 See the breaking section at the top of this file. The live operator-knob
-inventory is **67** after disposing `grpc_port` / `grpc_address`.
+inventory is **69** after disposing `grpc_port` / `grpc_address` and adding
+the two slashing group-commit knobs.
 
 ---
 

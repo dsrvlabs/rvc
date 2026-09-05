@@ -266,6 +266,8 @@ mod tests {
             data_dir: Some(data_dir),
             disable_slashing_protection: false,
             init_slashing_db: false,
+            group_commit_batch_size: None,
+            group_commit_wait_to_fill_ms: None,
             metrics_address: "127.0.0.1:0".to_string(),
             enable_log_reload: false,
             allowed_client_cns: None,

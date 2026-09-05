@@ -128,6 +128,20 @@ impl SlashingError {
     pub fn is_reserve_commit_failure(&self) -> bool {
         matches!(self, Self::ReserveCommitFailed(_))
     }
+
+    /// Rule / watermark / GVR rejections that apply to one group-commit member
+    /// without aborting the rest of the batch.
+    pub(crate) fn is_group_member_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::SlashableBlock(_)
+                | Self::SlashableAttestation(_)
+                | Self::GenesisRootMismatch { .. }
+                | Self::BelowBlockWatermark { .. }
+                | Self::BelowAttestationWatermark { .. }
+                | Self::BelowAttestationSourceWatermark { .. }
+        )
+    }
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

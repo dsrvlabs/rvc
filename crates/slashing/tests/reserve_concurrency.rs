@@ -39,7 +39,8 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, RngSeed};
 use rvc_slashing::{
     eip3076_allows_attestation, eip3076_allows_block, first_eip3076_history_violation,
-    CanonicalPubkey, CommittedReservation, SignedAttestation, SignedBlock, SigningRoot, SlashingDb,
+    CanonicalPubkey, CommittedReservation, GroupCommitConfig, SignedAttestation, SignedBlock,
+    SigningRoot, SlashingDb,
 };
 
 /// Documented default; `PROPTEST_CASES` wins when set.
@@ -548,4 +549,77 @@ fn test_two_threads_reserving_the_same_slot_produce_exactly_one_row() {
     let rows = db.get_blocks(&pk).expect("get_blocks");
     assert_eq!(rows.len(), 1, "history must contain exactly one row for the slot");
     assert_eq!(rows[0].slot, 42);
+}
+
+/// Batch-boundary (#205): one slashable member must not fail the COMMIT.
+#[test]
+fn test_slashable_member_does_not_fail_the_rest_of_a_group_commit() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.set_group_commit(GroupCommitConfig {
+        batch_size: 3,
+        wait_to_fill: std::time::Duration::from_millis(80),
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let pk_a = pk_hex(0);
+    let pk_b = pk_hex(1);
+
+    let db_ok = Arc::clone(&db);
+    let b_ok = Arc::clone(&barrier);
+    let pk = pk_a.clone();
+    let t_ok = thread::spawn(move || {
+        b_ok.wait();
+        db_ok.reserve_block(&pk, 10, Some(root_hex(1)), &GVR)
+    });
+
+    let db_bad = Arc::clone(&db);
+    let b_bad = Arc::clone(&barrier);
+    let pk = pk_a.clone();
+    let t_bad = thread::spawn(move || {
+        b_bad.wait();
+        db_bad.reserve_block(&pk, 10, Some(root_hex(2)), &GVR)
+    });
+
+    let db_other = Arc::clone(&db);
+    let b_other = Arc::clone(&barrier);
+    let pk = pk_b.clone();
+    let t_other = thread::spawn(move || {
+        b_other.wait();
+        db_other.reserve_block(&pk, 11, Some(root_hex(3)), &GVR)
+    });
+
+    let r_ok = t_ok.join().expect("join");
+    let r_bad = t_bad.join().expect("join");
+    let r_other = t_other.join().expect("join");
+    let ok_count = usize::from(r_ok.is_ok()) + usize::from(r_bad.is_ok());
+    assert_eq!(ok_count, 1, "exactly one of the conflicting reserves must succeed");
+    assert!(r_other.is_ok(), "unrelated member must commit; {r_other:?}");
+    assert_eq!(db.get_blocks(&pk_a).expect("A").len(), 1);
+    assert_eq!(db.get_blocks(&pk_b).expect("B").len(), 1);
+}
+
+/// Batch-boundary (#205): COMMIT failure rejects every member, no leftover rows.
+#[test]
+fn test_group_commit_failure_rejects_every_member() {
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open"));
+    db.set_group_commit(GroupCommitConfig {
+        batch_size: 3,
+        wait_to_fill: std::time::Duration::from_millis(80),
+    });
+    db.fail_next_commits(1);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for i in 0..3u8 {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let pk = pk_hex(i);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            db.reserve_block(&pk, u64::from(i) + 1, Some(root_hex(i + 1)), &GVR)
+        }));
+    }
+    for (i, h) in handles.into_iter().enumerate() {
+        let err = h.join().expect("join").expect_err("COMMIT fail must reject");
+        assert!(err.is_reserve_commit_failure(), "member {i}: {err:?}");
+        assert!(db.get_blocks(&pk_hex(i as u8)).expect("get").is_empty());
+    }
 }

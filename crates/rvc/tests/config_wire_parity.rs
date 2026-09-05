@@ -129,14 +129,15 @@ const REQUIRED_CORPUS: &[&str] = &[
     "logfile_table.toml",
     "top_level_28.toml",
     "beacon_timeouts.toml",
+    "slashing_group_commit.toml",
 ];
 
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 67, "operator knob count is 67 after ARCH-7e");
+    assert_eq!(names.len(), 69, "operator knob count is 69 after group-commit knobs");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 67, "operator knob names must be unique");
+    assert_eq!(unique.len(), 69, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);

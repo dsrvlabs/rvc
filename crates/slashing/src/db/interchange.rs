@@ -22,7 +22,7 @@ impl SlashingDb {
     ///
     /// Returns `SlashingError::InvalidInterchangeFormat` if the string is not
     /// valid hex, not exactly 32 bytes, or all zeros.
-    pub(super) fn parse_gvr_hex(s: &str) -> Result<Root, SlashingError> {
+    pub(crate) fn parse_gvr_hex(s: &str) -> Result<Root, SlashingError> {
         use eth_types::canonical::{gvr_hex, ParseError};
         let root = gvr_hex::parse_gvr_hex(s).map_err(|e| {
             let msg = match e {

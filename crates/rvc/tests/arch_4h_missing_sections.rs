@@ -224,13 +224,15 @@ disable_keystore_locking = false
 // M4: exactly one clap/section declaration per knob across rvc-config (+ leftover cli groups)
 // ---------------------------------------------------------------------------
 
-const KNOBS_67: &[&str] = &[
+const KNOBS_69: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
     "keystore_path",
     "password_file",
     "slashing_db_path",
     "init_slashing_db",
+    "group_commit_batch_size",
+    "group_commit_wait_to_fill_ms",
     "allow_unsupported_fork",
     "metrics_address",
     "metrics_port",
@@ -396,10 +398,10 @@ fn leaf_declarations(src: &str, struct_name: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn every_one_of_the_67_knobs_has_exactly_one_declaration() {
-    assert_eq!(KNOBS_67.len(), 67);
-    let unique: BTreeSet<_> = KNOBS_67.iter().copied().collect();
-    assert_eq!(unique.len(), 67);
+fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
+    assert_eq!(KNOBS_69.len(), 69);
+    let unique: BTreeSet<_> = KNOBS_69.iter().copied().collect();
+    assert_eq!(unique.len(), 69);
 
     let root = workspace_root();
     let section_dir = root.join("crates/rvc-config/src/sections");
@@ -437,7 +439,7 @@ fn every_one_of_the_67_knobs_has_exactly_one_declaration() {
     ];
 
     let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for k in KNOBS_67 {
+    for k in KNOBS_69 {
         counts.insert(*k, Vec::new());
     }
     let mut extras = Vec::new();
@@ -461,7 +463,7 @@ fn every_one_of_the_67_knobs_has_exactly_one_declaration() {
         counts.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (*k, v)).collect();
     assert!(
         extras.is_empty(),
-        "scanner found clap fields that are not in the 67 knobs or NOT_A_KNOB: {extras:?}"
+        "scanner found clap fields that are not in the 69 knobs or NOT_A_KNOB: {extras:?}"
     );
     assert!(missing.is_empty(), "knobs with zero clap/section declarations: {missing:?}");
     assert!(dupes.is_empty(), "knobs with more than one declaration: {dupes:?}");
