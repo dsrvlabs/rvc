@@ -18,7 +18,7 @@ pub use sections::{
     LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
     ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
     SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
-    TracingArgs, TracingConfig, TracingExporter,
+    TimingConfig, TracingArgs, TracingConfig, TracingExporter,
 };
 
 #[cfg(test)]

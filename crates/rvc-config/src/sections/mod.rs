@@ -19,6 +19,7 @@ mod safety;
 mod secret_provider;
 mod server;
 mod slashing;
+mod timing;
 mod tracing;
 
 pub use beacon::{BeaconArgs, BeaconConfig};
@@ -36,6 +37,7 @@ pub use secret_provider::{
 };
 pub use server::{ServerArgs, ServerConfig};
 pub use slashing::{SlashingArgs, SlashingConfig};
+pub use timing::TimingConfig;
 pub use tracing::{TracingArgs, TracingConfig, TracingExporter};
 
 #[cfg(test)]

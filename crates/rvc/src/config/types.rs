@@ -29,7 +29,7 @@ pub use rvc_config::{
     LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
     ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
     SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
-    TracingArgs, TracingConfig, TracingExporter,
+    TimingConfig, TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// Message types that may be broadcast to all beacon nodes.
@@ -77,9 +77,9 @@ impl FromStr for BroadcastTopic {
 ///
 /// Related knobs are grouped into nested sub-structs (`logfile`, `tracing`,
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
-/// `builder_limits`). ARCH-4h invents `[beacon]` / `[server]` / `[network]` /
-/// `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s public /
-/// serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
+/// `builder_limits`, `timing`). ARCH-4h invents `[beacon]` / `[server]` /
+/// `[network]` / `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s
+/// public / serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
 /// Existing operator TOML may still use the **flat** keys; both spellings are
 /// accepted (see `ConfigWire`).
 #[derive(Debug, Clone, Serialize)]
@@ -178,6 +178,9 @@ pub struct Config {
 
     #[serde(default)]
     pub builder_limits: BuilderLimits,
+
+    #[serde(default)]
+    pub timing: TimingConfig,
 
     // --- Proposer nodes / broadcast (remain flat) ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -288,6 +291,7 @@ impl Default for Config {
             proposer_config: ProposerConfigSource::default(),
             monitoring: MonitoringConfig::default(),
             builder_limits: BuilderLimits::default(),
+            timing: TimingConfig::default(),
             proposer_nodes: Vec::new(),
             broadcast: Vec::new(),
             bn_sync_tolerances: None,
@@ -411,6 +415,8 @@ struct ConfigWire {
     monitoring: MonitoringConfig,
     #[serde(default)]
     builder_limits: BuilderLimits,
+    #[serde(default)]
+    timing: TimingConfig,
 
     // Flat legacy keys (old spelling) — Option so we can detect presence
     keymanager_enabled: Option<bool>,
@@ -645,6 +651,7 @@ impl Config {
             proposer_config,
             monitoring,
             builder_limits,
+            timing: w.timing,
             proposer_nodes: w.proposer_nodes,
             broadcast: w.broadcast,
             bn_sync_tolerances: w.bn_sync_tolerances.or(w.beacon.inner.bn_sync_tolerances),
@@ -881,6 +888,21 @@ impl Config {
             self.group_commit_wait_to_fill_ms,
         ) {
             return Err(ConfigError::MissingField(e.to_string()));
+        }
+
+        if !(1..=10000).contains(&self.timing.attestation_due_bps) {
+            return Err(ConfigError::Invalid {
+                field: "timing.attestation_due_bps",
+                message: format!("must be 1..=10000, got {}", self.timing.attestation_due_bps),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        if !(1..=10000).contains(&self.timing.aggregate_due_bps) {
+            return Err(ConfigError::Invalid {
+                field: "timing.aggregate_due_bps",
+                message: format!("must be 1..=10000, got {}", self.timing.aggregate_due_bps),
+                source_layer: ConfigSource::Default,
+            });
         }
 
         // Validate proposer node URLs
@@ -1325,6 +1347,8 @@ mod tests {
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
+        assert_eq!(config.timing.attestation_due_bps, 3333);
+        assert_eq!(config.timing.aggregate_due_bps, 6667);
     }
 
     #[test]
@@ -1475,6 +1499,62 @@ allow_fresh_db = true
             ..Default::default()
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidGraffiti(_))));
+    }
+
+    #[test]
+    fn test_timing_attestation_due_bps_from_toml_is_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps = 2500
+aggregate_due_bps = 4000
+"#,
+        )
+        .expect("[timing] must bind through ConfigWire");
+        assert_eq!(config.timing.attestation_due_bps, 2500);
+        assert_eq!(config.timing.aggregate_due_bps, 4000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_bps_zero_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps = 0
+"#,
+        )
+        .expect("0 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=0 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_bps_above_range_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps = 10001
+"#,
+        )
+        .expect("10001 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=10001 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_bps_non_integer_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[timing]
+attestation_due_bps = "not-an-integer"
+"#,
+        )
+        .expect_err("non-integer bps must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("attestation_due_bps"), "{msg}");
     }
 
     #[test]
@@ -2975,6 +3055,7 @@ roles = ["not-a-role"]
             "pub proposer_config: ProposerConfigSource",
             "pub monitoring: MonitoringConfig",
             "pub builder_limits: BuilderLimits",
+            "pub timing: TimingConfig",
         ] {
             assert!(config_struct.contains(nested), "nested group missing from Config: {nested}");
         }

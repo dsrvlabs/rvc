@@ -49,6 +49,10 @@
     "circuit_breaker_consecutive_limit": 3,
     "circuit_breaker_epoch_limit": 5
   },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667
+  },
   "block_selection_mode": "max-profit",
   "validator_registration_batch_size": 500,
   "validator_registration_batch_delay": 500,

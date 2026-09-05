@@ -220,6 +220,28 @@ disable_keystore_locking = false
     assert!(config.disable_keystore_locking);
 }
 
+#[test]
+fn timing_toml_round_trip_is_observable_on_config() {
+    let config: Config = toml::from_str(
+        r#"
+[timing]
+attestation_due_bps = 2500
+aggregate_due_bps = 4000
+"#,
+    )
+    .expect("[timing] TOML must round-trip onto Config");
+    assert_eq!(config.timing.attestation_due_bps, 2500);
+    assert_eq!(config.timing.aggregate_due_bps, 4000);
+}
+
+#[test]
+fn absent_timing_section_uses_pre_gloas_defaults() {
+    let config: Config =
+        toml::from_str("log_level = \"debug\"").expect("missing [timing] must parse");
+    assert_eq!(config.timing.attestation_due_bps, 3333);
+    assert_eq!(config.timing.aggregate_due_bps, 6667);
+}
+
 // ---------------------------------------------------------------------------
 // M4: exactly one clap/section declaration per knob across rvc-config (+ leftover cli groups)
 // ---------------------------------------------------------------------------

@@ -54,6 +54,10 @@
     "circuit_breaker_consecutive_limit": 3,
     "circuit_breaker_epoch_limit": 5
   },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667
+  },
   "proposer_nodes": [
     "http://proposer-top:5052"
   ],

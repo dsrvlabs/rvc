@@ -20,7 +20,7 @@ pub use types::{
     KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig,
     MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
     ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
-    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TracingArgs,
-    TracingConfig, TracingExporter,
+    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
+    TracingArgs, TracingConfig, TracingExporter,
 };
 pub use validator_store::BlockSelectionMode;
