@@ -13,7 +13,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -363,6 +363,10 @@ impl SmokeHarness {
         format!("http://127.0.0.1:{}/readyz", self.ports.metrics)
     }
 
+    fn livez_url(&self) -> String {
+        format!("http://127.0.0.1:{}/livez", self.ports.metrics)
+    }
+
     /// Wait until `/health` is HTTP 200 (healthy=true). 503 is not ready.
     async fn wait_until_ready(&self) {
         let health = self.health_url();
@@ -450,6 +454,54 @@ async fn test_graceful_shutdown_sigterm_exit_code_zero() {
     {
         let _ = (status, logs);
     }
+}
+
+/// ARCH-7d: the configured gRPC port must not be bound after startup.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_grpc_listener_on_startup() {
+    let mut harness = SmokeHarness::start().await;
+    harness.wait_until_ready().await;
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], harness.ports.grpc));
+    let connected = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
+    assert!(
+        connected.is_err(),
+        "configured gRPC port must have no listener after startup; connect succeeded on {addr}"
+    );
+    let logs = harness.logs.snapshot();
+    assert!(
+        !logs.contains("Starting gRPC server"),
+        "startup must not bind a gRPC listener.\n--- stdout ---\n{logs}"
+    );
+
+    let (status, _logs) = harness.shutdown_cleanly().await;
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}");
+    let _ = status;
+}
+
+/// ARCH-7d: metrics `/health` and `/readyz` are the live replacement probes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_server_answers_health_and_readyz() {
+    let mut harness = SmokeHarness::start().await;
+    harness.wait_until_ready().await;
+
+    assert_health_json_healthy(&harness.health_url()).await;
+    assert!(
+        wait_for_http_ok(&harness.readyz_url(), Duration::from_secs(2)).await,
+        "/readyz must answer HTTP 200 when the process is ready.\n--- stdout ---\n{}",
+        harness.logs.snapshot()
+    );
+    assert!(
+        wait_for_http_ok(&harness.livez_url(), Duration::from_secs(2)).await,
+        "/livez must answer HTTP 200 (process-up).\n--- stdout ---\n{}",
+        harness.logs.snapshot()
+    );
+
+    let (status, _logs) = harness.shutdown_cleanly().await;
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}");
+    let _ = status;
 }
 
 #[tokio::test(flavor = "multi_thread")]

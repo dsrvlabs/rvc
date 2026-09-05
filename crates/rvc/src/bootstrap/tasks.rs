@@ -296,6 +296,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_metrics_server_answers_health_and_readyz() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            listener.local_addr().expect("local_addr").port()
+        };
+        let health = metrics::new_health_status();
+        {
+            let mut status = health.write().await;
+            status.beacon_connected = true;
+            status.validators_loaded = 1;
+            status.slashing_db_initialized = true;
+            status.update_healthy();
+        }
+        let config = Config {
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            metrics_port: port,
+            ..Config::default()
+        };
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_background_tasks(
+            &config,
+            health,
+            &executor,
+            empty_pubkey_map(),
+            empty_validator_store(),
+        )
+        .expect("loopback metrics spawn");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("reqwest client");
+        let health_url = format!("http://127.0.0.1:{port}/health");
+        let readyz_url = format!("http://127.0.0.1:{port}/readyz");
+        let livez_url = format!("http://127.0.0.1:{port}/livez");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut health_ok = false;
+        let mut readyz_ok = false;
+        let mut livez_ok = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(resp) = client.get(&health_url).send().await {
+                health_ok = resp.status().is_success();
+            }
+            if let Ok(resp) = client.get(&readyz_url).send().await {
+                readyz_ok = resp.status().is_success();
+            }
+            if let Ok(resp) = client.get(&livez_url).send().await {
+                livez_ok = resp.status().is_success();
+            }
+            if health_ok && readyz_ok && livez_ok {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(health_ok, "/health must answer on the metrics server");
+        assert!(readyz_ok, "/readyz must answer on the metrics server");
+        assert!(livez_ok, "/livez must answer on the metrics server");
+
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
     async fn test_spawn_background_tasks_all_tasks_cancel_on_shutdown() {
         let config = Config {
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),

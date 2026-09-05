@@ -22,26 +22,38 @@ roots, request bodies, and URL gating are unchanged.
 
 ---
 
-## Deprecations
+## Breaking: gRPC healthz endpoint removed
 
-### gRPC healthz endpoint deprecated — migrate probes to metrics `/livez` and `/readyz`
+Nothing listens on `{grpc_address}:{grpc_port}`. Default **`grpc_port` is
+50051; it is not a server.** `grpc_address` and `grpc_port` still parse on
+the CLI and in TOML; they bind no socket. Any probe, monitor, or healthcheck
+still aimed at that port will fail.
 
-The gRPC **healthz** RPC on `{grpc_address}:{grpc_port}` (the healthz-only
-DutyTracker tonic server) is **deprecated** and will be **removed in a future
-release** (at least one release after this note ships).
+**Replacement pair** on the metrics HTTP server (`metrics_address` /
+`metrics_port`):
 
-**This release starts the deprecation window** for that removal.
+| Endpoint | Role |
+|----------|------|
+| **`GET /health`** | JSON diagnostic (`200` when ready, `503` otherwise). Same readiness predicate as `/readyz`. Not a Kubernetes probe. |
+| **`GET /readyz`** | Readiness (plain text). `503 not ready` until beacon is connected, at least one validator is loaded, and the slashing DB is initialized. |
 
-**Probe mapping (do not swap these):**
+**Kubernetes probes** (plain text only — do not use `/health` for either):
 
-| Probe kind | Endpoint | Semantics |
-|------------|----------|-----------|
-| **Liveness** | `GET /livez` on the metrics HTTP server | Always process-up (`200 ok`) — closest match to legacy gRPC healthz |
-| **Readiness** | `GET /readyz` on the metrics HTTP server | Real readiness: fails (`503 not ready`) until beacon is connected, at least one validator is loaded, and the slashing DB is initialized |
+- **Liveness → `GET /livez`** (always process-up). Closest match to the old
+  gRPC healthz, which always reported healthy.
+- **Readiness → `GET /readyz`**.
 
-**Do not use `/readyz` as a liveness probe** — readiness can fail during BN blips or early startup and would restart the pod in a loop. gRPC healthz was always `status: true` (process-up only); `/livez` is the replacement for that behavior.
+`/health` also returns `503` when the process is not ready, so it is **not**
+a stand-in for gRPC healthz. Do **not** put `/health` or `/readyz` on a
+liveness probe — both fail during BN blips or early startup and would
+restart the pod in a loop.
 
-`/health` remains available (JSON status) but is not the Kubernetes liveness/readiness pair; prefer `/livez` + `/readyz`. Prefer those over `/health` for probes (they return plain text only).
+**Action required:** finish the [probe-migration checklist](#probe-migration-checklist)
+if you have not already. Move **liveness → `/livez`** and **readiness →
+`/readyz`** on the metrics port before upgrade.
+
+A later release will reject `grpc_address` / `grpc_port` at startup. Until
+then they still parse and do nothing.
 
 **Metrics bind defaults (probe reachability):**
 
@@ -68,7 +80,7 @@ readinessProbe:
   periodSeconds: 5
 ```
 
-**Probe-migration checklist (operators):**
+### Probe-migration checklist
 
 - [ ] Does any Kubernetes `livenessProbe` / `readinessProbe` target the **gRPC**
       port (`grpc_port`, default 50051) or the gRPC Healthz RPC?
@@ -76,19 +88,12 @@ readinessProbe:
       hit the gRPC port instead of the metrics HTTP port?
 - [ ] Do any Docker / Compose `healthcheck` commands call the gRPC surface?
 - [ ] After migrating: **liveness → `/livez`**, **readiness → `/readyz`**, both on
-      **metrics** `port` (not gRPC). Never put `/readyz` on the liveness probe.
+      **metrics** `port` (not gRPC). Never put `/health` or `/readyz` on the
+      liveness probe. `/health` is JSON on the same listener; prefer plain
+      text `/livez` + `/readyz` for Kubernetes.
 - [ ] Is the metrics bind reachable from the probe source? Default is loopback
       only; non-loopback needs `RVC_METRICS_ALLOW_NON_LOOPBACK=true` and should
       be network-restricted (opening the port also exposes `/metrics` and `/health`).
-
-**Note:** No probe dependency on the gRPC healthz endpoint has been verified
-from inside this repository. Whether production deployments target it is
-unknown here; the deprecation window is the discovery mechanism. If you rely
-on gRPC healthz, migrate before the removal release.
-
-**Unchanged this release:** `grpc_address` and `grpc_port` still work; the
-endpoint still answers. Disposal of those knobs is deferred to the removal
-release.
 
 ---
 

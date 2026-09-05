@@ -11,7 +11,6 @@ use bn_manager::OperationTimeouts;
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
 use tokio::sync::mpsc;
-use tonic::transport::Server;
 use tracing::{error, info, warn};
 
 use super::executor::{ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
@@ -22,11 +21,9 @@ use super::{
 };
 use crate::config::{redact_url, Config};
 use crate::deletion_denylist::DeletionDenylist;
-use crate::grpc_health::DutyTrackerService;
 use crate::key_admission::{AdmissionSource, KeyAdmissionService};
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
 use crate::startup;
-use crate::DutyTrackerServer;
 
 /// Binary-owned flags that are not part of [`Config`].
 pub struct RunOptions {
@@ -71,8 +68,6 @@ pub async fn run(
         network = %config.network,
         metrics_address = %config.metrics_address,
         metrics_port = config.metrics_port,
-        grpc_address = %config.grpc_address,
-        grpc_port = config.grpc_port,
         doppelganger_detection = config.doppelganger_detection,
         spec_version = eth_types::CONSENSUS_SPEC_VERSION,
         "Starting validator client"
@@ -298,30 +293,6 @@ pub async fn run(
 
     finalize_health_status(&health_status).await;
 
-    let grpc_addr = format!("{}:{}", config.grpc_address, config.grpc_port)
-        .parse()
-        .map_err(|e: std::net::AddrParseError| BootstrapError::InvalidConfig(e.to_string()))?;
-    let duty_tracker_service = DutyTrackerService::new();
-
-    info!(addr = %grpc_addr, "Starting gRPC server");
-    log_grpc_healthz_deprecation();
-    // Ingress: token-only shutdown (C8). Redundant shutdown_signal arm removed so a
-    // second SIGINT during drain cannot bypass tier order (ARCH-2h).
-    let grpc_server = Server::builder()
-        .add_service(DutyTrackerServer::new(duty_tracker_service))
-        .serve_with_shutdown(grpc_addr, {
-            let token = shutdown_token.clone();
-            async move {
-                token.cancelled().await;
-            }
-        });
-    executor.spawn("grpc_healthz", ShutdownTier::Ingress, async move {
-        match grpc_server.await {
-            Ok(()) => info!("gRPC server shut down gracefully"),
-            Err(e) => error!("gRPC server error: {}", e),
-        }
-    });
-
     // P1-2/P1-3/P1-4: metrics + monitoring + proposer-config on executor.
     spawn_background_tasks(
         &config,
@@ -455,18 +426,6 @@ async fn finalize_health_status(health_status: &SharedHealthStatus) {
     info!(healthy = status.healthy, "Health status finalized");
 }
 
-/// Startup deprecation notice for the gRPC healthz-only server (C8 / ARCH-8).
-///
-/// Operators should migrate liveness probes to `/livez` and readiness probes to
-/// `/readyz` on the metrics HTTP server. Removal is Phase 7 (≥1 release later).
-fn log_grpc_healthz_deprecation() {
-    warn!(
-        "gRPC healthz endpoint is deprecated and will be removed in a future release; \
-         migrate liveness probes to /livez and readiness probes to /readyz on the metrics \
-         HTTP server (metrics_address / metrics_port)"
-    );
-}
-
 /// Spawn secret-provider refresh when configured and providers are present.
 ///
 /// Relocated from `wire_signing_enablement` so `validator_store` and `key_gen_tx`
@@ -513,17 +472,13 @@ fn spawn_secret_provider_refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::duty_tracker::duty_tracker_client::DutyTrackerClient;
-    use crate::proto::duty_tracker::HealthzRequest;
     use crate::startup::{
         acquire_keystore_lock, EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED,
         EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
     };
     use ::slashing::SlashingDb;
     use std::time::Duration;
-    use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
-    use tracing_test::traced_test;
 
     /// ARCH-2i / NFR-3: pin EXIT_* numeric values so a silent renumber fails CI.
     #[test]
@@ -579,6 +534,21 @@ mod tests {
         SlashingDb::open(path).expect("seed slashing db");
     }
 
+    /// ARCH-7d: bootstrap must not start a tonic server on the configured gRPC port.
+    #[test]
+    fn test_run_rs_does_not_start_a_grpc_server() {
+        let src = include_str!("run.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body before tests");
+        assert!(
+            !body.contains("Starting gRPC server"),
+            "bootstrap/run.rs must not start a tonic server (ARCH-7d)"
+        );
+        assert!(
+            !body.contains("serve_with_shutdown"),
+            "bootstrap/run.rs must not call tonic serve_with_shutdown (ARCH-7d)"
+        );
+    }
+
     /// ARCH-2i: production body of run.rs must not hard-exit the process.
     #[test]
     fn test_run_rs_has_no_process_exit_call() {
@@ -589,16 +559,6 @@ mod tests {
             !body.contains("std::process::exit") && !body.contains("::exit("),
             "bootstrap/run.rs production body must not hard-exit the process (ARCH-2i)"
         );
-    }
-
-    #[test]
-    #[traced_test]
-    fn test_startup_warns_that_grpc_healthz_is_deprecated() {
-        log_grpc_healthz_deprecation();
-
-        assert!(logs_contain("deprecated"), "expected WARN naming deprecation of gRPC healthz");
-        assert!(logs_contain("/livez"), "deprecation WARN must name /livez");
-        assert!(logs_contain("/readyz"), "deprecation WARN must name /readyz");
     }
 
     /// ARCH-2h: no `sleep` may stand in for a join in the production body.
@@ -619,76 +579,10 @@ mod tests {
             "orchestrator must be registered as duty_orchestrator"
         );
         assert!(
-            body.contains("grpc_healthz"),
-            "gRPC healthz must be registered as Ingress grpc_healthz (C8)"
-        );
-        assert!(
             body.contains("spawn_sse_subscriber"),
             "ARCH-3l must start the SSE subscriber from production run()"
         );
         assert!(body.contains("bn.sse"), "ARCH-3l must name the registered SSE task bn.sse");
-    }
-
-    /// ARCH-2h: gRPC serve_with_shutdown must be token-only (no redundant signal arm).
-    #[test]
-    fn test_grpc_shutdown_is_token_only_not_signal() {
-        let src = include_str!("run.rs");
-        let body = src.split("#[cfg(test)]").next().expect("production body");
-        let grpc_block = body
-            .split("serve_with_shutdown")
-            .nth(1)
-            .expect("serve_with_shutdown present")
-            .split("executor.spawn(\"grpc_healthz\"")
-            .next()
-            .expect("spawn grpc_healthz after serve_with_shutdown");
-        assert!(
-            grpc_block.contains("token.cancelled()"),
-            "gRPC must still observe the cancellation token"
-        );
-        assert!(
-            !grpc_block.contains("shutdown_signal()"),
-            "gRPC must not select on shutdown_signal (would bypass tier order on second SIGINT)"
-        );
-    }
-
-    /// Guard: deprecation must not disable the endpoint it deprecates (C8).
-    #[tokio::test]
-    async fn test_grpc_healthz_still_serves_after_deprecation_warning() {
-        log_grpc_healthz_deprecation();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
-        let addr = listener.local_addr().expect("local_addr");
-
-        let server = tokio::spawn(async move {
-            Server::builder()
-                .add_service(DutyTrackerServer::new(DutyTrackerService::new()))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .expect("gRPC server");
-        });
-
-        let endpoint = format!("http://{addr}");
-        let mut client = None;
-        for _ in 0..50 {
-            match tonic::transport::Endpoint::from_shared(endpoint.clone())
-                .expect("endpoint")
-                .connect()
-                .await
-            {
-                Ok(channel) => {
-                    client = Some(DutyTrackerClient::new(channel));
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-        let mut client = client.expect("connect to gRPC healthz server");
-
-        let response =
-            client.healthz(tonic::Request::new(HealthzRequest {})).await.expect("healthz RPC");
-        assert!(response.get_ref().status, "healthz must still report healthy");
-
-        server.abort();
     }
 
     fn test_admissions(

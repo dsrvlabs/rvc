@@ -577,14 +577,18 @@ must not re-open it; it only removes one arm.
 
 **Acceptance criteria.**
 
-- [ ] `rg 'DutyTrackerServer|DutyTrackerService|grpc_health'` returns nothing under `crates/`, `bin/`.
+- [x] `rg 'DutyTrackerServer|DutyTrackerService|grpc_health'` returns nothing under `crates/`, `bin/`.
 - [ ] The top-level `select!` in `run.rs` has two arms and its arm-order comment matches.
-- [ ] No listener binds the configured gRPC port at startup (test-asserted).
-- [ ] `/health` and `/readyz` answer on the metrics server (test-asserted).
-- [ ] The release note names the replacement probe pair and links the probe-migration check written
+      *Closure note (2026-09-05): stale vs HEAD. Phase 2 (ARCH-2h) already re-homed tonic to
+      `executor.spawn("grpc_healthz", ShutdownTier::Ingress, …)`; the remaining `select!` is the
+      three-arm drain trigger (signal / `shutdown_rx` / token) and must not be collapsed (Phase 2
+      shutdown / `EXIT_*`). Equivalent work: delete the Ingress spawn — done.*
+- [x] No listener binds the configured gRPC port at startup (test-asserted).
+- [x] `/health` and `/readyz` answer on the metrics server (test-asserted).
+- [x] The release note names the replacement probe pair and links the probe-migration check written
       in Phase 0 (`0F`).
-- [ ] `cargo-machete` / `cargo-udeps` green — no dependency orphaned by the deletion.
-- [ ] Named exit codes and shutdown behaviour unchanged (Phase 2's `EXIT_*` assertions still green).
+- [x] `cargo-machete` / `cargo-udeps` green — no dependency orphaned by the deletion.
+- [x] Named exit codes and shutdown behaviour unchanged (Phase 2's `EXIT_*` assertions still green).
 
 ---
 

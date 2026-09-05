@@ -432,7 +432,7 @@ async fn test_orchestrator_handle_shutdown_is_joined_within_budget() {
         .expect("orchestrator join test timed out");
 }
 
-/// ARCH-2h: second cancel during drain still yields Ingress→… order (no signal arm on gRPC).
+/// ARCH-2h: second cancel during drain still yields Ingress→Orchestrator→Background→Telemetry.
 ///
 /// Drain order is a property of `TaskExecutor::shutdown`; registering one task per
 /// tier and cancelling the token twice must not reorder tiers.
@@ -473,22 +473,4 @@ async fn test_second_sigint_during_drain_does_not_bypass_tier_order() {
     };
 
     tokio::time::timeout(Duration::from_secs(5), body).await.expect("tier-order test timed out");
-}
-
-/// C8 / ARCH-2h: healthz deprecation warn still fires; endpoint still serves.
-///
-/// Production wiring re-homes the server as Ingress `grpc_healthz` without changing
-/// observable behaviour. Unit tests in `bootstrap/run.rs` pin the warn + RPC; this
-/// test is the integration-level name from the issue checklist.
-#[tokio::test]
-async fn test_healthz_grpc_still_serves_and_still_warns() {
-    // Behaviour pinned in `bootstrap/run.rs`:
-    // - `test_startup_warns_that_grpc_healthz_is_deprecated`
-    // - `test_grpc_healthz_still_serves_after_deprecation_warning`
-    // - `test_grpc_shutdown_is_token_only_not_signal`
-    // Presence of registration name is the production contract.
-    let src = include_str!("../src/bootstrap/run.rs");
-    assert!(src.contains("log_grpc_healthz_deprecation"));
-    assert!(src.contains("executor.spawn(\"grpc_healthz\""));
-    assert!(src.contains("DutyTrackerServer"));
 }
