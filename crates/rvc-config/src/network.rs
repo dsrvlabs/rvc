@@ -46,9 +46,9 @@ impl Network {
         self.preset().map(NetworkPreset::genesis_validators_root_hex)
     }
 
-    /// Seconds per slot (all named networks).
-    pub fn seconds_per_slot(&self) -> u64 {
-        12
+    /// Slot duration in milliseconds (all named networks).
+    pub fn slot_duration_ms(&self) -> u64 {
+        eth_types::SLOT_DURATION_MS
     }
 
     /// Slots per epoch (all named networks).

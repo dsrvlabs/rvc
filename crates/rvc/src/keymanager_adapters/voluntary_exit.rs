@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use beacon::BeaconClient;
 use crypto::PublicKey;
 use eth_types::{
-    ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SECONDS_PER_SLOT, SLOTS_PER_EPOCH,
+    ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH, SLOT_DURATION_MS,
 };
 use keymanager_api::error::ApiError;
 use keymanager_api::traits::{Pubkey, VoluntaryExitManager};
@@ -77,8 +77,7 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
                     .expect("system time before UNIX epoch")
                     .as_secs();
 
-                let current_slot = now.saturating_sub(genesis_time) / SECONDS_PER_SLOT;
-                current_slot / SLOTS_PER_EPOCH
+                current_epoch_at(now, genesis_time)
             }
         };
 
@@ -105,5 +104,31 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
             message: voluntary_exit,
             signature: signature.to_bytes().to_vec(),
         })
+    }
+}
+
+/// Current epoch at `now_unix_secs` given genesis, using millisecond slot duration.
+fn current_epoch_at(now_unix_secs: u64, genesis_time: u64) -> u64 {
+    let elapsed_ms = now_unix_secs.saturating_sub(genesis_time).saturating_mul(1000);
+    elapsed_ms / SLOT_DURATION_MS / SLOTS_PER_EPOCH
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_current_epoch_at_genesis_is_zero() {
+        let genesis = 1_606_824_023_u64;
+        assert_eq!(current_epoch_at(genesis, genesis), 0);
+    }
+
+    #[test]
+    fn test_current_epoch_after_one_epoch_is_one() {
+        let genesis = 1_606_824_023_u64;
+        let epoch_secs = SLOT_DURATION_MS / 1000 * SLOTS_PER_EPOCH;
+        assert_eq!(epoch_secs, 384, "one epoch is 384 s");
+        assert_eq!(current_epoch_at(genesis + epoch_secs, genesis), 1);
+        assert_eq!(current_epoch_at(genesis + epoch_secs - 1, genesis), 0);
     }
 }

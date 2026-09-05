@@ -22,9 +22,9 @@ pub enum SlashedOutcome {
     ShutdownRequested,
 }
 
-/// Epoch interval between slashing checks (`SECONDS_PER_SLOT * SLOTS_PER_EPOCH`).
+/// Epoch interval between slashing checks (`SLOT_DURATION_MS * SLOTS_PER_EPOCH`).
 pub fn epoch_check_interval() -> Duration {
-    Duration::from_secs(eth_types::SECONDS_PER_SLOT.saturating_mul(eth_types::SLOTS_PER_EPOCH))
+    Duration::from_millis(eth_types::SLOT_DURATION_MS.saturating_mul(eth_types::SLOTS_PER_EPOCH))
 }
 
 /// Query enabled validators and apply the configured slashed action.
@@ -272,11 +272,21 @@ mod tests {
         let interval = epoch_check_interval();
         assert_eq!(
             interval,
-            Duration::from_secs(eth_types::SECONDS_PER_SLOT * eth_types::SLOTS_PER_EPOCH)
+            Duration::from_millis(
+                eth_types::SLOT_DURATION_MS.saturating_mul(eth_types::SLOTS_PER_EPOCH)
+            )
         );
-        // Guard against accidental reintroduction of a hardcoded 12s * 32 loop.
-        assert_eq!(interval, Duration::from_secs(12 * 32));
-        assert_eq!(eth_types::SECONDS_PER_SLOT, 12);
+        // Same numeric value as the pre-ms tree (384 s epoch). A naive
+        // `from_secs(SLOT_DURATION_MS * SLOTS_PER_EPOCH)` is 384_000 s.
+        assert_eq!(interval, Duration::from_secs(384));
+        assert_eq!(interval.as_millis(), 384_000);
+        assert_ne!(
+            interval,
+            Duration::from_secs(
+                eth_types::SLOT_DURATION_MS.saturating_mul(eth_types::SLOTS_PER_EPOCH)
+            )
+        );
+        assert_eq!(eth_types::SLOT_DURATION_MS, 12_000);
         assert_eq!(eth_types::SLOTS_PER_EPOCH, 32);
     }
 

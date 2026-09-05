@@ -58,7 +58,6 @@ mod tests {
 
         // Timing / consensus-spec metadata (replaces three lib.rs constant-echo tests).
         assert_eq!(crate::SLOTS_PER_EPOCH, 32, "SLOTS_PER_EPOCH");
-        assert_eq!(crate::SECONDS_PER_SLOT, 12, "SECONDS_PER_SLOT");
         assert_eq!(crate::SLOT_DURATION_MS, 12_000, "SLOT_DURATION_MS");
         assert_eq!(crate::CONSENSUS_SPEC_VERSION, "v1.5.0-alpha.12", "CONSENSUS_SPEC_VERSION");
     }

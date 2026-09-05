@@ -105,7 +105,6 @@ pub type Signature = Vec<u8>;
 pub const SIGNATURE_BYTES_LEN: usize = 96;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
-pub const SECONDS_PER_SLOT: u64 = 12;
 pub const SLOT_DURATION_MS: u64 = 12_000;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 

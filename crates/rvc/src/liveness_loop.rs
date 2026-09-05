@@ -33,7 +33,7 @@ use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, ValidatorLivenessData,
     DEFAULT_MONITORING_EPOCHS,
 };
-use eth_types::{Epoch, SECONDS_PER_SLOT};
+use eth_types::{Epoch, SLOT_DURATION_MS};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -96,7 +96,7 @@ impl LivenessObservationLoop {
             pubkey_index,
             pubkey_map: None,
             epoch_clock,
-            slot_duration: Duration::from_secs(SECONDS_PER_SLOT),
+            slot_duration: Duration::from_millis(SLOT_DURATION_MS),
             cancel,
         }
     }

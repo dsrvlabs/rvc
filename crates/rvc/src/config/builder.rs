@@ -484,7 +484,7 @@ impl ServiceBuilder {
 
     pub fn build_slot_clock(&self) -> Result<Arc<SystemSlotClock>, ConfigError> {
         let genesis_time = self.config.effective_genesis_time()?;
-        let slot_duration = Duration::from_secs(self.config.network.seconds_per_slot());
+        let slot_duration = Duration::from_millis(self.config.network.slot_duration_ms());
         let slots_per_epoch = self.config.network.slots_per_epoch();
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)

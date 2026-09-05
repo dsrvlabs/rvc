@@ -8,7 +8,7 @@ use std::time::Duration;
 use beacon::BeaconClient;
 use crypto::CompositeSigner;
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock};
-use eth_types::{Epoch, ForkSchedule, Root, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use keymanager_api::traits::{DoppelgangerMonitor, VoluntaryExitManager};
 use signer::SignerService;
 use slashing::SlashingDb;
@@ -166,9 +166,9 @@ pub fn build_keymanager_api(
 
     // M-12: time-based window for the delayed set_enabled task. When
     // doppelganger is disabled the window is Duration::ZERO so keys are
-    // immediately enabled. When on: 2 epochs × 32 slots × 12 s = 768 s.
+    // immediately enabled. When on: 2 epochs × 32 slots × 12_000 ms = 768 s.
     let doppelganger_window = if config.doppelganger_detection {
-        Duration::from_secs(2 * SLOTS_PER_EPOCH * SECONDS_PER_SLOT)
+        Duration::from_millis(2 * SLOTS_PER_EPOCH * SLOT_DURATION_MS)
     } else {
         Duration::ZERO
     };

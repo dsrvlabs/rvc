@@ -11,7 +11,7 @@ mod error;
 pub use clock::{MockSlotClock, SlotClock, SystemSlotClock};
 pub use error::TimingError;
 
-pub use eth_types::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+pub use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 
 /// Denominator for the intra-slot basis-points timing model (report §4.3).
 ///

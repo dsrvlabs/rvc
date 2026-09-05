@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crypto::PublicKey;
 use doppelganger::{ForwardWindowMachine, SigningEnablement};
-use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use keymanager_api::traits::{DoppelgangerMonitor, Pubkey};
 use observability::logging::TruncatedPubkey;
 use tracing::{info, warn};
@@ -255,5 +255,5 @@ pub fn wall_clock_epoch(genesis_time: u64) -> Epoch {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    now.saturating_sub(genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+    now.saturating_sub(genesis_time).saturating_mul(1000) / SLOT_DURATION_MS / SLOTS_PER_EPOCH
 }

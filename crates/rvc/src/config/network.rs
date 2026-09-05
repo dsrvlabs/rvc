@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_network_constants() {
-        assert_eq!(Network::Mainnet.seconds_per_slot(), 12);
+        assert_eq!(Network::Mainnet.slot_duration_ms(), 12_000);
         assert_eq!(Network::Mainnet.slots_per_epoch(), 32);
     }
 }

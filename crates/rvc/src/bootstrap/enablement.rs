@@ -200,7 +200,7 @@ mod tests {
     use bn_manager::{BnManager, OperationTimeouts};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey, Signer};
     use doppelganger::ForwardWindowStatus;
-    use eth_types::{Root, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+    use eth_types::{Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
     use slashing::SlashingDbReader;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
@@ -354,7 +354,9 @@ mod tests {
         // Genesis far in the future → MonotonicEpochClock stays at epoch 0.
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let far_future = now.saturating_add(SECONDS_PER_SLOT * SLOTS_PER_EPOCH * 100);
+        let far_future = now.saturating_add(
+            SLOT_DURATION_MS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(100) / 1000,
+        );
         let (_server, beacon) = mock_beacon(far_future).await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();

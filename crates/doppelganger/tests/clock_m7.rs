@@ -6,10 +6,42 @@
 
 use std::time::{Duration, Instant};
 
+use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use rvc_doppelganger::MonotonicEpochClock;
 
-// Epoch length in seconds: SECONDS_PER_SLOT * SLOTS_PER_EPOCH = 12 * 32 = 384
-const SECONDS_PER_EPOCH: u64 = 12 * 32;
+// Epoch length in seconds: SLOT_DURATION_MS * SLOTS_PER_EPOCH / 1000 = 12_000 * 32 / 1000 = 384
+const SECONDS_PER_EPOCH: u64 = SLOT_DURATION_MS * SLOTS_PER_EPOCH / 1000;
+
+/// Slot 0 at genesis; one 12_000 ms slot later is slot 1 (not 12_000 s later).
+/// Would fail a naive `secs / SLOT_DURATION_MS` rename of `secs / SECONDS_PER_SLOT`.
+#[test]
+fn test_slot_zero_at_genesis() {
+    let genesis = 1_606_824_023_u64;
+    let clock = MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis);
+    assert_eq!(clock.current_slot(), 0);
+    assert_eq!(clock.current_epoch(), 0);
+
+    let one_slot_secs = SLOT_DURATION_MS / 1000;
+    assert_eq!(one_slot_secs, 12, "mainnet slot is 12 s");
+    let one_slot_later =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + one_slot_secs);
+    assert_eq!(one_slot_later.current_slot(), 1);
+
+    let still_genesis =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + one_slot_secs - 1);
+    assert_eq!(still_genesis.current_slot(), 0);
+}
+
+/// One epoch is 384 s (`SLOT_DURATION_MS * SLOTS_PER_EPOCH` ms), matching the pre-ms tree.
+#[test]
+fn test_epoch_duration_is_384_seconds() {
+    assert_eq!(SECONDS_PER_EPOCH, 384);
+    let genesis = 0_u64;
+    let clock =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + SECONDS_PER_EPOCH);
+    assert_eq!(clock.current_epoch(), 1);
+    assert_eq!(clock.current_slot(), SLOTS_PER_EPOCH);
+}
 
 /// M-7: A wall-clock step (NTP jump) must NOT shift the computed epoch.
 #[test]
